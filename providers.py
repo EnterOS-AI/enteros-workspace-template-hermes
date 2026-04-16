@@ -222,11 +222,17 @@ PROVIDERS: dict[str, ProviderConfig] = {
 # followed by the most likely-to-be-configured commercial APIs.
 
 RESOLUTION_ORDER: tuple[str, ...] = (
-    # Back-compat: PR 2 baseline
+    # Anthropic first — Molecule AI default preference is Claude (CEO directive
+    # 2026-04-16 'I prefer claude but we should be able to support all'). When
+    # ANTHROPIC_API_KEY is set, hermes resolves to Claude via the native
+    # Messages API. Other providers stay registered + resolvable via explicit
+    # provider= kwarg or via their own env var when ANTHROPIC_API_KEY is unset.
+    "anthropic",
+    # PR 2 back-compat — nous_portal + openrouter still resolve when their
+    # env vars are set + ANTHROPIC_API_KEY is not.
     "nous_portal",
     "openrouter",
     # Frontier commercial
-    "anthropic",
     "openai",
     "gemini",
     "xai",
