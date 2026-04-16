@@ -74,3 +74,7 @@ class HermesAdapter(BaseAdapter):
 
         executor._heartbeat = config.heartbeat
         return executor
+
+# Module-level alias so molecule-runtime's ADAPTER_MODULE=adapter resolves Adapter via 'import adapter'.
+# Without this the runtime's get_adapter() fails to find the class and falls through to discovery.
+Adapter = HermesAdapter
