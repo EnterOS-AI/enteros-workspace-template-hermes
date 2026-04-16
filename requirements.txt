@@ -1,0 +1,7 @@
+# Molecule AI workspace runtime — shared infrastructure
+molecule-ai-workspace-runtime>=0.1.0
+
+# Hermes adapter specific deps
+openai>=1.0.0
+anthropic>=0.39.0
+google-genai>=1.0.0
