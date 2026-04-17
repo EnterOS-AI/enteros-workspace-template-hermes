@@ -46,7 +46,7 @@ class HermesAdapter(BaseAdapter):
 
     async def create_executor(self, config: AdapterConfig):  # pragma: no cover
         """Create and return a HermesA2AExecutor using key resolution from env/config."""
-        from .executor import create_executor, HermesA2AExecutor
+        from executor import create_executor, HermesA2AExecutor
 
         # Resolve API key: prefer workspace secrets (runtime_config), then env vars
         hermes_api_key = config.runtime_config.get("hermes_api_key") or None

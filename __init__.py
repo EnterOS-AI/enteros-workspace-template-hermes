@@ -1,5 +1,5 @@
-from .adapter import HermesAdapter
-from .executor import create_executor
+from adapter import HermesAdapter
+from executor import create_executor
 
 Adapter = HermesAdapter
 

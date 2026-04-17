@@ -8,7 +8,10 @@ RUN useradd -u 1000 -m -s /bin/bash agent
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python3 -c "import molecule_runtime.preflight as pf; pf.SUPPORTED_RUNTIMES.add('hermes')" && \
+    SITE=$(python3 -c 'import molecule_runtime.preflight as p; print(p.__file__)') && \
+    sed -i "s/SUPPORTED_RUNTIMES = {/SUPPORTED_RUNTIMES = {'hermes', 'gemini-cli',/" "$SITE"
 
 COPY adapter.py .
 COPY __init__.py .

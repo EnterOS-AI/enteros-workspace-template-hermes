@@ -38,8 +38,8 @@ import logging
 import os
 from typing import Optional
 
-from .escalation import LadderRung, parse_ladder, should_escalate
-from .providers import PROVIDERS, ProviderConfig, resolve_provider
+from escalation import LadderRung, parse_ladder, should_escalate
+from providers import PROVIDERS, ProviderConfig, resolve_provider
 
 logger = logging.getLogger(__name__)
 
