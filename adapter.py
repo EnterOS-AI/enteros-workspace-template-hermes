@@ -1,15 +1,27 @@
-"""Hermes adapter — Nous Research Hermes models via Nous Portal or OpenRouter.
+"""Hermes adapter — bridges molecule A2A to the real Nous Research hermes-agent.
 
-Uses the OpenAI-compatible client (openai>=1.0.0) to communicate with
-either the Nous Portal directly (HERMES_API_KEY) or OpenRouter as a
-fallback (OPENROUTER_API_KEY).
+This template runs the actual `hermes-agent` (github.com/NousResearch/hermes-agent)
+inside the workspace container. start.sh boots `hermes gateway` with the
+API_SERVER platform enabled (listening on 127.0.0.1:8642) before exec'ing
+`molecule-runtime`. At request time the executor proxies every A2A
+message into hermes-agent's OpenAI-compatible /v1/chat/completions
+endpoint, collects the response, and emits it back on the A2A queue.
+
+The adapter deliberately does no model/provider selection of its own —
+that responsibility lives inside hermes-agent (`hermes model`, `hermes
+config set`). Trying to layer a second provider registry on top was the
+core mistake the previous version of this template made; see
+docs/PLANNING.md for the rewrite rationale.
 """
+from __future__ import annotations
+
 import os
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
 
 
-class HermesAdapter(BaseAdapter):
+class HermesAgentAdapter(BaseAdapter):
+    """Adapter that proxies A2A requests to a locally-running hermes-agent."""
 
     @staticmethod
     def name() -> str:
@@ -17,11 +29,15 @@ class HermesAdapter(BaseAdapter):
 
     @staticmethod
     def display_name() -> str:
-        return "Hermes (Nous Research)"
+        return "Hermes Agent (Nous Research)"
 
     @staticmethod
     def description() -> str:
-        return "Hermes models via Nous Portal or OpenRouter — openai>=1.0.0 compatible client"
+        return (
+            "Runs the real Nous Research hermes-agent with its native "
+            "terminal, file, web, memory, and skill tools. Model + provider "
+            "are owned by hermes-agent itself (hermes model)."
+        )
 
     @staticmethod
     def get_config_schema() -> dict:
@@ -29,52 +45,48 @@ class HermesAdapter(BaseAdapter):
             "model": {
                 "type": "string",
                 "description": (
-                    "Hermes model ID (e.g. nousresearch/hermes-3-llama-3.1-405b for OpenRouter "
-                    "or hermes-3-llama-3.1-405b for Nous Portal)"
+                    "Model string passed through to hermes-agent. Accepts "
+                    "any form hermes-agent understands — e.g. "
+                    "'nousresearch/hermes-4-70b', 'anthropic/claude-sonnet-4-5', "
+                    "'gemini/gemini-2.5-pro', 'MiniMax-M2.7', or "
+                    "'openrouter/<slug>'."
                 ),
             },
         }
 
-    async def setup(self, config: AdapterConfig) -> None:  # pragma: no cover
+    async def setup(self, config: AdapterConfig) -> None:
+        """Verify the hermes-agent API server is reachable.
+
+        start.sh boots `hermes gateway` before molecule-runtime. If the
+        gateway didn't come up by the time setup runs, fail loud so the
+        workspace is marked unhealthy rather than silently forwarding to
+        a dead port.
+        """
         try:
-            import openai  # noqa: F401
-        except ImportError as e:
+            import httpx  # noqa: F401
+        except ImportError as exc:  # pragma: no cover
             raise RuntimeError(
-                "Hermes adapter requires openai>=1.0.0 — "
-                "install with: pip install 'openai>=1.0.0'"
-            ) from e
+                "Hermes adapter bridge requires httpx — "
+                "add to requirements.txt and rebuild the image."
+            ) from exc
 
-    async def create_executor(self, config: AdapterConfig):  # pragma: no cover
-        """Create and return a HermesA2AExecutor using key resolution from env/config."""
-        from executor import create_executor, HermesA2AExecutor
+        import httpx
 
-        # Resolve API key: prefer workspace secrets (runtime_config), then env vars
-        hermes_api_key = config.runtime_config.get("hermes_api_key") or None
+        base = os.environ.get("HERMES_API_BASE", "http://127.0.0.1:8642/v1").rstrip("/")
+        health_url = base.replace("/v1", "") + "/health"
+        try:
+            r = httpx.get(health_url, timeout=5.0)
+            r.raise_for_status()
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(
+                f"hermes-agent API server not reachable at {health_url}. "
+                "Check /var/log/hermes-gateway.log inside the container."
+            ) from exc
 
-        # Phase 3 escalation ladder — read from runtime_config.escalation_ladder
-        # if present. The platform's org importer copies the ladder from
-        # org.yaml (runtime_config.escalation_ladder) into the container's
-        # /configs/config.yaml, and the workspace-template loader surfaces it
-        # here. Empty / missing = single-shot behaviour (unchanged from pre-
-        # Phase-3). See adapters.hermes.escalation for classification rules.
-        escalation_ladder = config.runtime_config.get("escalation_ladder") or None
+    async def create_executor(self, config: AdapterConfig):
+        from executor import HermesAgentProxyExecutor
 
-        executor = create_executor(
-            hermes_api_key=hermes_api_key,
-            config_path=config.config_path,  # Phase 2d-i: system-prompt.md injection
-            escalation_ladder=escalation_ladder,
-        )
+        return HermesAgentProxyExecutor(config)
 
-        # Override model from config if provided
-        model = config.model
-        if ":" in model:
-            _, model = model.split(":", 1)
-        if model:
-            executor.model = model
 
-        executor._heartbeat = config.heartbeat
-        return executor
-
-# Module-level alias so molecule-runtime's ADAPTER_MODULE=adapter resolves Adapter via 'import adapter'.
-# Without this the runtime's get_adapter() fails to find the class and falls through to discovery.
-Adapter = HermesAdapter
+Adapter = HermesAgentAdapter

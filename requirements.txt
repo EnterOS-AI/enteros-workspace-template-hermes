@@ -1,7 +1,7 @@
-# Molecule AI workspace runtime — shared infrastructure
+# Molecule AI workspace runtime — adapter + A2A server infra
 molecule-ai-workspace-runtime>=0.1.0
 
-# Hermes adapter specific deps
-openai>=1.0.0
-anthropic>=0.39.0
-google-genai>=1.0.0
+# Bridge dependency — async HTTP to the local hermes-agent gateway on :8642.
+# All model/provider SDKs are now owned by hermes-agent itself; see
+# docs/ARCHITECTURE.md for why they no longer live here.
+httpx>=0.27.0
