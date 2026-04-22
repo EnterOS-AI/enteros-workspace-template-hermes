@@ -1,30 +1,36 @@
 name: Hermes Agent
 description: >-
-  NousResearch Hermes-3 agent workspace. Compatible with Hermes-3 70B /
-  405B, any Hermes-family fine-tune, and any OpenAI-compatible provider
-  registered in providers.py (Nous Portal, OpenRouter, Anthropic, OpenAI,
-  MiniMax, Qwen, GLM, Kimi, DeepSeek, Groq, xAI, Gemini, Together,
-  Fireworks, Mistral).
-version: 1.0.0
+  Nous Research hermes-agent — the self-improving AI agent with built-in
+  terminal, file ops, web search, memory, skills, and cross-session recall.
+  This workspace runs the real `hermes-agent` (github.com/NousResearch/hermes-agent)
+  behind an A2A bridge. The agent exposes its OpenAI-compatible API on
+  localhost:8642 and molecule_runtime proxies messages to it on :8000.
+
+  Any model `hermes-agent` supports is selectable at runtime via
+  `hermes model` — Nous Portal, OpenRouter, OpenAI, Anthropic, Gemini,
+  xAI, MiniMax, Qwen, DeepSeek, Groq, NVIDIA NIM, Kimi, Mistral, and more.
+version: 2.0.0
 tier: 2
 
 runtime: hermes
 runtime_config:
-  # Default model — can be overridden per-workspace in canvas Config tab
-  # or at runtime via HERMES_MODEL env var.
-  model: nous-hermes-3-70b
+  # Default model. `hermes-agent` resolves provider + auth from its own
+  # config — canvas just passes the model ID through so the user can switch
+  # without leaving the UI. Override per-workspace in the Config tab.
+  model: nousresearch/hermes-4-70b
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
-  # Required Env Vars based on the selected entry. Keep ids exact —
-  # they're sent verbatim to the inference API.
+  # Required Env Vars based on the selected entry. hermes-agent itself
+  # accepts any model string and picks the provider by prefix/scheme.
   models:
-    # --- Hermes (Nous Research) ---
-    - id: nous-hermes-3-70b
-      name: Nous Hermes 3 70B (Nous Portal)
+    # --- Hermes 4 (Nous Research) ---
+    - id: nousresearch/hermes-4-70b
+      name: Hermes 4 70B (Nous Portal)
       required_env: [HERMES_API_KEY]
-    - id: nous-hermes-3-405b
-      name: Nous Hermes 3 405B (Nous Portal)
+    - id: nousresearch/hermes-4-405b
+      name: Hermes 4 405B (Nous Portal)
       required_env: [HERMES_API_KEY]
+    # --- Hermes 3 (Nous Research, legacy) ---
     - id: nousresearch/hermes-3-llama-3.1-70b
       name: Hermes 3 70B (via OpenRouter)
       required_env: [OPENROUTER_API_KEY]
@@ -32,41 +38,62 @@ runtime_config:
       name: Hermes 3 405B (via OpenRouter)
       required_env: [OPENROUTER_API_KEY]
 
-    # --- MiniMax (direct) — OpenAI-compatible at api.minimax.io/v1 ---
-    # MINIMAX_API_KEY accepts either a pay-as-you-go key (sk-api-*) or a
-    # Token Plan subscription key (sk-cp-*); MiniMax routes by prefix.
+    # --- Anthropic (direct, native SDK in hermes-agent) ---
+    - id: anthropic/claude-sonnet-4-5
+      name: Claude Sonnet 4.5 (direct)
+      required_env: [ANTHROPIC_API_KEY]
+    - id: anthropic/claude-opus-4-1
+      name: Claude Opus 4.1 (direct)
+      required_env: [ANTHROPIC_API_KEY]
+
+    # --- OpenAI (direct) ---
+    - id: openai/gpt-5
+      name: GPT-5 (direct)
+      required_env: [OPENAI_API_KEY]
+
+    # --- Gemini (direct, native SDK in hermes-agent) ---
+    - id: gemini/gemini-2.5-pro
+      name: Gemini 2.5 Pro (direct)
+      required_env: [GEMINI_API_KEY]
+
+    # --- MiniMax (direct) — reused from prior template version ---
     - id: MiniMax-M2.7
       name: MiniMax M2.7 (direct, ~197K ctx, coding-tuned)
       required_env: [MINIMAX_API_KEY]
     - id: MiniMax-M2.7-highspeed
-      name: MiniMax M2.7 highspeed (Token Plan only, higher rate limits)
-      required_env: [MINIMAX_API_KEY]
-    - id: MiniMax-M1
-      name: MiniMax M1 (direct, 1M ctx)
+      name: MiniMax M2.7 highspeed (Token Plan only)
       required_env: [MINIMAX_API_KEY]
 
-    # --- MiniMax (via OpenRouter) — reuses existing OPENROUTER_API_KEY ---
-    - id: minimax/minimax-m2.7
-      name: MiniMax M2.7 (via OpenRouter)
-      required_env: [OPENROUTER_API_KEY]
-    - id: minimax/minimax-m1
-      name: MiniMax M1 (via OpenRouter, 1M ctx)
+    # --- Any OpenRouter-exposed model (catch-all) ---
+    - id: openrouter/*
+      name: Any OpenRouter model (set ID per workspace)
       required_env: [OPENROUTER_API_KEY]
 
-  # Default env requirement — overridden per-model when a model is picked
-  # from the list above. executor.py still accepts either key at runtime.
+  # Required env is driven by the selected model above.
   required_env:
     - HERMES_API_KEY
 
-  # 0 = no timeout; increase for long-running research tasks.
+  # 0 = no timeout; hermes-agent sessions can run long when tool-using.
   timeout: 0
 
+# Tools hermes-agent ships natively — see .hermes/config.yaml inside the
+# container for the full list. These are informational; hermes-agent owns
+# tool selection. Use `hermes tools` to adjust at runtime.
 skills: []
 
 a2a:
   port: 8000
   streaming: true
   push_notifications: true
+
+# Bridge config — consumed by executor.py.
+bridge:
+  # Where the in-container hermes-agent API server listens. Do not change
+  # unless you also change start.sh and API_SERVER_PORT env.
+  hermes_api_base: http://127.0.0.1:8642/v1
+  # Bearer token is injected by start.sh as API_SERVER_KEY and read by
+  # executor.py from the env at request time — not stored in config.
+  hermes_api_key_env: API_SERVER_KEY
 
 delegation:
   retry_attempts: 3

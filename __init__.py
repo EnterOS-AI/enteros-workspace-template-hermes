@@ -1,6 +1,5 @@
-from adapter import HermesAdapter
-from executor import create_executor
+from adapter import HermesAgentAdapter
 
-Adapter = HermesAdapter
+Adapter = HermesAgentAdapter
 
-__all__ = ["create_executor", "HermesAdapter", "Adapter"]
+__all__ = ["HermesAgentAdapter", "Adapter"]
