@@ -1,23 +1,60 @@
 name: Hermes Agent
 description: >-
-  NousResearch Hermes-3 agent workspace. Supports Nous Portal and
-  OpenRouter as inference providers. Compatible with Hermes-3 70B / 405B
-  and any Hermes-family fine-tune served through an OpenAI-compatible API.
+  NousResearch Hermes-3 agent workspace. Compatible with Hermes-3 70B /
+  405B, any Hermes-family fine-tune, and any OpenAI-compatible provider
+  registered in providers.py (Nous Portal, OpenRouter, Anthropic, OpenAI,
+  MiniMax, Qwen, GLM, Kimi, DeepSeek, Groq, xAI, Gemini, Together,
+  Fireworks, Mistral).
 version: 1.0.0
 tier: 2
 
 runtime: hermes
 runtime_config:
-  # Model identifier — exact string depends on your provider:
-  #   Nous Portal:  nous-hermes-3-70b  |  nous-hermes-3-405b
-  #   OpenRouter:   nousresearch/hermes-3-llama-3.1-70b
-  # Override at runtime without editing this file by setting HERMES_MODEL env var.
+  # Default model — can be overridden per-workspace in canvas Config tab
+  # or at runtime via HERMES_MODEL env var.
   model: nous-hermes-3-70b
 
-  # Authentication — supply ONE of these env vars (checked in order):
-  #   HERMES_API_KEY     — Nous Research portal key (https://portal.nousresearch.com)
-  #   OPENROUTER_API_KEY — OpenRouter as a Hermes proxy (useful for dev / cost control)
-  # Both are checked by adapters/hermes/executor.py; at least one must be set.
+  # Canvas surfaces this list as a Model dropdown and auto-populates
+  # Required Env Vars based on the selected entry. Keep ids exact —
+  # they're sent verbatim to the inference API.
+  models:
+    # --- Hermes (Nous Research) ---
+    - id: nous-hermes-3-70b
+      name: Nous Hermes 3 70B (Nous Portal)
+      required_env: [HERMES_API_KEY]
+    - id: nous-hermes-3-405b
+      name: Nous Hermes 3 405B (Nous Portal)
+      required_env: [HERMES_API_KEY]
+    - id: nousresearch/hermes-3-llama-3.1-70b
+      name: Hermes 3 70B (via OpenRouter)
+      required_env: [OPENROUTER_API_KEY]
+    - id: nousresearch/hermes-3-llama-3.1-405b
+      name: Hermes 3 405B (via OpenRouter)
+      required_env: [OPENROUTER_API_KEY]
+
+    # --- MiniMax (direct) — OpenAI-compatible at api.minimax.io/v1 ---
+    # MINIMAX_API_KEY accepts either a pay-as-you-go key (sk-api-*) or a
+    # Token Plan subscription key (sk-cp-*); MiniMax routes by prefix.
+    - id: MiniMax-M2.7
+      name: MiniMax M2.7 (direct, ~197K ctx, coding-tuned)
+      required_env: [MINIMAX_API_KEY]
+    - id: MiniMax-M2.7-highspeed
+      name: MiniMax M2.7 highspeed (Token Plan only, higher rate limits)
+      required_env: [MINIMAX_API_KEY]
+    - id: MiniMax-M1
+      name: MiniMax M1 (direct, 1M ctx)
+      required_env: [MINIMAX_API_KEY]
+
+    # --- MiniMax (via OpenRouter) — reuses existing OPENROUTER_API_KEY ---
+    - id: minimax/minimax-m2.7
+      name: MiniMax M2.7 (via OpenRouter)
+      required_env: [OPENROUTER_API_KEY]
+    - id: minimax/minimax-m1
+      name: MiniMax M1 (via OpenRouter, 1M ctx)
+      required_env: [OPENROUTER_API_KEY]
+
+  # Default env requirement — overridden per-model when a model is picked
+  # from the list above. executor.py still accepts either key at runtime.
   required_env:
     - HERMES_API_KEY
 
