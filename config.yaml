@@ -6,79 +6,186 @@ description: >-
   behind an A2A bridge. The agent exposes its OpenAI-compatible API on
   localhost:8642 and molecule_runtime proxies messages to it on :8000.
 
-  Any model `hermes-agent` supports is selectable at runtime via
-  `hermes model` — Nous Portal, OpenRouter, OpenAI, Anthropic, Gemini,
-  xAI, MiniMax, Qwen, DeepSeek, Groq, NVIDIA NIM, Kimi, Mistral, and more.
-version: 2.0.0
+  Supports every provider hermes-agent supports — see docs/CONFIGURATION.md
+  for the full list. Any model hermes-agent accepts is selectable at
+  runtime via `hermes model`, or from the canvas Config tab.
+version: 2.1.0
 tier: 2
 
 runtime: hermes
 runtime_config:
-  # Default model. `hermes-agent` resolves provider + auth from its own
-  # config — canvas just passes the model ID through so the user can switch
-  # without leaving the UI. Override per-workspace in the Config tab.
+  # Default model. hermes-agent owns provider resolution via the
+  # HERMES_INFERENCE_PROVIDER env or its own `hermes model` wizard.
+  # Override per-workspace in the canvas Config tab.
   model: nousresearch/hermes-4-70b
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
-  # Required Env Vars based on the selected entry. hermes-agent itself
-  # accepts any model string and picks the provider by prefix/scheme.
+  # Required Env Vars from the selected entry's required_env. Provider
+  # names in parentheses mirror hermes-agent's CLI provider field; see
+  # docs/CONFIGURATION.md#provider-matrix for the full mapping.
   models:
-    # --- Hermes 4 (Nous Research) ---
+    # ── Nous Research (Hermes 4) via Nous Portal ──────────────────────
     - id: nousresearch/hermes-4-70b
       name: Hermes 4 70B (Nous Portal)
       required_env: [HERMES_API_KEY]
     - id: nousresearch/hermes-4-405b
       name: Hermes 4 405B (Nous Portal)
       required_env: [HERMES_API_KEY]
-    # --- Hermes 3 (Nous Research, legacy) ---
+    - id: nousresearch/hermes-4-14b
+      name: Hermes 4 14B (Nous Portal)
+      required_env: [HERMES_API_KEY]
+
+    # ── Hermes 3 family (via OpenRouter) ─────────────────────────────
     - id: nousresearch/hermes-3-llama-3.1-70b
-      name: Hermes 3 70B (via OpenRouter)
+      name: Hermes 3 70B (OpenRouter)
       required_env: [OPENROUTER_API_KEY]
     - id: nousresearch/hermes-3-llama-3.1-405b
-      name: Hermes 3 405B (via OpenRouter)
+      name: Hermes 3 405B (OpenRouter)
       required_env: [OPENROUTER_API_KEY]
 
-    # --- Anthropic (direct, native SDK in hermes-agent) ---
+    # ── Anthropic (native SDK inside hermes-agent) ────────────────────
     - id: anthropic/claude-sonnet-4-5
       name: Claude Sonnet 4.5 (direct)
       required_env: [ANTHROPIC_API_KEY]
     - id: anthropic/claude-opus-4-1
       name: Claude Opus 4.1 (direct)
       required_env: [ANTHROPIC_API_KEY]
+    - id: anthropic/claude-haiku-4-5
+      name: Claude Haiku 4.5 (direct)
+      required_env: [ANTHROPIC_API_KEY]
 
-    # --- OpenAI (direct) ---
+    # ── OpenAI (via OpenRouter — hermes has no direct openai provider;
+    #    openai-codex is OAuth-only for Codex models) ──────────────────
     - id: openai/gpt-5
-      name: GPT-5 (direct)
-      required_env: [OPENAI_API_KEY]
+      name: GPT-5 (via OpenRouter)
+      required_env: [OPENROUTER_API_KEY]
+    - id: openai/gpt-5-mini
+      name: GPT-5 mini (via OpenRouter)
+      required_env: [OPENROUTER_API_KEY]
+    - id: openai/gpt-4o
+      name: GPT-4o (via OpenRouter)
+      required_env: [OPENROUTER_API_KEY]
+    - id: openai/gpt-4o-mini
+      name: GPT-4o mini (via OpenRouter)
+      required_env: [OPENROUTER_API_KEY]
 
-    # --- Gemini (direct, native SDK in hermes-agent) ---
+    # ── Google Gemini (native SDK) ────────────────────────────────────
     - id: gemini/gemini-2.5-pro
       name: Gemini 2.5 Pro (direct)
       required_env: [GEMINI_API_KEY]
+    - id: gemini/gemini-2.5-flash
+      name: Gemini 2.5 Flash (direct)
+      required_env: [GEMINI_API_KEY]
 
-    # --- MiniMax (direct) — reused from prior template version ---
-    - id: MiniMax-M2.7
-      name: MiniMax M2.7 (direct, ~197K ctx, coding-tuned)
+    # ── DeepSeek (direct) ─────────────────────────────────────────────
+    - id: deepseek/deepseek-v3.2
+      name: DeepSeek V3.2 (direct)
+      required_env: [DEEPSEEK_API_KEY]
+    - id: deepseek/deepseek-r1
+      name: DeepSeek R1 reasoning (direct)
+      required_env: [DEEPSEEK_API_KEY]
+
+    # ── z.ai / GLM ────────────────────────────────────────────────────
+    - id: zai/glm-4.6
+      name: GLM 4.6 (z.ai)
+      required_env: [GLM_API_KEY]
+
+    # ── Kimi / Moonshot ───────────────────────────────────────────────
+    - id: kimi-coding/kimi-k2
+      name: Kimi K2 (Moonshot)
+      required_env: [KIMI_API_KEY]
+
+    # ── MiniMax (global + China) ─────────────────────────────────────
+    - id: minimax/MiniMax-M2.7
+      name: MiniMax M2.7 (direct, coding-tuned)
       required_env: [MINIMAX_API_KEY]
-    - id: MiniMax-M2.7-highspeed
+    - id: minimax/MiniMax-M2.7-highspeed
       name: MiniMax M2.7 highspeed (Token Plan only)
       required_env: [MINIMAX_API_KEY]
+    - id: minimax/MiniMax-M1
+      name: MiniMax M1 (1M ctx)
+      required_env: [MINIMAX_API_KEY]
+    - id: minimax-cn/abab6.5-chat
+      name: MiniMax China (abab6.5)
+      required_env: [MINIMAX_CN_API_KEY]
 
-    # --- Any OpenRouter-exposed model (catch-all) ---
+    # ── Alibaba Cloud / Qwen (DashScope) ─────────────────────────────
+    - id: alibaba/qwen3-max
+      name: Qwen 3 Max (Alibaba Cloud)
+      required_env: [DASHSCOPE_API_KEY]
+    - id: alibaba/qwen3-coder
+      name: Qwen 3 Coder (Alibaba Cloud)
+      required_env: [DASHSCOPE_API_KEY]
+
+    # ── Xiaomi MiMo ──────────────────────────────────────────────────
+    - id: xiaomi/mimo-v1
+      name: Xiaomi MiMo v1
+      required_env: [XIAOMI_API_KEY]
+
+    # ── Arcee Trinity ────────────────────────────────────────────────
+    - id: arcee/trinity-70b
+      name: Arcee Trinity 70B
+      required_env: [ARCEEAI_API_KEY]
+
+    # ── NVIDIA NIM ────────────────────────────────────────────────────
+    - id: nvidia/nemotron-70b
+      name: Nemotron 70B (NVIDIA NIM)
+      required_env: [NVIDIA_API_KEY]
+
+    # ── Ollama Cloud ─────────────────────────────────────────────────
+    - id: ollama-cloud/llama-3.3-70b
+      name: Llama 3.3 70B (Ollama Cloud)
+      required_env: [OLLAMA_API_KEY]
+
+    # ── Hugging Face Inference ───────────────────────────────────────
+    - id: huggingface/*
+      name: Any Hugging Face model (set ID per workspace)
+      required_env: [HF_TOKEN]
+
+    # ── Vercel AI Gateway ────────────────────────────────────────────
+    - id: ai-gateway/*
+      name: Any Vercel AI Gateway model
+      required_env: [AI_GATEWAY_API_KEY]
+
+    # ── OpenCode Zen / Go ────────────────────────────────────────────
+    - id: opencode-zen/*
+      name: OpenCode Zen (set model per workspace)
+      required_env: [OPENCODE_ZEN_API_KEY]
+    - id: opencode-go/*
+      name: OpenCode Go (set model per workspace)
+      required_env: [OPENCODE_GO_API_KEY]
+
+    # ── Kilo Code ────────────────────────────────────────────────────
+    - id: kilocode/*
+      name: Kilo Code (set model per workspace)
+      required_env: [KILOCODE_API_KEY]
+
+    # ── OpenRouter catch-all ─────────────────────────────────────────
     - id: openrouter/*
-      name: Any OpenRouter model (set ID per workspace)
+      name: Any OpenRouter model (200+ available)
       required_env: [OPENROUTER_API_KEY]
 
-  # Required env is driven by the selected model above.
-  required_env:
-    - HERMES_API_KEY
+    # ── Custom endpoint (LM Studio / Ollama local / vLLM / llama.cpp) ─
+    - id: custom/*
+      name: Self-hosted OpenAI-compat endpoint (configure base_url in ~/.hermes/config)
+      required_env: []
+
+  # No single required env — hermes-agent supports 20+ providers and
+  # customers pick any one via the canvas Config tab (per-model
+  # required_env above drives the real UX). Molecule-runtime's
+  # preflight enforces AND-semantics on this list, so a non-empty
+  # value here would block workspaces using any non-default provider.
+  # hermes-agent itself errors loud at request time if zero providers
+  # are configured — that's the safety net.
+  required_env: []
 
   # 0 = no timeout; hermes-agent sessions can run long when tool-using.
   timeout: 0
 
-# Tools hermes-agent ships natively — see .hermes/config.yaml inside the
-# container for the full list. These are informational; hermes-agent owns
-# tool selection. Use `hermes tools` to adjust at runtime.
+# Tools hermes-agent ships natively. See `hermes tools` inside the
+# container for the interactive toggle — by default all 17 built-in
+# tool families are available (terminal, file read/write/edit,
+# web fetch+search, memory, skills, subagent spawn, etc.).
 skills: []
 
 a2a:
@@ -86,14 +193,20 @@ a2a:
   streaming: true
   push_notifications: true
 
-# Bridge config — consumed by executor.py.
+# Bridge config — consumed by executor.py and start.sh.
 bridge:
-  # Where the in-container hermes-agent API server listens. Do not change
-  # unless you also change start.sh and API_SERVER_PORT env.
+  # Where the in-container hermes-agent API server listens. Do NOT
+  # change unless you also change start.sh / API_SERVER_PORT.
   hermes_api_base: http://127.0.0.1:8642/v1
   # Bearer token is injected by start.sh as API_SERVER_KEY and read by
   # executor.py from the env at request time — not stored in config.
   hermes_api_key_env: API_SERVER_KEY
+  # Optional: force a specific hermes provider instead of relying on
+  # hermes-agent's `auto` detection. Useful when multiple keys are
+  # set and you want deterministic routing. Set via HERMES_INFERENCE_PROVIDER
+  # env on the container OR hardcode here. Valid values: see
+  # docs/CONFIGURATION.md#provider-matrix.
+  provider: ""
 
 delegation:
   retry_attempts: 3

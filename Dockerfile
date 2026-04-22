@@ -1,9 +1,14 @@
 FROM python:3.11-slim
 
-# System deps: curl for the hermes installer, git for the agent's file/repo
-# tools, gosu so start.sh can drop privileges, ca-certificates for TLS.
+# System deps:
+#   curl         — hermes installer + loopback health probe in start.sh
+#   ca-certificates — TLS for all the outbound installs
+#   git          — hermes installer clones the repo; also used by agent tools
+#   gosu         — drop privileges in start.sh (single-process friendly)
+#   xz-utils     — hermes installer extracts a Node 22 tarball (.tar.xz)
+#   build-essential — some python deps in hermes `.[all]` extra compile from src
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates git gosu \
+    curl ca-certificates git gosu xz-utils build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root agent user. hermes-agent writes its state into ~/.hermes so
@@ -26,13 +31,19 @@ COPY start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
 
 # --- Install the real Nous Research hermes-agent as the agent user ---
-# The installer lives under the agent's home (~/.hermes, PATH update in
-# .bashrc). Running as root would place it in /root and break discovery.
+# The installer lives under the agent's home (~/.hermes, symlinks the
+# `hermes` entrypoint into ~/.local/bin/). Running as root would place
+# it in /root and break discovery.
+#   --skip-setup → no interactive wizard (curl|bash is non-tty anyway
+#                  but the installer treats this as "run anyway" by
+#                  default; passing it explicitly avoids surprises).
 USER agent
 WORKDIR /home/agent
-RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
-# Make `hermes` available in non-interactive shells (start.sh).
-ENV PATH="/home/agent/.local/bin:/home/agent/.hermes/bin:${PATH}"
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
+      | bash -s -- --skip-setup
+# hermes installer symlinks ~/.hermes/hermes-agent/venv/bin/hermes into
+# ~/.local/bin/hermes, so ~/.local/bin is the only PATH entry we need.
+ENV PATH="/home/agent/.local/bin:${PATH}"
 
 USER root
 WORKDIR /app

@@ -92,6 +92,42 @@ canvas ─── POST /a2a/... ───▶ molecule_runtime (:8000)
   that's a regression to v1.x.
 - **Tool routing.** Tools are hermes-agent's job. Our bridge sees
   only the final assistant text.
+
+## Provider routing (how keys become inference)
+
+Provider resolution happens inside hermes-agent, driven by:
+
+1. **`~/.hermes/cli-config.yaml`** — `model.provider` field. start.sh
+   seeds this file on first boot (`auto` by default, or whatever
+   `HERMES_INFERENCE_PROVIDER` specifies).
+2. **`~/.hermes/.env`** — every provider key we forward from the
+   container env (see start.sh for the full list; see
+   `CONFIGURATION.md#provider-matrix` for the mapping).
+3. **Auto-detection** — when `provider: auto`, hermes walks its
+   internal resolution order and picks the first provider whose
+   credential is present. When multiple keys are set, prefer explicit
+   `HERMES_INFERENCE_PROVIDER` to avoid surprises.
+
+### Common routing gotcha
+
+With only `OPENAI_API_KEY` set and `provider: auto`, hermes-agent will
+route to `openai-codex` (Codex API, OAuth-only) and return:
+
+```
+401 - Missing Authentication header
+```
+
+The fix is to set `HERMES_INFERENCE_PROVIDER=openrouter` — hermes's
+openrouter provider accepts `OPENAI_API_KEY` as alt-auth and routes
+OpenAI-format Chat Completions correctly. This is documented in
+`CONFIGURATION.md#forcing-a-provider`.
+
+### Auxiliary model
+
+Vision, web summarization, and MoA use a separate auxiliary model —
+defaults to Gemini Flash via OpenRouter. If `OPENROUTER_API_KEY` is
+absent, these capabilities break silently (the primary path still
+works). Set `HERMES_AUXILIARY_PROVIDER` to override.
 - **Streaming.** `stream: false` in the request payload. A later
   revision can upgrade to SSE by subscribing to
   `GET /v1/runs/{run_id}/events` and pushing partial messages into
