@@ -94,8 +94,14 @@ chmod 600 "$ENV_FILE"
 # the selection; operators override via HERMES_INFERENCE_PROVIDER
 # + HERMES_DEFAULT_MODEL env, or by editing config.yaml at runtime
 # inside the container.
-PROVIDER="${HERMES_INFERENCE_PROVIDER:-auto}"
 DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}"
+# Derive provider from model slug prefix — shared with install.sh via
+# scripts/derive-provider.sh so Docker + bare-host paths match.
+# Dockerfile COPYs scripts/ to /app/scripts; fall back to /scripts
+# for dev environments that run start.sh with a different WORKDIR.
+DERIVE_SCRIPT="/app/scripts/derive-provider.sh"
+[ -f "$DERIVE_SCRIPT" ] || DERIVE_SCRIPT="/scripts/derive-provider.sh"
+HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" . "$DERIVE_SCRIPT"
 {
   echo "# Seeded by molecule template-hermes start.sh. Customize via"
   echo "# \`hermes config edit\` or by editing this file directly."

@@ -111,8 +111,16 @@ chmod 600 "$HERMES_HOME/.env"
 # cli-config.yaml.example here as config.yaml which defaults to
 # anthropic/claude-opus-4.6 + provider:auto. Our bridge needs
 # deterministic routing.
-PROVIDER="${HERMES_INFERENCE_PROVIDER:-auto}"
+#
+# Provider derivation: scripts/derive-provider.sh looks at the model
+# slug prefix and sets $PROVIDER accordingly (minimax/* → minimax,
+# anthropic/* → anthropic, openai/* → openrouter (hermes has no
+# direct openai provider), nousresearch/* → nous-or-openrouter based
+# on keys present, etc.). Explicit HERMES_INFERENCE_PROVIDER in the
+# env always wins.
 DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}"
+HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" \
+  . "$(dirname "$0")/scripts/derive-provider.sh"
 {
   echo "# Seeded by template-hermes install.sh on $(date -u -Iseconds)"
   echo "# Rewritten each boot from HERMES_DEFAULT_MODEL + HERMES_INFERENCE_PROVIDER env."
