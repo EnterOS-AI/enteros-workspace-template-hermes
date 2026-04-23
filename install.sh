@@ -154,32 +154,38 @@ DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}"
 HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" \
   . "$(dirname "$0")/scripts/derive-provider.sh"
 
-# --- FIXES #13 + #14: OpenAI bridge uses native openai provider ---
+# --- OpenAI bridge: PROVIDER=custom + chat_completions api_mode ---
 #
-# Previously this block bridged OPENAI_API_KEY → custom provider. That
-# caused TWO downstream bugs:
+# hermes-agent does NOT have a native "openai" provider in its registry
+# (valid list includes: ai-gateway, anthropic, openrouter, nous, custom,
+# minimax, kimi, etc — but NOT "openai"). See `hermes doctor` output for
+# the authoritative list. Therefore the OpenAI bridge uses `custom`
+# provider pointed at api.openai.com.
 #
-#   #13: custom provider passes model slug verbatim → OpenAI sees
-#        `openai/gpt-4o` and returns 400 model_not_found (expects `gpt-4o`).
-#        Fix: strip the `openai/` prefix from DEFAULT_MODEL here.
+# Three things have to line up for this to actually work:
 #
-#   #14: custom provider's /v1/responses code path sends
-#        include=[reasoning.encrypted_content] which only o1-family
-#        models support. Switching to native openai provider routes
-#        the request through the model-family-aware code path that
-#        chooses /v1/chat/completions for gpt-* and /v1/responses
-#        for o1/o3/o4 + conditionally adds encrypted_content.
+#   (1) Keep PROVIDER=custom when only OPENAI_API_KEY is set. Setting
+#       PROVIDER=openai crashes the gateway with "Unknown provider".
 #
-# Resolution: when only OPENAI_API_KEY is provided (no OPENROUTER,
-# no explicit HERMES_CUSTOM_*), set PROVIDER=openai (hermes has a
-# native openai provider) and strip the slug prefix. Custom remains
-# available when the operator explicitly configures HERMES_CUSTOM_*
-# (e.g. pointing at a self-hosted vLLM endpoint).
+#   (2) Strip the `openai/` prefix from DEFAULT_MODEL. Custom passes
+#       the model name verbatim to the endpoint; OpenAI rejects
+#       `openai/gpt-4o` with 400 model_not_found (expects `gpt-4o`).
+#
+#   (3) Set api_mode: "chat_completions" in the emitted config.yaml.
+#       Without this, hermes defaults custom provider to codex_responses
+#       which hits /v1/responses + sends include=[reasoning.encrypted_content].
+#       gpt-4o / gpt-4.1 reject that with 400 (only o1 family supports it).
+#
+# Fires ONLY when operator hasn't configured HERMES_CUSTOM_* themselves —
+# explicit custom endpoints (vLLM, LM Studio) skip the prefix strip and
+# chat_completions default.
 if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
-  PROVIDER="openai"
-  # Strip `openai/` prefix so OpenAI sees a plain model name.
+  export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
+  export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
+  export HERMES_CUSTOM_API_MODE="chat_completions"
+  # Strip the `openai/` provider prefix — OpenAI expects bare model names.
   DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"
-  echo "[install.sh] bridged OPENAI_API_KEY → native openai provider, model=${DEFAULT_MODEL}"
+  echo "[install.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com (api_mode=chat_completions, model=${DEFAULT_MODEL})"
 fi
 
 {
@@ -193,6 +199,13 @@ fi
   fi
   if [ -n "${HERMES_CUSTOM_API_KEY:-}" ]; then
     echo "  api_key: \"${HERMES_CUSTOM_API_KEY}\""
+  fi
+  # api_mode gates hermes's custom-provider request shape:
+  #   chat_completions  → POST /v1/chat/completions (OpenAI-compat, default)
+  #   codex_responses   → POST /v1/responses + include=[encrypted_content]
+  # Emit the field only when explicitly set — absent = hermes auto-detect.
+  if [ -n "${HERMES_CUSTOM_API_MODE:-}" ]; then
+    echo "  api_mode: \"${HERMES_CUSTOM_API_MODE}\""
   fi
 } >"$HERMES_HOME/config.yaml"
 
