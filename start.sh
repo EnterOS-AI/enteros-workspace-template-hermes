@@ -103,17 +103,17 @@ DERIVE_SCRIPT="/app/scripts/derive-provider.sh"
 [ -f "$DERIVE_SCRIPT" ] || DERIVE_SCRIPT="/scripts/derive-provider.sh"
 HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" . "$DERIVE_SCRIPT"
 
-# --- FIXES #13 + #14: use native openai provider for OpenAI bridge ---
-# Symmetric with install.sh. Custom provider path was broken on OpenAI:
-#   - passes full slug (openai/gpt-4o) → 400 model_not_found
-#   - sends include=[reasoning.encrypted_content] → 400 on non-o1 models
-# Native openai provider strips the prefix and routes through the
-# model-family-aware code path. Explicit HERMES_CUSTOM_* still wins
-# when the operator configures a genuine custom endpoint (e.g. vLLM).
+# --- OpenAI bridge: custom provider + chat_completions api_mode ---
+# Symmetric with install.sh. See install.sh for the full explanation.
+# hermes has NO native "openai" provider — bridge must use custom+
+# api_mode=chat_completions to get the OpenAI-compat /v1/chat/completions
+# path (not /v1/responses with encrypted_content, which 400s on gpt-4o).
 if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
-  PROVIDER="openai"
+  export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
+  export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
+  export HERMES_CUSTOM_API_MODE="chat_completions"
   DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"
-  echo "[start.sh] bridged OPENAI_API_KEY → native openai provider, model=${DEFAULT_MODEL}"
+  echo "[start.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com (api_mode=chat_completions, model=${DEFAULT_MODEL})"
 fi
 
 {
@@ -133,6 +133,12 @@ fi
   fi
   if [ -n "${HERMES_CUSTOM_API_KEY:-}" ]; then
     echo "  api_key: \"${HERMES_CUSTOM_API_KEY}\""
+  fi
+  # api_mode gates hermes custom-provider request shape:
+  #   chat_completions  → /v1/chat/completions (OpenAI-compat)
+  #   codex_responses   → /v1/responses + encrypted_content (o1 only)
+  if [ -n "${HERMES_CUSTOM_API_MODE:-}" ]; then
+    echo "  api_mode: \"${HERMES_CUSTOM_API_MODE}\""
   fi
 } >"$HERMES_CONFIG"
 chown agent:agent "$HERMES_CONFIG"
