@@ -102,6 +102,17 @@ DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}"
 DERIVE_SCRIPT="/app/scripts/derive-provider.sh"
 [ -f "$DERIVE_SCRIPT" ] || DERIVE_SCRIPT="/scripts/derive-provider.sh"
 HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" . "$DERIVE_SCRIPT"
+
+# Auto-bridge OPENAI_API_KEY → "custom" provider against api.openai.com
+# when derive-provider picked "custom" via the openai/* slug path.
+# Kept in sync with install.sh so Docker + bare-host paths behave
+# identically. HERMES_CUSTOM_* env vars win when explicitly set.
+if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
+  export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
+  export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
+  echo "[start.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com"
+fi
+
 {
   echo "# Seeded by molecule template-hermes start.sh. Customize via"
   echo "# \`hermes config edit\` or by editing this file directly."

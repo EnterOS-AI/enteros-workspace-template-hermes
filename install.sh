@@ -121,6 +121,20 @@ chmod 600 "$HERMES_HOME/.env"
 DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}"
 HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" \
   . "$(dirname "$0")/scripts/derive-provider.sh"
+
+# Auto-bridge OPENAI_API_KEY → "custom" provider against api.openai.com
+# when derive-provider picked "custom" via the openai/* slug path
+# (fires only when OPENAI_API_KEY is set but OPENROUTER_API_KEY is not —
+# see scripts/derive-provider.sh). Without this, PROVIDER=custom would
+# write an empty base_url/api_key stanza and hermes would fail on first
+# call. HERMES_CUSTOM_* env vars still win when the operator set them
+# explicitly; we only fill missing values.
+if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
+  export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
+  export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
+  echo "[install.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com"
+fi
+
 {
   echo "# Seeded by template-hermes install.sh on $(date -u -Iseconds)"
   echo "# Rewritten each boot from HERMES_DEFAULT_MODEL + HERMES_INFERENCE_PROVIDER env."
