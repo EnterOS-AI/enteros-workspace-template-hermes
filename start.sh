@@ -103,14 +103,17 @@ DERIVE_SCRIPT="/app/scripts/derive-provider.sh"
 [ -f "$DERIVE_SCRIPT" ] || DERIVE_SCRIPT="/scripts/derive-provider.sh"
 HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" . "$DERIVE_SCRIPT"
 
-# Auto-bridge OPENAI_API_KEY → "custom" provider against api.openai.com
-# when derive-provider picked "custom" via the openai/* slug path.
-# Kept in sync with install.sh so Docker + bare-host paths behave
-# identically. HERMES_CUSTOM_* env vars win when explicitly set.
+# --- FIXES #13 + #14: use native openai provider for OpenAI bridge ---
+# Symmetric with install.sh. Custom provider path was broken on OpenAI:
+#   - passes full slug (openai/gpt-4o) → 400 model_not_found
+#   - sends include=[reasoning.encrypted_content] → 400 on non-o1 models
+# Native openai provider strips the prefix and routes through the
+# model-family-aware code path. Explicit HERMES_CUSTOM_* still wins
+# when the operator configures a genuine custom endpoint (e.g. vLLM).
 if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
-  export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
-  export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
-  echo "[start.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com"
+  PROVIDER="openai"
+  DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"
+  echo "[start.sh] bridged OPENAI_API_KEY → native openai provider, model=${DEFAULT_MODEL}"
 fi
 
 {
