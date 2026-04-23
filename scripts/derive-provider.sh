@@ -59,8 +59,26 @@ case "${HERMES_DEFAULT_MODEL}" in
   opencode-zen/*)          PROVIDER="opencode-zen" ;;
   opencode-go/*)           PROVIDER="opencode-go" ;;
 
-  # Hermes-specific routing quirks
-  openai/*)                PROVIDER="openrouter" ;;  # no direct openai provider; openrouter covers it
+  # Hermes-specific routing quirks. `openai/*` has two valid targets:
+  #   1. OpenRouter (hermes's built-in path — requires OPENROUTER_API_KEY).
+  #   2. hermes's "custom" provider pointed at api.openai.com — requires
+  #      OPENAI_API_KEY. install.sh sees this case and auto-populates
+  #      HERMES_CUSTOM_{BASE_URL,API_KEY} so the direct-OpenAI path works
+  #      without the user having to set HERMES_CUSTOM_* explicitly.
+  # Prefer OR when an OR key is present (keeps existing installs stable).
+  # Fall through to custom when only an OpenAI key is available — the
+  # operator expectation for a workspace whose sole credential is
+  # OPENAI_API_KEY is that hermes should call OpenAI directly, not fail
+  # on "missing OPENROUTER_API_KEY". Matches the 2026-04-23 E2E case.
+  openai/*)
+    if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+      PROVIDER="openrouter"
+    elif [ -n "${OPENAI_API_KEY:-}" ]; then
+      PROVIDER="custom"
+    else
+      PROVIDER="openrouter" # no-key fallback — hermes will error clearly
+    fi
+    ;;
   nousresearch/*)
     # Prefer direct Nous Portal if Nous credentials present, else OR.
     if [ -n "${HERMES_API_KEY:-}" ] || [ -n "${NOUS_API_KEY:-}" ]; then
