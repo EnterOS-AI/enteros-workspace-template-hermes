@@ -60,21 +60,27 @@ case "${HERMES_DEFAULT_MODEL}" in
   opencode-go/*)           PROVIDER="opencode-go" ;;
 
   # Hermes-specific routing quirks. `openai/*` has two valid targets:
-  #   1. OpenRouter (hermes's built-in path — requires OPENROUTER_API_KEY).
-  #   2. hermes's "custom" provider pointed at api.openai.com — requires
+  #   1. hermes's "custom" provider pointed at api.openai.com — requires
   #      OPENAI_API_KEY. install.sh sees this case and auto-populates
   #      HERMES_CUSTOM_{BASE_URL,API_KEY} so the direct-OpenAI path works
   #      without the user having to set HERMES_CUSTOM_* explicitly.
-  # Prefer OR when an OR key is present (keeps existing installs stable).
-  # Fall through to custom when only an OpenAI key is available — the
-  # operator expectation for a workspace whose sole credential is
-  # OPENAI_API_KEY is that hermes should call OpenAI directly, not fail
-  # on "missing OPENROUTER_API_KEY". Matches the 2026-04-23 E2E case.
+  #   2. OpenRouter (hermes's built-in path — requires OPENROUTER_API_KEY).
+  #
+  # Priority: prefer **custom** (direct OpenAI) when OPENAI_API_KEY is set.
+  # The operator supplying OPENAI_API_KEY for an openai/* model is an
+  # explicit intent signal to hit OpenAI directly. The previous "prefer
+  # OR if any OR key exists" rule silently hijacked that intent whenever
+  # a tenant-global OPENROUTER_API_KEY was present (even if stale/empty
+  # enough to 401), which is exactly what bit the 2026-04-23 E2E (surfaced
+  # as OpenRouter's `401 Missing Authentication header` in the agent reply).
+  #
+  # To explicitly route openai/* through OR, set HERMES_INFERENCE_PROVIDER=openrouter
+  # (handled at the top of this file) or use an openrouter/* model slug.
   openai/*)
-    if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-      PROVIDER="openrouter"
-    elif [ -n "${OPENAI_API_KEY:-}" ]; then
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
       PROVIDER="custom"
+    elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
+      PROVIDER="openrouter"
     else
       PROVIDER="openrouter" # no-key fallback — hermes will error clearly
     fi
