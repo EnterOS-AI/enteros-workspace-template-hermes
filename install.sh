@@ -162,30 +162,45 @@ HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" \
 # the authoritative list. Therefore the OpenAI bridge uses `custom`
 # provider pointed at api.openai.com.
 #
-# Three things have to line up for this to actually work:
+# Two independent concerns:
 #
-#   (1) Keep PROVIDER=custom when only OPENAI_API_KEY is set. Setting
-#       PROVIDER=openai crashes the gateway with "Unknown provider".
+#   (A) Auto-fill HERMES_CUSTOM_{BASE_URL,API_KEY,API_MODE} when the
+#       operator hasn't — so the common case (just OPENAI_API_KEY) Just
+#       Works. Operators who configure HERMES_CUSTOM_* themselves (vLLM,
+#       LM Studio, a custom OpenAI-compat gateway) skip this step and
+#       keep their own values.
 #
-#   (2) Strip the `openai/` prefix from DEFAULT_MODEL. Custom passes
-#       the model name verbatim to the endpoint; OpenAI rejects
-#       `openai/gpt-4o` with 400 model_not_found (expects `gpt-4o`).
+#   (B) Strip the `openai/` provider prefix from DEFAULT_MODEL when the
+#       final request target is api.openai.com, regardless of who set
+#       HERMES_CUSTOM_BASE_URL. OpenAI rejects `openai/gpt-4o` with 400
+#       "invalid model ID" — it expects bare `gpt-4o`. This concern is
+#       independent of who configured the routing: if requests land at
+#       api.openai.com, the prefix must go.
 #
-#   (3) Set api_mode: "chat_completions" in the emitted config.yaml.
-#       Without this, hermes defaults custom provider to codex_responses
-#       which hits /v1/responses + sends include=[reasoning.encrypted_content].
-#       gpt-4o / gpt-4.1 reject that with 400 (only o1 family supports it).
-#
-# Fires ONLY when operator hasn't configured HERMES_CUSTOM_* themselves —
-# explicit custom endpoints (vLLM, LM Studio) skip the prefix strip and
-# chat_completions default.
+# These were bundled in a single guard before 2026-04-24, which caused:
+# operators who pinned HERMES_CUSTOM_{BASE_URL,API_KEY,API_MODE} to
+# api.openai.com (e.g. the molecule-core E2E test after PR #1987) got
+# the right routing but not the prefix strip, and hit OpenAI 400.
+# Separating (A) and (B) makes both paths correct.
+
+# (A) auto-fill defaults when operator hasn't configured custom
 if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
   export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
   export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
   export HERMES_CUSTOM_API_MODE="chat_completions"
-  # Strip the `openai/` provider prefix — OpenAI expects bare model names.
+  echo "[install.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com (api_mode=chat_completions)"
+fi
+
+# (B) strip the openai/ prefix ONLY when the final URL is api.openai.com.
+# The regex intentionally anchors to start + requires a `/` or end-of-string
+# after `api.openai.com` so lookalike domains (api.openai.com.evil.internal)
+# do not match. Idempotent when there's no prefix.
+if [[ "${HERMES_CUSTOM_BASE_URL:-}" =~ ^https?://api\.openai\.com(/|$) ]]; then
+  BEFORE="${DEFAULT_MODEL}"
   DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"
-  echo "[install.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com (api_mode=chat_completions, model=${DEFAULT_MODEL})"
+  if [ "${BEFORE}" != "${DEFAULT_MODEL}" ]; then
+    echo "[install.sh] stripped openai/ prefix → model=${DEFAULT_MODEL} (routing to api.openai.com)"
+  fi
 fi
 
 {
