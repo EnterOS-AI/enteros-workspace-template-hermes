@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-HERMES_HOME="/home/agent/.hermes"
+HERMES_HOME="/tmp/.hermes"
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
 LOG_FILE="/tmp/hermes-gateway.log"
@@ -144,11 +144,15 @@ fi
 chown agent:agent "$HERMES_CONFIG"
 
 # --- Start hermes gateway in the background ---
-# `hermes gateway` reads ~/.hermes/.env at startup. We run it as the
-# agent user via gosu so memory/skills land in the agent-owned home.
-# `bash -lc` forces a login shell so .profile / .bashrc add ~/.local/bin
-# to PATH (that's where install.sh symlinks the hermes binary).
-nohup gosu agent bash -lc "cd /home/agent && hermes gateway" \
+# `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
+# /tmp so the lookup resolves to /tmp/.hermes/.env (writable; matches
+# HERMES_HOME above). The hermes binary is on PATH via /home/agent/.local/bin
+# (set in Dockerfile) — that location is read-only under T1 sandbox but
+# binary lookup only needs read.
+# Use bash -c (not -lc) since we no longer want the login-shell HOME-driven
+# defaults; we're explicitly setting PATH + HOME inline.
+nohup gosu agent env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    bash -c "cd /tmp && hermes gateway" \
     >>"$LOG_FILE" 2>&1 &
 GATEWAY_PID=$!
 
