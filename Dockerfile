@@ -19,10 +19,7 @@ RUN useradd -u 1000 -m -s /bin/bash agent
 # --- Install molecule_runtime (bridge + A2A server) ---
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    python3 -c "import molecule_runtime.preflight as pf; pf.SUPPORTED_RUNTIMES.add('hermes')" && \
-    SITE=$(python3 -c 'import molecule_runtime.preflight as p; print(p.__file__)') && \
-    sed -i "s/SUPPORTED_RUNTIMES = {/SUPPORTED_RUNTIMES = {'hermes', 'gemini-cli',/" "$SITE"
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY adapter.py .
 COPY __init__.py .
