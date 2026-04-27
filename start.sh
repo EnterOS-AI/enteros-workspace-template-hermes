@@ -13,7 +13,7 @@ set -euo pipefail
 HERMES_HOME="/home/agent/.hermes"
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
-LOG_FILE="/var/log/hermes-gateway.log"
+LOG_FILE="/tmp/hermes-gateway.log"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
