@@ -1,5 +1,5 @@
 # Molecule AI workspace runtime — adapter + A2A server infra
-molecule-ai-workspace-runtime>=0.1.0
+molecule-ai-workspace-runtime>=0.1.22
 
 # Bridge dependency — async HTTP to the local hermes-agent gateway on :8642.
 # All model/provider SDKs are now owned by hermes-agent itself; see

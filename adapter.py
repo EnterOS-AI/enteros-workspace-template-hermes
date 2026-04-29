@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 
-from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
+from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig, RuntimeCapabilities
 
 
 class HermesAgentAdapter(BaseAdapter):
@@ -53,6 +53,53 @@ class HermesAgentAdapter(BaseAdapter):
                 ),
             },
         }
+
+    def capabilities(self) -> RuntimeCapabilities:
+        """Hermes-agent owns several cross-cutting capabilities natively
+        — see project memory `project_runtime_native_pluggable.md`.
+
+        provides_native_session=True
+            hermes-agent runs an in-container event log (memory or Redis,
+            configurable via runtime.event_log.backend in its own
+            config.yaml) that holds in-flight session state across A2A
+            turns. The platform's a2a_queue would double-buffer the
+            same state — declaring native_session lets the platform
+            skip enqueueing and dispatch directly. Validates capability
+            primitive #5 once that consumer lands.
+
+        Other capabilities stay False (platform fallback owns them):
+        - provides_native_heartbeat: hermes-agent doesn't broadcast
+          progress events at the platform's cadence; we keep emitting
+          WORKSPACE_HEARTBEAT every 30s from heartbeat.py so the canvas
+          UI's idle indicator stays accurate.
+        - provides_native_scheduler: hermes-agent has no built-in cron;
+          platform scheduler keeps owning it.
+        - provides_native_status_mgmt: hermes-agent doesn't surface a
+          ready/degraded/failed signal back to us; platform's
+          error_rate inference still drives the workspace status.
+        - provides_native_retry / activity_decoration / channel_dispatch:
+          not implemented in hermes-agent's API server — platform
+          fallback applies.
+        """
+        return RuntimeCapabilities(
+            provides_native_session=True,
+        )
+
+    def idle_timeout_override(self) -> int:
+        """hermes-agent synthesis on slower providers (anthropic Opus,
+        custom models behind hermes' provider router) routinely exceeds
+        the platform default 5min idle window. The single-text reply
+        path also doesn't broadcast tool-call progress events while the
+        upstream LLM is thinking — so the platform's broadcaster-silence
+        timer would cancel a legit-but-slow synthesis. 15 min covers
+        every observed turn so far without leaving genuinely-wedged
+        runs hanging too long.
+
+        Capability primitive #2 — see workspace/adapter_base.py:
+        idle_timeout_override and PR #2139 for the platform-side
+        consumer in a2a_proxy.dispatchA2A.
+        """
+        return 900  # 15 minutes
 
     async def setup(self, config: AdapterConfig) -> None:
         """Verify the hermes-agent API server is reachable.
