@@ -32,7 +32,7 @@ import httpx
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.utils import new_agent_text_message
+from a2a.helpers import new_text_message
 
 from molecule_runtime.adapters.base import AdapterConfig
 from molecule_runtime.executor_helpers import extract_message_text
@@ -62,7 +62,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         prompt = extract_message_text(context.message) or ""
         if not prompt.strip():
             await event_queue.enqueue_event(
-                new_agent_text_message("(empty prompt — nothing to do)")
+                new_text_message("(empty prompt — nothing to do)")
             )
             return
 
@@ -82,7 +82,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
             body = exc.response.text[:500] if exc.response is not None else ""
             logger.error("hermes-agent %s: %s", exc.response.status_code, body)
             await event_queue.enqueue_event(
-                new_agent_text_message(
+                new_text_message(
                     f"[hermes-agent error {exc.response.status_code}] {body}"
                 )
             )
@@ -90,12 +90,12 @@ class HermesAgentProxyExecutor(AgentExecutor):
         except httpx.RequestError as exc:
             logger.exception("hermes-agent transport error")
             await event_queue.enqueue_event(
-                new_agent_text_message(f"[hermes-agent unreachable] {exc!s}")
+                new_text_message(f"[hermes-agent unreachable] {exc!s}")
             )
             return
 
         text = self._extract_assistant_text(data)
-        await event_queue.enqueue_event(new_agent_text_message(text))
+        await event_queue.enqueue_event(new_text_message(text))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # hermes-agent doesn't expose a per-request cancel over HTTP in the

@@ -10,10 +10,10 @@
 
 set -euo pipefail
 
-HERMES_HOME="/home/agent/.hermes"
+HERMES_HOME="/tmp/.hermes"
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
-LOG_FILE="/var/log/hermes-gateway.log"
+LOG_FILE="/tmp/hermes-gateway.log"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
@@ -94,7 +94,51 @@ chmod 600 "$ENV_FILE"
 # the selection; operators override via HERMES_INFERENCE_PROVIDER
 # + HERMES_DEFAULT_MODEL env, or by editing config.yaml at runtime
 # inside the container.
-DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}"
+# Pick a default model. The fallback used to be `nousresearch/hermes-4-70b`
+# unconditionally, which derives PROVIDER=openrouter when no Nous key is
+# present — and if OPENROUTER_API_KEY isn't set either, hermes-agent boots
+# with a config that points at a provider with no usable key, then 500s
+# at request time with "No LLM provider configured". Surfaces as a real
+# user-facing error whenever a workspace is provisioned with a single
+# provider key (e.g. just MINIMAX_API_KEY) but no explicit model
+# selection — the canvas's "set key, save, send" flow.
+#
+# Fix: when HERMES_DEFAULT_MODEL is unset and HERMES_INFERENCE_PROVIDER
+# is unset, pick the default model based on which API key is actually
+# present in env. Keeps the behaviour-when-everything-is-set unchanged
+# (operator-supplied HERMES_DEFAULT_MODEL still wins). Order below is
+# rough preference (direct providers preferred over OR routing for the
+# same model family).
+if [ -z "${HERMES_DEFAULT_MODEL:-}" ] && [ -z "${HERMES_INFERENCE_PROVIDER:-}" ]; then
+  if   [ -n "${HERMES_API_KEY:-}" ] || [ -n "${NOUS_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="nousresearch/hermes-4-70b"
+  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="anthropic/claude-sonnet-4-5"
+  elif [ -n "${OPENAI_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="openai/gpt-4o"
+  elif [ -n "${MINIMAX_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="minimax/MiniMax-M2.7-highspeed"
+  elif [ -n "${MINIMAX_CN_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="minimax-cn/abab6.5-chat"
+  elif [ -n "${GEMINI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="gemini/gemini-2.0-flash"
+  elif [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="deepseek/deepseek-chat"
+  elif [ -n "${KIMI_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="kimi/kimi-k2"
+  elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
+    HERMES_DEFAULT_MODEL="nousresearch/hermes-4-70b"  # routes via OR
+  else
+    # No provider key at all — keep the historical fallback so the
+    # error surfaces as the same "No LLM provider configured" message
+    # that operators are familiar with (rather than swapping it for a
+    # different obscure error).
+    HERMES_DEFAULT_MODEL="nousresearch/hermes-4-70b"
+  fi
+  echo "[start.sh] HERMES_DEFAULT_MODEL was unset; auto-selected '${HERMES_DEFAULT_MODEL}' from available API keys"
+fi
+
+DEFAULT_MODEL="${HERMES_DEFAULT_MODEL}"
 # Derive provider from model slug prefix — shared with install.sh via
 # scripts/derive-provider.sh so Docker + bare-host paths match.
 # Dockerfile COPYs scripts/ to /app/scripts; fall back to /scripts
@@ -144,11 +188,15 @@ fi
 chown agent:agent "$HERMES_CONFIG"
 
 # --- Start hermes gateway in the background ---
-# `hermes gateway` reads ~/.hermes/.env at startup. We run it as the
-# agent user via gosu so memory/skills land in the agent-owned home.
-# `bash -lc` forces a login shell so .profile / .bashrc add ~/.local/bin
-# to PATH (that's where install.sh symlinks the hermes binary).
-nohup gosu agent bash -lc "cd /home/agent && hermes gateway" \
+# `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
+# /tmp so the lookup resolves to /tmp/.hermes/.env (writable; matches
+# HERMES_HOME above). The hermes binary is on PATH via /home/agent/.local/bin
+# (set in Dockerfile) — that location is read-only under T1 sandbox but
+# binary lookup only needs read.
+# Use bash -c (not -lc) since we no longer want the login-shell HOME-driven
+# defaults; we're explicitly setting PATH + HOME inline.
+nohup gosu agent env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    bash -c "cd /tmp && hermes gateway" \
     >>"$LOG_FILE" 2>&1 &
 GATEWAY_PID=$!
 
