@@ -109,6 +109,14 @@ class HermesAgentAdapter(BaseAdapter):
         workspace is marked unhealthy rather than silently forwarding to
         a dead port.
         """
+        # Boot-smoke contract (molecule-core#2275): start.sh's smoke-mode
+        # branch exec's molecule-runtime without spawning the gateway,
+        # so :8642 isn't listening. Skip the health probe under smoke
+        # mode — the runtime's smoke short-circuit fires after
+        # create_executor() returns.
+        if os.environ.get("MOLECULE_SMOKE_MODE") == "1":
+            return
+
         try:
             import httpx  # noqa: F401
         except ImportError as exc:  # pragma: no cover

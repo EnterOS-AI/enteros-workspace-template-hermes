@@ -10,6 +10,19 @@
 
 set -euo pipefail
 
+# Boot-smoke contract (molecule-core#2275): the publish-image gate
+# invokes the runtime with stub creds and no network so it can
+# exercise lazy imports inside executor.execute(). The hermes
+# gateway needs valid creds + a writable log file, neither of which
+# exist in the smoke env. Skip directly to molecule-runtime — the
+# runtime's smoke_mode short-circuit fires after create_executor()
+# returns and exits before any A2A traffic is attempted. Real
+# production boots are unaffected.
+if [ "${MOLECULE_SMOKE_MODE:-0}" = "1" ]; then
+  echo "[start.sh] MOLECULE_SMOKE_MODE=1 — skipping hermes gateway spawn"
+  exec molecule-runtime
+fi
+
 HERMES_HOME="/tmp/.hermes"
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
