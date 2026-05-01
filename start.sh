@@ -107,6 +107,21 @@ chmod 600 "$ENV_FILE"
 # the selection; operators override via HERMES_INFERENCE_PROVIDER
 # + HERMES_DEFAULT_MODEL env, or by editing config.yaml at runtime
 # inside the container.
+# Pull HERMES_DEFAULT_MODEL + HERMES_INFERENCE_PROVIDER out of
+# /configs/config.yaml (canvas Config tab values, written by CP
+# user-data per task #197). Env-var overrides still win — the helper
+# only sets vars that aren't already set. Sourced for env mutation.
+# Dockerfile COPYs scripts/ to /app/scripts; fall back to /scripts
+# for dev environments running start.sh with a different WORKDIR.
+#
+# Runs BEFORE the API-key-based auto-selection block below so a
+# canvas-set provider/model wins over a key-presence guess. Operators
+# who explicitly picked GLM-4.6 in the UI shouldn't get bumped to
+# anthropic/* just because ANTHROPIC_API_KEY happens to be in env too.
+LOAD_CONFIG_SCRIPT="/app/scripts/load-workspace-config.sh"
+[ -f "$LOAD_CONFIG_SCRIPT" ] || LOAD_CONFIG_SCRIPT="/scripts/load-workspace-config.sh"
+[ -f "$LOAD_CONFIG_SCRIPT" ] && . "$LOAD_CONFIG_SCRIPT"
+
 # Pick a default model. The fallback used to be `nousresearch/hermes-4-70b`
 # unconditionally, which derives PROVIDER=openrouter when no Nous key is
 # present — and if OPENROUTER_API_KEY isn't set either, hermes-agent boots
@@ -119,9 +134,9 @@ chmod 600 "$ENV_FILE"
 # Fix: when HERMES_DEFAULT_MODEL is unset and HERMES_INFERENCE_PROVIDER
 # is unset, pick the default model based on which API key is actually
 # present in env. Keeps the behaviour-when-everything-is-set unchanged
-# (operator-supplied HERMES_DEFAULT_MODEL still wins). Order below is
-# rough preference (direct providers preferred over OR routing for the
-# same model family).
+# (operator-supplied HERMES_DEFAULT_MODEL still wins, including the
+# config.yaml-sourced one above). Order below is rough preference
+# (direct providers preferred over OR routing for the same model family).
 if [ -z "${HERMES_DEFAULT_MODEL:-}" ] && [ -z "${HERMES_INFERENCE_PROVIDER:-}" ]; then
   if   [ -n "${HERMES_API_KEY:-}" ] || [ -n "${NOUS_API_KEY:-}" ]; then
     HERMES_DEFAULT_MODEL="nousresearch/hermes-4-70b"
