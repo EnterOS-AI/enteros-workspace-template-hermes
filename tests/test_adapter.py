@@ -1,0 +1,165 @@
+"""Tests for adapter.py.
+
+Coverage targets the public adapter surface:
+  - Static introspection (name, display_name, description, schema)
+  - Capabilities (provides_native_session=True, others False)
+  - idle_timeout_override (15min)
+  - setup() smoke-mode short-circuit
+  - setup() health probe via plugin path (default) and chat_completions
+    path (when MOLECULE_A2A_PLATFORM_ENABLED=false)
+  - create_executor() returns a started executor
+"""
+
+from __future__ import annotations
+
+import socket
+from typing import Any
+
+import pytest
+from aiohttp import web
+
+from adapter import HermesAgentAdapter, Adapter
+from molecule_runtime.adapters.base import AdapterConfig
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# ---- structural -----------------------------------------------------
+
+
+def test_adapter_alias():
+    assert Adapter is HermesAgentAdapter
+
+
+def test_static_introspection():
+    assert HermesAgentAdapter.name() == "hermes"
+    assert HermesAgentAdapter.display_name() == "Hermes Agent (Nous Research)"
+    desc = HermesAgentAdapter.description()
+    assert "Nous Research" in desc
+    schema = HermesAgentAdapter.get_config_schema()
+    assert "model" in schema
+    assert schema["model"]["type"] == "string"
+
+
+def test_capabilities_provide_native_session():
+    caps = HermesAgentAdapter().capabilities()
+    assert caps.provides_native_session is True
+
+
+def test_idle_timeout_override_is_15_min():
+    assert HermesAgentAdapter().idle_timeout_override() == 900
+
+
+# ---- setup() lifecycle ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_under_smoke_mode(monkeypatch):
+    monkeypatch.setenv("MOLECULE_SMOKE_MODE", "1")
+    # No HTTP server running anywhere — would fail if probe was attempted.
+    cfg = AdapterConfig(model="hermes-test")
+    await HermesAgentAdapter().setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_probes_plugin_health_by_default(monkeypatch):
+    """With MOLECULE_A2A_PLATFORM_ENABLED unset, setup() must probe
+    /a2a/health (NOT the legacy /v1/health)."""
+
+    monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
+    monkeypatch.delenv("MOLECULE_A2A_PLATFORM_ENABLED", raising=False)
+
+    health_port = _free_port()
+    paths_hit: list[str] = []
+
+    async def health_handler(request: web.Request) -> web.Response:
+        paths_hit.append(request.path)
+        return web.json_response({"ok": True, "platform": "molecule-a2a"})
+
+    app = web.Application()
+    app.router.add_get("/a2a/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", health_port)
+    await site.start()
+
+    try:
+        monkeypatch.setenv("MOLECULE_A2A_PLATFORM_PORT", str(health_port))
+        cfg = AdapterConfig(model="hermes-test")
+        await HermesAgentAdapter().setup(cfg)
+    finally:
+        await site.stop()
+        await runner.cleanup()
+
+    assert paths_hit == ["/a2a/health"]
+
+
+@pytest.mark.asyncio
+async def test_setup_probes_chat_completions_health_when_disabled(monkeypatch):
+    monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "false")
+
+    api_port = _free_port()
+    paths_hit: list[str] = []
+
+    async def health_handler(request: web.Request) -> web.Response:
+        paths_hit.append(request.path)
+        return web.json_response({"status": "ok"})
+
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", api_port)
+    await site.start()
+
+    try:
+        monkeypatch.setenv(
+            "HERMES_API_BASE", f"http://127.0.0.1:{api_port}/v1"
+        )
+        cfg = AdapterConfig(model="hermes-test")
+        await HermesAgentAdapter().setup(cfg)
+    finally:
+        await site.stop()
+        await runner.cleanup()
+
+    assert paths_hit == ["/health"]
+
+
+# ---- create_executor lifecycle ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_executor_returns_started_executor(monkeypatch):
+    """create_executor() must return an executor whose reply server is
+    already running (start() was called)."""
+
+    cb_port = _free_port()
+    monkeypatch.setenv("MOLECULE_A2A_CALLBACK_PORT", str(cb_port))
+
+    cfg = AdapterConfig(model="hermes-test")
+    executor = await HermesAgentAdapter().create_executor(cfg)
+    try:
+        assert executor._started is True
+        assert executor._reply_runner is not None
+        assert executor._reply_site is not None
+    finally:
+        await executor.stop()
+
+
+@pytest.mark.asyncio
+async def test_create_executor_when_plugin_disabled_skips_reply_server(monkeypatch):
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "false")
+    cfg = AdapterConfig(model="hermes-test")
+    executor = await HermesAgentAdapter().create_executor(cfg)
+    try:
+        assert executor._started is True
+        # No reply server when fallback path is in use.
+        assert executor._reply_runner is None
+        assert executor._reply_site is None
+    finally:
+        await executor.stop()
