@@ -55,6 +55,32 @@ RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/
 # ~/.local/bin/hermes, so ~/.local/bin is the only PATH entry we need.
 ENV PATH="/home/agent/.local/bin:${PATH}"
 
+# --- Molecule A2A platform plugin (post-demo: native push parity) ---
+# Two refs are installed into the same venv that the upstream installer
+# created above:
+#
+#   1. A pinned hermes-agent fork carrying the proposed
+#      `register_platform_adapter` patch series (NousResearch/hermes-agent
+#      PR #18775). Installed --force-reinstall over the upstream wheel so
+#      `hermes_cli/plugins.py` exposes PluginContext.register_platform_adapter
+#      and `gateway/run.py` honors plugin_platforms. Same deps as upstream
+#      (the patch is pure-Python additions), so no resolver impact.
+#   2. The Molecule A2A platform plugin itself, auto-discovered via
+#      hermes's `hermes_agent.plugins` entry-point group.
+#
+# Until upstream PR #18775 merges, the fork is the only place the patch
+# exists. Once merged + released, the fork install can be dropped and the
+# plugin will load against the official wheel unchanged.
+ARG HERMES_FORK_REF=feat/platform-adapter-plugins
+ARG HERMES_PLATFORM_MOLECULE_A2A_REF=main
+# The hermes installer uses uv to create the venv and doesn't seed pip
+# into it. Bootstrap pip first via ensurepip, then install both wheels.
+RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && \
+    /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir --force-reinstall \
+      "git+https://github.com/HongmingWang-Rabbit/hermes-agent.git@${HERMES_FORK_REF}#egg=hermes-agent" && \
+    /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir \
+      "git+https://github.com/Molecule-AI/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
+
 USER root
 WORKDIR /app
 
@@ -62,7 +88,11 @@ ENV ADAPTER_MODULE=adapter \
     HERMES_API_BASE=http://127.0.0.1:8642/v1 \
     API_SERVER_ENABLED=true \
     API_SERVER_HOST=127.0.0.1 \
-    API_SERVER_PORT=8642
+    API_SERVER_PORT=8642 \
+    MOLECULE_A2A_PLATFORM_ENABLED=true \
+    MOLECULE_A2A_PLATFORM_HOST=127.0.0.1 \
+    MOLECULE_A2A_PLATFORM_PORT=8645 \
+    MOLECULE_A2A_PLATFORM_CALLBACK_URL=http://127.0.0.1:8000/a2a/reply
 
 # start.sh boots `hermes gateway` in the background, waits for :8642
 # readiness, then exec's molecule-runtime on :8000.
