@@ -102,18 +102,19 @@ class HermesAgentAdapter(BaseAdapter):
         return 900  # 15 minutes
 
     async def setup(self, config: AdapterConfig) -> None:
-        """Verify the hermes-agent API server is reachable.
+        """Verify the hermes-agent API surface this workspace will use.
 
-        start.sh boots `hermes gateway` before molecule-runtime. If the
-        gateway didn't come up by the time setup runs, fail loud so the
-        workspace is marked unhealthy rather than silently forwarding to
-        a dead port.
+        start.sh boots `hermes gateway` before molecule-runtime. With
+        MOLECULE_A2A_PLATFORM_ENABLED=true (default) we probe the
+        plugin's /a2a/health endpoint; otherwise we fall back to the
+        legacy api-server /health. Failing here marks the workspace
+        unhealthy rather than silently forwarding to a dead port.
         """
         # Boot-smoke contract (molecule-core#2275): start.sh's smoke-mode
         # branch exec's molecule-runtime without spawning the gateway,
-        # so :8642 isn't listening. Skip the health probe under smoke
-        # mode — the runtime's smoke short-circuit fires after
-        # create_executor() returns.
+        # so neither the plugin port nor :8642 is listening. Skip the
+        # health probe under smoke mode — the runtime's smoke
+        # short-circuit fires after create_executor() returns.
         if os.environ.get("MOLECULE_SMOKE_MODE") == "1":
             return
 
@@ -127,21 +128,44 @@ class HermesAgentAdapter(BaseAdapter):
 
         import httpx
 
-        base = os.environ.get("HERMES_API_BASE", "http://127.0.0.1:8642/v1").rstrip("/")
-        health_url = base.replace("/v1", "") + "/health"
+        use_plugin = os.environ.get(
+            "MOLECULE_A2A_PLATFORM_ENABLED", "true"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        if use_plugin:
+            host = os.environ.get("MOLECULE_A2A_PLATFORM_HOST", "127.0.0.1")
+            port = int(os.environ.get("MOLECULE_A2A_PLATFORM_PORT", "8645"))
+            health_url = f"http://{host}:{port}/a2a/health"
+            err_hint = (
+                "Check /var/log/hermes-gateway.log inside the container — "
+                "the molecule-a2a platform stanza in ~/.hermes/config.yaml "
+                "should make hermes load the plugin and bind this port."
+            )
+        else:
+            base = os.environ.get(
+                "HERMES_API_BASE", "http://127.0.0.1:8642/v1"
+            ).rstrip("/")
+            health_url = base.replace("/v1", "") + "/health"
+            err_hint = "Check /var/log/hermes-gateway.log inside the container."
+
+        # AsyncClient — sync httpx inside an async setup() can deadlock
+        # against an aiohttp server sharing the same event loop (only
+        # bites in tests; real deployments separate processes).
         try:
-            r = httpx.get(health_url, timeout=5.0)
-            r.raise_for_status()
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(health_url)
+                r.raise_for_status()
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(
-                f"hermes-agent API server not reachable at {health_url}. "
-                "Check /var/log/hermes-gateway.log inside the container."
+                f"hermes-agent surface not reachable at {health_url}. {err_hint}"
             ) from exc
 
     async def create_executor(self, config: AdapterConfig):
         from executor import HermesAgentProxyExecutor
 
-        return HermesAgentProxyExecutor(config)
+        executor = HermesAgentProxyExecutor(config)
+        await executor.start()
+        return executor
 
 
 Adapter = HermesAgentAdapter

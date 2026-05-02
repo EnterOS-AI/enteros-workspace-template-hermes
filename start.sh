@@ -222,13 +222,18 @@ fi
   # the api-server bridge today; switching to the plugin path is a
   # separate adapter.py change (post-demo).
   if [ "${MOLECULE_A2A_PLATFORM_ENABLED:-true}" = "true" ]; then
+    # Default the plugin's callback URL to the executor's reply
+    # server (started by adapter.create_executor → executor.start()).
+    # Operators can pin a custom URL via env if molecule-runtime is
+    # extended to host /a2a/reply itself.
+    DEFAULT_CALLBACK="http://${MOLECULE_A2A_CALLBACK_HOST:-127.0.0.1}:${MOLECULE_A2A_CALLBACK_PORT:-8646}/a2a/reply"
     echo "platforms:"
     echo "  molecule-a2a:"
     echo "    enabled: true"
     echo "    extra:"
     echo "      host: \"${MOLECULE_A2A_PLATFORM_HOST:-127.0.0.1}\""
     echo "      port: ${MOLECULE_A2A_PLATFORM_PORT:-8645}"
-    echo "      callback_url: \"${MOLECULE_A2A_PLATFORM_CALLBACK_URL:-http://127.0.0.1:8000/a2a/reply}\""
+    echo "      callback_url: \"${MOLECULE_A2A_PLATFORM_CALLBACK_URL:-${DEFAULT_CALLBACK}}\""
     if [ -n "${MOLECULE_A2A_PLATFORM_SHARED_SECRET:-}" ]; then
       echo "      shared_secret: \"${MOLECULE_A2A_PLATFORM_SHARED_SECRET}\""
     fi

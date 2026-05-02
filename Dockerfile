@@ -92,7 +92,8 @@ ENV ADAPTER_MODULE=adapter \
     MOLECULE_A2A_PLATFORM_ENABLED=true \
     MOLECULE_A2A_PLATFORM_HOST=127.0.0.1 \
     MOLECULE_A2A_PLATFORM_PORT=8645 \
-    MOLECULE_A2A_PLATFORM_CALLBACK_URL=http://127.0.0.1:8000/a2a/reply
+    MOLECULE_A2A_CALLBACK_HOST=127.0.0.1 \
+    MOLECULE_A2A_CALLBACK_PORT=8646
 
 # start.sh boots `hermes gateway` in the background, waits for :8642
 # readiness, then exec's molecule-runtime on :8000.
