@@ -1,6 +1,22 @@
 """A2A → hermes-agent bridge with two transports.
 
-Default transport (``MOLECULE_A2A_PLATFORM_ENABLED=true``)
+Default transport (``MOLECULE_A2A_PLATFORM_ENABLED=false``)
+==========================================================
+POST to ``http://127.0.0.1:8642/v1/chat/completions`` synchronously,
+parse the OpenAI-shaped response, emit. No session continuity but no
+plugin dependency.
+
+This is the safe default while the plugin install path inside the
+deployed image is being debugged: the staging E2E for PR #32 surfaced
+a workspace boot failure where ``hermes gateway run`` did not bind
+``:8645`` inside the container (root cause TBD; local
+``scripts/e2e_full_chain.py`` runs against my laptop venv where the
+plugin was already installed manually, so it didn't catch the
+deployment-shape divergence). Flip back to plugin path with
+``MOLECULE_A2A_PLATFORM_ENABLED=true`` once the image-side install
+is verified.
+
+Plugin transport (``MOLECULE_A2A_PLATFORM_ENABLED=true``)
 =========================================================
 POST each A2A turn to the in-container hermes-agent platform plugin's
 ``/a2a/inbound`` endpoint. Hermes processes the message through its full
@@ -8,19 +24,8 @@ pipeline (sessions, skills, tools, hooks) and POSTs the agent's reply
 back to a callback server we run inside this executor. A correlation
 table maps the inbound ``message_id`` to an ``asyncio.Future`` that the
 ``execute()`` call awaits — so the A2A response is delivered as soon as
-hermes calls ``send()``, not by polling.
-
-This earns single-session continuity for peer agents: every turn lands
-in the same hermes daemon, which keeps its in-memory conversation state
-intact across messages. Replaces the previous "subprocess per A2A
-message" pattern that was ``/v1/chat/completions`` with no continuity.
-
-Fallback transport (``MOLECULE_A2A_PLATFORM_ENABLED=false``)
-============================================================
-The pre-plugin path: POST to ``http://127.0.0.1:8642/v1/chat/completions``
-synchronously, parse the OpenAI-shaped response, emit. No session
-continuity but no plugin dependency. Operators flip this off if the
-plugin path misbehaves in production.
+hermes calls ``send()``, not by polling. Earns single-session continuity
+for peer agents.
 
 Wire shape
 ==========
@@ -102,7 +107,9 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # Plugin transport state. The reply server only boots if the
         # plugin path is enabled; otherwise the executor degrades to
         # the legacy proxy below.
-        self._use_plugin = _bool_env("MOLECULE_A2A_PLATFORM_ENABLED", True)
+        # Default false until the image-side plugin install is verified
+        # — see module docstring. Operators flip on per workspace via env.
+        self._use_plugin = _bool_env("MOLECULE_A2A_PLATFORM_ENABLED", False)
         self._plugin_host = os.environ.get(
             "MOLECULE_A2A_PLATFORM_HOST", _DEFAULT_PLUGIN_HOST
         )

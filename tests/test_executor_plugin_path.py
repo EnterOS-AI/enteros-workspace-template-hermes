@@ -43,6 +43,10 @@ def _free_port() -> int:
 
 
 def _make_executor(monkeypatch, **env: str) -> HermesAgentProxyExecutor:
+    """Test helper. Defaults MOLECULE_A2A_PLATFORM_ENABLED=true so the
+    plugin-path tests below operate in plugin mode by default. Tests
+    that exercise the chat_completions fallback override this."""
+    env.setdefault("MOLECULE_A2A_PLATFORM_ENABLED", "true")
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     cfg = AdapterConfig(
@@ -85,15 +89,29 @@ def _build_context(text: str, *, task_id: str = "task-1"):
 # ---- structural -----------------------------------------------------
 
 
-def test_executor_init_defaults_to_plugin_path(monkeypatch):
+def test_executor_init_defaults_to_chat_completions(monkeypatch):
+    """Default is the safe legacy /v1/chat/completions transport while
+    the image-side plugin install is being debugged. Plugin path is
+    opt-in via MOLECULE_A2A_PLATFORM_ENABLED=true. Port defaults still
+    apply for when the plugin path is enabled.
+
+    Built without _make_executor so the helper's plugin-on default
+    doesn't mask the prod default we want to assert here."""
     monkeypatch.delenv("MOLECULE_A2A_PLATFORM_ENABLED", raising=False)
-    ex = _make_executor(monkeypatch)
-    assert ex._use_plugin is True
+    cfg = AdapterConfig(model="hermes-test", system_prompt="you are helpful")
+    ex = HermesAgentProxyExecutor(cfg)
+    assert ex._use_plugin is False
+    # Defaults still set so plugin enable just needs the one env flip.
     assert ex._plugin_port == 8645
     assert ex._callback_port == 8646
 
 
-def test_executor_falls_back_when_plugin_disabled(monkeypatch):
+def test_executor_enables_plugin_path_when_opted_in(monkeypatch):
+    ex = _make_executor(monkeypatch, MOLECULE_A2A_PLATFORM_ENABLED="true")
+    assert ex._use_plugin is True
+
+
+def test_executor_disabled_explicitly(monkeypatch):
     ex = _make_executor(monkeypatch, MOLECULE_A2A_PLATFORM_ENABLED="false")
     assert ex._use_plugin is False
 
