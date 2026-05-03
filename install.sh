@@ -150,8 +150,13 @@ chmod 600 "$HERMES_HOME/.env"
 # direct openai provider), nousresearch/* → nous-or-openrouter based
 # on keys present, etc.). Explicit HERMES_INFERENCE_PROVIDER in the
 # env always wins.
-DEFAULT_MODEL="${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}"
-HERMES_DEFAULT_MODEL="${DEFAULT_MODEL}" \
+# Read BOTH HERMES_INFERENCE_MODEL (upstream's actual env var, see
+# NousResearch/hermes-agent website/docs/reference/environment-variables.md)
+# AND HERMES_DEFAULT_MODEL (legacy name we invented before 2026-05).
+# Workspace-server still writes the legacy name during the migration
+# window — accepting both keeps existing provisions green.
+DEFAULT_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL:-nousresearch/hermes-4-70b}}"
+HERMES_INFERENCE_MODEL="${DEFAULT_MODEL}" \
   . "$(dirname "$0")/scripts/derive-provider.sh"
 
 # --- OpenAI bridge: PROVIDER=custom + chat_completions api_mode ---

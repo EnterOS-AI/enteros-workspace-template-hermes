@@ -5,9 +5,18 @@
 #
 # Contract:
 #   Reads:  $HERMES_INFERENCE_PROVIDER (if already set, we respect it)
-#           $HERMES_DEFAULT_MODEL      (slug, e.g. "minimax/MiniMax-M2.7-highspeed")
+#           $HERMES_INFERENCE_MODEL    (preferred — matches upstream env name)
+#           $HERMES_DEFAULT_MODEL      (legacy fallback — name we invented before
+#                                       2026-05; workspace-server still writes
+#                                       it during the migration window)
 #           $HERMES_API_KEY / $NOUS_API_KEY (affect the nousresearch/* branch)
 #   Writes: $PROVIDER — the derived provider name, or "auto" if unknown.
+#
+# Upstream's actual env var is $HERMES_INFERENCE_MODEL (see
+# website/docs/reference/environment-variables.md in NousResearch/hermes-agent).
+# We accept both for one release cycle so workspaces booting under the legacy
+# control-plane don't break — drop $HERMES_DEFAULT_MODEL once workspace-server
+# is updated to write the upstream name.
 #
 # Why the per-template sub-script (vs doing this in CP): every runtime
 # has its own provider taxonomy. Keeping the logic inside the template
@@ -31,12 +40,15 @@ if [ -n "${HERMES_INFERENCE_PROVIDER:-}" ]; then
   return 0 2>/dev/null || exit 0
 fi
 
-if [ -z "${HERMES_DEFAULT_MODEL:-}" ]; then
+# Resolve the model slug — prefer the upstream env name, fall back to legacy.
+_HERMES_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL:-}}"
+
+if [ -z "${_HERMES_MODEL}" ]; then
   PROVIDER="auto"
   return 0 2>/dev/null || exit 0
 fi
 
-case "${HERMES_DEFAULT_MODEL}" in
+case "${_HERMES_MODEL}" in
   # Keep full CN-suffix as provider so chinese-region keys route right
   minimax-cn/*)            PROVIDER="minimax-cn" ;;
   kimi-coding-cn/*)        PROVIDER="kimi-coding-cn" ;;
@@ -97,6 +109,23 @@ case "${HERMES_DEFAULT_MODEL}" in
   # Explicit catch-alls
   openrouter/*)            PROVIDER="openrouter" ;;
   custom/*)                PROVIDER="custom" ;;
+
+  # Additional 1:1 prefix→provider mappings — kept aligned with upstream's
+  # HERMES_INFERENCE_PROVIDER list (website/docs/reference/environment-variables.md
+  # in NousResearch/hermes-agent, v0.12.0 / 2026-04-30). Place these BEFORE the
+  # catch-all so they win.
+  xai/*|grok/*)            PROVIDER="xai" ;;
+  bedrock/*|aws/*)         PROVIDER="bedrock" ;;
+  tencent/*|tencent-tokenhub/*) PROVIDER="tencent-tokenhub" ;;
+  gmi/*)                   PROVIDER="gmi" ;;
+  qwen-oauth/*)            PROVIDER="qwen-oauth" ;;
+  lmstudio/*|lm-studio/*)  PROVIDER="lmstudio" ;;
+  minimax-oauth/*)         PROVIDER="minimax-oauth" ;;
+  alibaba-coding-plan/*)   PROVIDER="alibaba-coding-plan" ;;
+  google-gemini-cli/*)     PROVIDER="google-gemini-cli" ;;
+  openai-codex/*)          PROVIDER="openai-codex" ;;
+  copilot-acp/*)           PROVIDER="copilot-acp" ;;
+  copilot/*)               PROVIDER="copilot" ;;
 
   # Unknown prefix → let hermes auto-detect
   *)                       PROVIDER="auto" ;;
