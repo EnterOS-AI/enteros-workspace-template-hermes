@@ -66,12 +66,14 @@ async def test_setup_skips_under_smoke_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_setup_probes_plugin_health_by_default(monkeypatch):
-    """With MOLECULE_A2A_PLATFORM_ENABLED unset, setup() must probe
-    /a2a/health (NOT the legacy /v1/health)."""
+async def test_setup_probes_plugin_health_when_enabled(monkeypatch):
+    """When MOLECULE_A2A_PLATFORM_ENABLED=true, setup() probes
+    /a2a/health (NOT the legacy /v1/health). Plugin path is opt-in
+    while the image-side install is being verified — see executor.py
+    module docstring."""
 
     monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
-    monkeypatch.delenv("MOLECULE_A2A_PLATFORM_ENABLED", raising=False)
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "true")
 
     health_port = _free_port()
     paths_hit: list[str] = []
@@ -135,10 +137,13 @@ async def test_setup_probes_chat_completions_health_when_disabled(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_executor_returns_started_executor(monkeypatch):
-    """create_executor() must return an executor whose reply server is
-    already running (start() was called)."""
+    """create_executor() with plugin path enabled must return an
+    executor whose reply server is already running (start() was
+    called). Plugin path is opt-in while the image-side install is
+    verified — see executor.py module docstring."""
 
     cb_port = _free_port()
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "true")
     monkeypatch.setenv("MOLECULE_A2A_CALLBACK_PORT", str(cb_port))
 
     cfg = AdapterConfig(model="hermes-test")

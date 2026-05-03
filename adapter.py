@@ -128,8 +128,12 @@ class HermesAgentAdapter(BaseAdapter):
 
         import httpx
 
+        # Default off — see executor.py module docstring. Workspace boot
+        # was wedging on the plugin /a2a/health probe because the plugin
+        # didn't bind :8645 inside the deployed image. Falls back to the
+        # legacy /v1/chat/completions /health probe until that's fixed.
         use_plugin = os.environ.get(
-            "MOLECULE_A2A_PLATFORM_ENABLED", "true"
+            "MOLECULE_A2A_PLATFORM_ENABLED", "false"
         ).strip().lower() in ("1", "true", "yes", "on")
 
         if use_plugin:
