@@ -79,7 +79,7 @@ RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && 
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir --force-reinstall \
       "git+https://github.com/HongmingWang-Rabbit/hermes-agent.git@${HERMES_FORK_REF}#egg=hermes-agent" && \
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir \
-      "git+https://github.com/Molecule-AI/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
+      "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
 
 USER root
 WORKDIR /app

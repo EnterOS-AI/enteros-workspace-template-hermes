@@ -21,7 +21,7 @@ Both the Docker path and the SaaS bare-host path run the same stack:
 
 This template ships two entrypoints because the platform has two
 execution models — see
-[internal/product/designs/workspace-backends.md](https://github.com/Molecule-AI/internal/blob/main/product/designs/workspace-backends.md)
+[internal/product/designs/workspace-backends.md](https://git.moleculesai.app/molecule-ai/internal/src/branch/main/product/designs/workspace-backends.md)
 for the full story.
 
 | Path | Used by | Entry | Install recipe |
