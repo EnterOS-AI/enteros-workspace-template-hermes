@@ -71,13 +71,16 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # Until upstream PR #18775 merges, the fork is the only place the patch
 # exists. Once merged + released, the fork install can be dropped and the
 # plugin will load against the official wheel unchanged.
+#
+# moved to git.moleculesai.app/molecule-ai/hermes-agent (post-suspension migration; see internal#72)
+# Previously: github.com/HongmingWang-Rabbit/hermes-agent (account suspended 2026-05-06).
 ARG HERMES_FORK_REF=feat/platform-adapter-plugins
 ARG HERMES_PLATFORM_MOLECULE_A2A_REF=main
 # The hermes installer uses uv to create the venv and doesn't seed pip
 # into it. Bootstrap pip first via ensurepip, then install both wheels.
 RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && \
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir --force-reinstall \
-      "git+https://github.com/HongmingWang-Rabbit/hermes-agent.git@${HERMES_FORK_REF}#egg=hermes-agent" && \
+      "git+https://git.moleculesai.app/molecule-ai/hermes-agent.git@${HERMES_FORK_REF}#egg=hermes-agent" && \
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir \
       "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
 
