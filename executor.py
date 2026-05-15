@@ -75,6 +75,27 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BASE = "http://127.0.0.1:8642/v1"
 _REQUEST_TIMEOUT = 600.0
 
+# --- peer-discovery tool ---------------------------------------------------
+# Injected into every chat-completions call so hermes-agent can see and
+# explicitly request a fresh Molecule peer list via function calling.
+_PEER_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_peers",
+            "description": (
+                "Return the live list of peer workspaces reachable via the "
+                "Molecule A2A platform. Each entry includes the peer name, "
+                "workspace ID, current status, and role. Call this when you "
+                "need to know who you can collaborate with or when the user "
+                "asks 'who are your peers / what agents can you see'."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+]
+_MAX_TOOL_ROUNDS = 5  # prevent unbounded loops if the model keeps calling tools
+
 # --- plugin-path config ----------------------------------------------
 _DEFAULT_PLUGIN_HOST = "127.0.0.1"
 _DEFAULT_PLUGIN_PORT = 8645
@@ -341,18 +362,50 @@ class HermesAgentProxyExecutor(AgentExecutor):
         event_queue: EventQueue,
         prompt: str,
     ) -> None:
-        payload = self._build_chat_completions_payload(prompt)
+        peers_blurb = await self._fetch_peers_blurb()
+        messages = self._build_initial_messages(prompt, peers_blurb)
         headers = self._build_chat_completions_headers()
 
         try:
             async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
-                resp = await client.post(
-                    f"{self._base}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+                for _round in range(_MAX_TOOL_ROUNDS):
+                    payload: dict[str, Any] = {
+                        "model": self._config.model or "hermes-agent",
+                        "messages": messages,
+                        "stream": False,
+                        "tools": _PEER_TOOLS,
+                    }
+                    resp = await client.post(
+                        f"{self._base}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    choice = data.get("choices", [{}])[0]
+                    finish = choice.get("finish_reason", "stop")
+                    assistant_msg = choice.get("message", {})
+
+                    if finish == "tool_calls":
+                        messages.append(assistant_msg)
+                        tool_calls = assistant_msg.get("tool_calls") or []
+                        for tc in tool_calls:
+                            result = await self._dispatch_tool(tc)
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.get("id", ""),
+                                "content": result,
+                            })
+                    else:
+                        text = assistant_msg.get("content") or ""
+                        await event_queue.enqueue_event(new_text_message(text))
+                        return
+
+                # Exhausted tool rounds — emit whatever we have
+                text = self._extract_assistant_text(data)
+                await event_queue.enqueue_event(new_text_message(text))
+
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500] if exc.response is not None else ""
             logger.error("hermes-agent %s: %s", exc.response.status_code, body)
@@ -361,27 +414,27 @@ class HermesAgentProxyExecutor(AgentExecutor):
                     f"[hermes-agent error {exc.response.status_code}] {body}"
                 )
             )
-            return
         except httpx.RequestError as exc:
             logger.exception("hermes-agent transport error")
             await event_queue.enqueue_event(
                 new_text_message(f"[hermes-agent unreachable] {exc!s}")
             )
-            return
 
-        text = self._extract_assistant_text(data)
-        await event_queue.enqueue_event(new_text_message(text))
-
-    def _build_chat_completions_payload(self, user_text: str) -> dict[str, Any]:
-        messages: list[dict[str, str]] = []
-        if self._config.system_prompt:
-            messages.append({"role": "system", "content": self._config.system_prompt})
+    def _build_initial_messages(
+        self, user_text: str, peers_blurb: str = ""
+    ) -> list[dict[str, Any]]:
+        system_content = self._config.system_prompt or ""
+        if peers_blurb:
+            system_content = (
+                f"{system_content}\n\n{peers_blurb}".strip()
+                if system_content
+                else peers_blurb
+            )
+        messages: list[dict[str, Any]] = []
+        if system_content:
+            messages.append({"role": "system", "content": system_content})
         messages.append({"role": "user", "content": user_text})
-        return {
-            "model": self._config.model or "hermes-agent",
-            "messages": messages,
-            "stream": False,
-        }
+        return messages
 
     def _build_chat_completions_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -389,6 +442,70 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if key:
             headers["Authorization"] = f"Bearer {key}"
         return headers
+
+    # ------------------------------------------------------------------
+    # Peer-discovery helpers
+    # ------------------------------------------------------------------
+    async def _fetch_peers_blurb(self) -> str:
+        """Fetch the live Molecule peer list and return a formatted string
+        suitable for injection into the system prompt. Returns empty string
+        on any error so the absence of platform creds is non-fatal."""
+        peers = await self._fetch_peers_raw()
+        if peers is None:
+            return ""
+        if not peers:
+            return "Molecule platform peers: none currently available."
+        lines = []
+        for p in peers:
+            name = p.get("name") or p.get("id", "?")
+            pid = p.get("id", "?")
+            status = p.get("status", "unknown")
+            role = p.get("role") or ""
+            entry = f"  - {name} (ID: {pid}, status: {status}"
+            if role:
+                entry += f", role: {role}"
+            entry += ")"
+            lines.append(entry)
+        return (
+            "## Molecule platform peers\n"
+            "These peer workspaces are reachable via A2A. "
+            "You can reference them by name or ID when the user wants to "
+            "collaborate with or delegate to another agent.\n"
+            + "\n".join(lines)
+        )
+
+    async def _fetch_peers_raw(self) -> Optional[list[dict[str, Any]]]:
+        platform_url = (
+            os.environ.get("PLATFORM_URL")
+            or os.environ.get("MOLECULE_PLATFORM_URL", "")
+        ).rstrip("/")
+        workspace_token = os.environ.get("MOLECULE_WORKSPACE_TOKEN", "")
+        if not platform_url or not workspace_token:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    f"{platform_url}/registry/peers",
+                    headers={
+                        "Authorization": f"Bearer {workspace_token}",
+                        "Origin": platform_url,
+                    },
+                )
+                resp.raise_for_status()
+                return resp.json()
+        except Exception:
+            logger.debug("could not fetch peers from platform", exc_info=True)
+            return None
+
+    async def _dispatch_tool(self, tool_call: dict[str, Any]) -> str:
+        name = (tool_call.get("function") or {}).get("name", "")
+        if name == "list_peers":
+            return await self._tool_list_peers()
+        return f"Unknown tool: {name!r}"
+
+    async def _tool_list_peers(self) -> str:
+        blurb = await self._fetch_peers_blurb()
+        return blurb or "No peers available (platform credentials not configured)."
 
     @staticmethod
     def _extract_assistant_text(data: dict[str, Any]) -> str:
