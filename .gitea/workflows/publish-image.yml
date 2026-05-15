@@ -176,7 +176,12 @@ jobs:
           IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
         run: |
           set -eu
-          docker run --rm --entrypoint sh "${IMAGE}" -c '
+          docker run --rm \
+            -e WORKSPACE_ID=smoke-test \
+            -e CLAUDE_CODE_OAUTH_TOKEN=sk-fake-smoke-token \
+            -e ANTHROPIC_API_KEY=sk-fake-smoke-key \
+            -e OPENAI_API_KEY=sk-fake-smoke-key \
+            --entrypoint sh "${IMAGE}" -c '
             set -e
             cd /app
             for f in *.py; do
