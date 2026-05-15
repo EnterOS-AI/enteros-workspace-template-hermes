@@ -26,11 +26,21 @@ fi
 HERMES_HOME="/tmp/.hermes"
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
-LOG_FILE="/tmp/hermes-gateway.log"
-
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-chown agent:agent "$LOG_FILE"
+# Log files live under HERMES_HOME (agent-owned via `install -d -o agent`
+# below) — NOT a bare /tmp path. See the comment block above the log-file
+# `install` calls for the full rationale; the short version: with
+# `set -euo pipefail`, `nohup gosu agent ... >> /tmp/some.log` is racy
+# because the redirect open() is done by the ROOT parent shell BEFORE
+# `gosu` execs the agent user. If a previous boot left /tmp/some.log
+# owned by `agent` (or the file is created by `touch` then `chown`'d
+# in two separate syscalls), the parent `>>` open can land between the
+# touch and the chown — root-owned 644 file → EPERM on the next boot's
+# `>>` open → set -e kills start.sh → gateway never spawns → container
+# crashloops. Putting logs under HERMES_HOME (which `install -d -o agent`
+# creates with agent ownership in a single atomic syscall) plus using
+# `install -m 644 -o agent -g agent /dev/null` for the files themselves
+# closes the race window entirely.
+LOG_FILE="${HERMES_HOME}/gateway.log"
 
 # --- Generate a per-container API_SERVER_KEY ---
 # hermes-agent requires a bearer token on the api-server platform. We
@@ -41,7 +51,28 @@ if [ -z "${API_SERVER_KEY:-}" ]; then
   export API_SERVER_KEY
 fi
 
+# Create HERMES_HOME up front (agent-owned) so the log-file installs
+# below land inside an agent-owned dir. MUST happen before any gateway
+# log-file or MCP-log-file `install` calls.
 install -d -o agent -g agent "$HERMES_HOME"
+
+# --- Install log files atomically (race-free) ---
+# Regression fix re-applied 2026-05-15: a previous build (image
+# sha-7669af2, built 13:31 UTC) crashloops in prod with:
+#   /usr/local/bin/start.sh: line N: /tmp/molecule-mcp-server.log: Permission denied
+#   /usr/local/bin/start.sh: line N: /tmp/hermes-gateway.log: Permission denied
+# The bug: `set -euo pipefail` + `touch FILE && chown agent FILE; ...
+# nohup gosu agent ... >> FILE` is racy. The `>>` redirect is opened
+# by the ROOT parent shell BEFORE `gosu` execs agent. With separate
+# touch + chown syscalls (or a stale /tmp file from a prior boot in a
+# different uid namespace), the open() can return EPERM, set -e kills
+# the script, and the gateway never registers with the CP → workspace
+# state=failed at 720s.
+# The May-6 working image (sha256:0f8e83f4…) used `install -m 644
+# -o agent -g agent /dev/null "$LOG_FILE"` — a single atomic syscall
+# that creates the file with the final perms in one shot — and located
+# logs inside HERMES_HOME (agent-owned). Re-applying that fix here.
+install -m 644 -o agent -g agent /dev/null "$LOG_FILE"
 
 # --- Write hermes-agent's .env ---
 # API_SERVER_ENABLED must be true and the bearer must match. Every
@@ -255,8 +286,13 @@ chown agent:agent "$HERMES_CONFIG"
 # :9100 so hermes-agent's native MCP client can connect to it.
 # The executor.py chat-completions bridge also exposes the same tools as
 # function-call tools; both paths complement each other.
-MCP_LOG="/tmp/molecule-mcp-server.log"
-touch "$MCP_LOG" && chown agent:agent "$MCP_LOG"
+# MCP_LOG lives under HERMES_HOME for the SAME race-free reason LOG_FILE
+# does — see the LOG_FILE comment block at the top of this script. The
+# old `MCP_LOG="/tmp/molecule-mcp-server.log"; touch + chown` pattern
+# is the exact regression that put image sha-7669af2 into a crashloop
+# (Permission denied on the >> redirect from the root parent shell).
+MCP_LOG="${HERMES_HOME}/molecule-mcp-server.log"
+install -m 644 -o agent -g agent /dev/null "$MCP_LOG"
 nohup gosu agent env HOME=/tmp \
     python3 -m molecule_runtime.a2a_mcp_server --transport http --port 9100 \
     >>"$MCP_LOG" 2>&1 &
