@@ -211,3 +211,4 @@ jobs:
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — hermes runtime
+# no-op: retrigger wedged PR CI
