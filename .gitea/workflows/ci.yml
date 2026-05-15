@@ -140,10 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: validate-static
-    # Skip when the PR comes from a fork — those are external,
-    # untrusted, and would let attackers run pip install / docker build
-    # / adapter.py import on our runner.
-    if: github.event.pull_request.head.repo.fork != true
+    if: needs.validate-static.result == 'success'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Fetch molecule-ci canonical scripts

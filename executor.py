@@ -46,6 +46,7 @@ race).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -67,6 +68,20 @@ from a2a.helpers import new_text_message
 
 from molecule_runtime.adapters.base import AdapterConfig
 from molecule_runtime.executor_helpers import extract_message_text
+try:
+    from molecule_runtime.a2a_tools import (
+        tool_check_task_status,
+        tool_commit_memory,
+        tool_delegate_task,
+        tool_delegate_task_async,
+        tool_get_workspace_info,
+        tool_list_peers,
+        tool_recall_memory,
+        tool_send_message_to_user,
+    )
+    _A2A_TOOLS_AVAILABLE = True
+except ImportError:
+    _A2A_TOOLS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -75,25 +90,123 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BASE = "http://127.0.0.1:8642/v1"
 _REQUEST_TIMEOUT = 600.0
 
-# --- peer-discovery tool ---------------------------------------------------
-# Injected into every chat-completions call so hermes-agent can see and
-# explicitly request a fresh Molecule peer list via function calling.
-_PEER_TOOLS: list[dict[str, Any]] = [
+# --- Molecule platform tools -----------------------------------------------
+# Injected into every chat-completions call so hermes-agent can use the full
+# Molecule A2A toolset: peer discovery, task delegation, memory, etc.
+# Mirrors the tools exposed by the stdio MCP server for Claude Code / Codex.
+_MOLECULE_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "list_peers",
-            "description": (
-                "Return the live list of peer workspaces reachable via the "
-                "Molecule A2A platform. Each entry includes the peer name, "
-                "workspace ID, current status, and role. Call this when you "
-                "need to know who you can collaborate with or when the user "
-                "asks 'who are your peers / what agents can you see'."
-            ),
+            "description": "List all peer workspaces reachable via the Molecule A2A platform. Returns name, ID, status, and role for each peer.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "description": "Delegate a task to another workspace via A2A (synchronous — waits for the peer's response).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {"type": "string", "description": "Target workspace ID (from list_peers)"},
+                    "task": {"type": "string", "description": "Task description to send to the peer"},
+                },
+                "required": ["workspace_id", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_task_async",
+            "description": "Delegate a task to a peer workspace (fire-and-forget). Returns immediately with a task_id; use check_task_status to poll for the result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {"type": "string", "description": "Target workspace ID"},
+                    "task": {"type": "string", "description": "Task description"},
+                },
+                "required": ["workspace_id", "task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_task_status",
+            "description": "Check the status and result of a previously delegated async task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "workspace_id": {"type": "string", "description": "Target workspace ID used in delegate_task_async"},
+                    "task_id": {"type": "string", "description": "task_id returned by delegate_task_async"},
+                },
+                "required": ["workspace_id", "task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message_to_user",
+            "description": "Send a direct message to the user's canvas chat (WebSocket push). Use for proactive updates when the user isn't actively polling.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Message text to deliver to the user"},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_workspace_info",
+            "description": "Get this workspace's own metadata — ID, name, role, tier, parent, status.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "commit_memory",
+            "description": "Save important information to persistent memory so it can be recalled across conversations.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Information to persist"},
+                    "scope": {
+                        "type": "string",
+                        "description": "Visibility: LOCAL (this workspace only, default), TEAM, or GLOBAL",
+                        "enum": ["LOCAL", "TEAM", "GLOBAL"],
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_memory",
+            "description": "Search persistent memory for previously saved information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query (optional — omit to list recent entries)"},
+                    "scope": {"type": "string", "description": "Scope filter: LOCAL, TEAM, or GLOBAL (optional)"},
+                },
+                "required": [],
+            },
+        },
+    },
 ]
+# Only inject tools if the a2a_tools module loaded successfully.
+_ACTIVE_TOOLS: list[dict[str, Any]] = _MOLECULE_TOOLS if _A2A_TOOLS_AVAILABLE else []
 _MAX_TOOL_ROUNDS = 5  # prevent unbounded loops if the model keeps calling tools
 
 # --- plugin-path config ----------------------------------------------
@@ -373,8 +486,9 @@ class HermesAgentProxyExecutor(AgentExecutor):
                         "model": self._config.model or "hermes-agent",
                         "messages": messages,
                         "stream": False,
-                        "tools": _PEER_TOOLS,
                     }
+                    if _ACTIVE_TOOLS:
+                        payload["tools"] = _ACTIVE_TOOLS
                     resp = await client.post(
                         f"{self._base}/chat/completions",
                         json=payload,
@@ -444,68 +558,74 @@ class HermesAgentProxyExecutor(AgentExecutor):
         return headers
 
     # ------------------------------------------------------------------
-    # Peer-discovery helpers
+    # Molecule platform tool helpers
     # ------------------------------------------------------------------
     async def _fetch_peers_blurb(self) -> str:
-        """Fetch the live Molecule peer list and return a formatted string
-        suitable for injection into the system prompt. Returns empty string
-        on any error so the absence of platform creds is non-fatal."""
-        peers = await self._fetch_peers_raw()
-        if peers is None:
+        """Return a formatted peer list for system-prompt injection.
+        Calls the a2a_tools implementation directly (no extra HTTP round-trip)."""
+        if not _A2A_TOOLS_AVAILABLE:
             return ""
-        if not peers:
-            return "Molecule platform peers: none currently available."
-        lines = []
-        for p in peers:
-            name = p.get("name") or p.get("id", "?")
-            pid = p.get("id", "?")
-            status = p.get("status", "unknown")
-            role = p.get("role") or ""
-            entry = f"  - {name} (ID: {pid}, status: {status}"
-            if role:
-                entry += f", role: {role}"
-            entry += ")"
-            lines.append(entry)
-        return (
-            "## Molecule platform peers\n"
-            "These peer workspaces are reachable via A2A. "
-            "You can reference them by name or ID when the user wants to "
-            "collaborate with or delegate to another agent.\n"
-            + "\n".join(lines)
-        )
-
-    async def _fetch_peers_raw(self) -> Optional[list[dict[str, Any]]]:
-        platform_url = (
-            os.environ.get("PLATFORM_URL")
-            or os.environ.get("MOLECULE_PLATFORM_URL", "")
-        ).rstrip("/")
-        workspace_token = os.environ.get("MOLECULE_WORKSPACE_TOKEN", "")
-        if not platform_url or not workspace_token:
-            return None
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    f"{platform_url}/registry/peers",
-                    headers={
-                        "Authorization": f"Bearer {workspace_token}",
-                        "Origin": platform_url,
-                    },
-                )
-                resp.raise_for_status()
-                return resp.json()
+            result = await tool_list_peers()
+            if not result or "No peers" in result:
+                return ""
+            return (
+                "## Molecule platform peers\n"
+                "The following peer workspaces are reachable via the Molecule "
+                "A2A platform. Use list_peers, delegate_task, or delegate_task_async "
+                "to interact with them.\n"
+                + result
+            )
         except Exception:
-            logger.debug("could not fetch peers from platform", exc_info=True)
-            return None
+            logger.debug("could not fetch peers for system prompt", exc_info=True)
+            return ""
 
     async def _dispatch_tool(self, tool_call: dict[str, Any]) -> str:
-        name = (tool_call.get("function") or {}).get("name", "")
-        if name == "list_peers":
-            return await self._tool_list_peers()
-        return f"Unknown tool: {name!r}"
+        """Dispatch a model-requested tool call to the Molecule platform."""
+        fn = tool_call.get("function") or {}
+        name = fn.get("name", "")
+        args_raw = fn.get("arguments", "{}")
+        try:
+            args: dict[str, Any] = (
+                json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            )
+        except json.JSONDecodeError:
+            args = {}
 
-    async def _tool_list_peers(self) -> str:
-        blurb = await self._fetch_peers_blurb()
-        return blurb or "No peers available (platform credentials not configured)."
+        if not _A2A_TOOLS_AVAILABLE:
+            return f"Tool {name!r} unavailable: molecule_runtime.a2a_tools not installed."
+
+        try:
+            if name == "list_peers":
+                return await tool_list_peers()
+            elif name == "delegate_task":
+                return await tool_delegate_task(
+                    args.get("workspace_id", ""), args.get("task", "")
+                )
+            elif name == "delegate_task_async":
+                return await tool_delegate_task_async(
+                    args.get("workspace_id", ""), args.get("task", "")
+                )
+            elif name == "check_task_status":
+                return await tool_check_task_status(
+                    args.get("workspace_id", ""), args.get("task_id", "")
+                )
+            elif name == "send_message_to_user":
+                return await tool_send_message_to_user(args.get("message", ""))
+            elif name == "get_workspace_info":
+                return await tool_get_workspace_info()
+            elif name == "commit_memory":
+                return await tool_commit_memory(
+                    args.get("content", ""), args.get("scope", "LOCAL")
+                )
+            elif name == "recall_memory":
+                return await tool_recall_memory(
+                    args.get("query", ""), args.get("scope", "")
+                )
+            else:
+                return f"Unknown tool: {name!r}"
+        except Exception as exc:
+            return f"Tool error ({name}): {exc!s}"
 
     @staticmethod
     def _extract_assistant_text(data: dict[str, Any]) -> str:

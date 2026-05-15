@@ -249,6 +249,20 @@ fi
 } >"$HERMES_CONFIG"
 chown agent:agent "$HERMES_CONFIG"
 
+# --- Start the Molecule A2A MCP HTTP server ---
+# Exposes all Molecule platform tools (list_peers, delegate_task, recall_memory,
+# commit_memory, send_message_to_user, get_workspace_info, …) over HTTP+SSE on
+# :9100 so hermes-agent's native MCP client can connect to it.
+# The executor.py chat-completions bridge also exposes the same tools as
+# function-call tools; both paths complement each other.
+MCP_LOG="/tmp/molecule-mcp-server.log"
+touch "$MCP_LOG" && chown agent:agent "$MCP_LOG"
+nohup gosu agent env HOME=/tmp \
+    python3 -m molecule_runtime.a2a_mcp_server --transport http --port 9100 \
+    >>"$MCP_LOG" 2>&1 &
+MCP_PID=$!
+echo "[start.sh] Molecule A2A MCP HTTP server started (pid ${MCP_PID}) on :9100"
+
 # --- Start hermes gateway in the background ---
 # `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
 # /tmp so the lookup resolves to /tmp/.hermes/.env (writable; matches
