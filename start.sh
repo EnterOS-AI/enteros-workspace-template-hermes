@@ -277,6 +277,30 @@ fi
       echo "      shared_secret: \"${MOLECULE_A2A_PLATFORM_SHARED_SECRET}\""
     fi
   fi
+  # --- Molecule MCP server (canvas-agent tool affordance) ---
+  # The MOLECULE_A2A_PLATFORM plugin above only handles INBOUND A2A
+  # messages (peer-agent → hermes pipeline). It does NOT give hermes
+  # outbound platform-tool affordances (list_peers, send_message_to_user,
+  # delegate_task, commit_memory, recall_memory, …) when the user types
+  # in the canvas chat. Without those tools, hermes responds coherently
+  # to questions like "can you see your peers" with a generic "I don't
+  # have visibility into other AI peers" — confidently wrong, because
+  # the platform tools that WOULD give it visibility are running on
+  # :9100 but hermes was never told about them.
+  #
+  # Wire hermes-agent's native MCP client at config.yaml time. The
+  # molecule MCP server is started below (line ~340), bound to
+  # 127.0.0.1:9100 inside the container; hermes connects on first
+  # tool-discovery call from the gateway pipeline. 12 tools surface.
+  #
+  # Local probe confirms ✓ Connected + Tools discovered: 12 against the
+  # `python3 -m molecule_runtime.a2a_mcp_server --transport http --port 9100`
+  # server started below. Class-A canvas regression — without this
+  # block hermes is platform-blind even though every other plumbing
+  # layer is correct.
+  echo "mcp_servers:"
+  echo "  molecule:"
+  echo "    url: \"http://127.0.0.1:${MOLECULE_MCP_PORT:-9100}/mcp\""
 } >"$HERMES_CONFIG"
 chown agent:agent "$HERMES_CONFIG"
 
@@ -298,6 +322,41 @@ nohup gosu agent env HOME=/tmp \
     >>"$MCP_LOG" 2>&1 &
 MCP_PID=$!
 echo "[start.sh] Molecule A2A MCP HTTP server started (pid ${MCP_PID}) on :9100"
+
+# --- Smoke: confirm MCP server responds to the JSON-RPC initialize ---
+# Class-A regression guard. If the MCP server is up but the /mcp route
+# is missing (server version mismatch, transport wired wrong) hermes
+# will silently fail tool-discovery later and the canvas user will see
+# generic "I don't have peer visibility" answers — exactly the symptom
+# this PR is closing. Fail-fast here per
+# feedback_chained_defects_in_never_tested_workflows: every never-fired
+# smoke step is a latent defect waiting to surface in prod.
+MCP_PORT="${MOLECULE_MCP_PORT:-9100}"
+MCP_INIT_PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"start.sh-smoke","version":"1"}}}'
+for _ in $(seq 1 15); do
+  if curl -fsS -X POST -H 'Content-Type: application/json' \
+       -H 'Accept: application/json, text/event-stream' \
+       "http://127.0.0.1:${MCP_PORT}/mcp" -d "$MCP_INIT_PAYLOAD" \
+       >/dev/null 2>&1; then
+    echo "[start.sh] MCP server /mcp initialize OK"
+    break
+  fi
+  if ! kill -0 "$MCP_PID" 2>/dev/null; then
+    echo "[start.sh] MCP server exited before /mcp came up. Last log lines:" >&2
+    tail -40 "$MCP_LOG" >&2
+    exit 1
+  fi
+  sleep 1
+done
+if ! curl -fsS -X POST -H 'Content-Type: application/json' \
+       -H 'Accept: application/json, text/event-stream' \
+       "http://127.0.0.1:${MCP_PORT}/mcp" -d "$MCP_INIT_PAYLOAD" \
+       >/dev/null 2>&1; then
+  echo "[start.sh] MCP server /mcp initialize FAILED after 15s." >&2
+  echo "[start.sh] hermes will boot without platform tools — refusing." >&2
+  tail -40 "$MCP_LOG" >&2
+  exit 1
+fi
 
 # --- Start hermes gateway in the background ---
 # `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
@@ -336,6 +395,27 @@ if ! curl -fsS "http://127.0.0.1:${API_SERVER_PORT:-8642}/health" >/dev/null 2>&
 fi
 
 echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWAY_PID})"
+
+# --- Smoke: confirm hermes sees the molecule MCP server in `mcp list` ---
+# Belt-and-braces check: even if config.yaml has mcp_servers.molecule
+# written above, a yaml-parse error or a hermes-side regression could
+# silently drop the entry. Asserting hermes's view of its own config
+# before allowing the workspace to come online closes the loop end-to-end.
+# Soft-fail (log + continue): if the smoke step itself errors (busy CLI,
+# transient stdin issue), we don't want to refuse boot — but a config
+# without `molecule` in it IS a real failure, so we exit non-zero on that.
+MCP_LIST_OUT=$(gosu agent env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    timeout 10 hermes mcp list 2>&1 || true)
+if echo "$MCP_LIST_OUT" | grep -q "^[[:space:]]*molecule[[:space:]]"; then
+  echo "[start.sh] hermes mcp list shows 'molecule' wired"
+else
+  echo "[start.sh] FATAL: hermes mcp list did NOT show 'molecule' — platform tools unavailable" >&2
+  echo "[start.sh] hermes mcp list output:" >&2
+  echo "$MCP_LIST_OUT" >&2
+  echo "[start.sh] config.yaml mcp_servers block:" >&2
+  grep -A 5 '^mcp_servers' "$HERMES_CONFIG" >&2 || true
+  exit 1
+fi
 
 # --- Exec molecule-runtime on :8000 ---
 # From here on, every A2A message the platform sends gets proxied
