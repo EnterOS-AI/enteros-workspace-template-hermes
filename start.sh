@@ -23,6 +23,36 @@ if [ "${MOLECULE_SMOKE_MODE:-0}" = "1" ]; then
   exec molecule-runtime
 fi
 
+# --- Make /configs agent-owned (fleet contract) ---
+# The /configs volume is created by Docker/the provisioner as root, but
+# molecule_runtime/configs_dir.py's documented contract is that /configs
+# is "owned by the agent user" — and the agent-context molecule-mcp
+# server (started below as `gosu agent`) needs to READ /configs/.auth_token
+# (the platform bearer) and WRITE .platform_inbound_secret rotations.
+#
+# Without this chown, configs_dir.resolve() running as the agent user
+# fails the `os.access('/configs', W_OK)` test and silently falls back to
+# $HOME/.molecule-workspace (= /tmp/.molecule-workspace under HOME=/tmp),
+# where there is no .auth_token. platform_auth.get_token() then returns
+# None, auth_headers() sends NO Authorization header, and EVERY
+# `list_peers` / A2A MCP tool call 401s with the canned
+# "restart the workspace usually re-mints it" message — confidently
+# wrong, because the correct token IS on disk at /configs/.auth_token,
+# just unreadable by the agent. (Root-context callers like
+# molecule-runtime's heartbeat were unaffected, which is why the
+# authenticated registry+heartbeat chain looked healthy while the
+# literal list_peers MCP path — never exercised by HERMES-FLEET-VERIFIED
+# — was broken.)
+#
+# This mirrors the established fleet pattern: the claude-code template's
+# entrypoint.sh does the same `chown -R agent:agent /configs` when
+# running as root, with a comment explicitly naming ".auth_token
+# rotation" as a reason. start.sh runs as root here (before any gosu),
+# so the chown takes effect for the agent-context children below.
+if [ "$(id -u)" = "0" ]; then
+  chown -R agent:agent /configs 2>/dev/null || true
+fi
+
 HERMES_HOME="/tmp/.hermes"
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
@@ -317,7 +347,16 @@ chown agent:agent "$HERMES_CONFIG"
 # (Permission denied on the >> redirect from the root parent shell).
 MCP_LOG="${HERMES_HOME}/molecule-mcp-server.log"
 install -m 644 -o agent -g agent /dev/null "$MCP_LOG"
-nohup gosu agent env HOME=/tmp \
+# CONFIGS_DIR=/configs is REQUIRED here, not optional: the `env HOME=/tmp`
+# form REPLACES the inherited environment, so even though /configs is now
+# agent-owned (chowned above), configs_dir.resolve()'s second branch
+# (`/configs exists AND os.access W_OK`) is the only thing that would
+# save us — and relying on that implicit fallback is exactly what made
+# this defect latent for so long. Setting CONFIGS_DIR explicitly makes
+# the MCP server's token resolution deterministic and self-documenting:
+# it takes configs_dir.resolve()'s FIRST (explicit-override) branch and
+# can never silently fall back to /tmp/.molecule-workspace again.
+nohup gosu agent env HOME=/tmp CONFIGS_DIR=/configs \
     python3 -m molecule_runtime.a2a_mcp_server --transport http --port 9100 \
     >>"$MCP_LOG" 2>&1 &
 MCP_PID=$!
