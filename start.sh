@@ -20,7 +20,7 @@ set -euo pipefail
 # production boots are unaffected.
 if [ "${MOLECULE_SMOKE_MODE:-0}" = "1" ]; then
   echo "[start.sh] MOLECULE_SMOKE_MODE=1 — skipping hermes gateway spawn"
-  exec molecule-runtime
+  exec gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
 fi
 
 # --- Make /configs agent-owned (fleet contract) ---
@@ -459,4 +459,17 @@ fi
 # --- Exec molecule-runtime on :8000 ---
 # From here on, every A2A message the platform sends gets proxied
 # through executor.py → :8642 → hermes-agent.
-exec molecule-runtime
+#
+# Run as the unprivileged `agent` (uid 1000) — NOT root. molecule-runtime's
+# platform_auth.save_token() does os.open(.auth_token, O_WRONLY|O_CREAT|
+# O_TRUNC, 0o600) at ~T+6s (after /registry/register returns). If this
+# exec stays root, .auth_token lands root:root 0600 and the uid-1000 MCP
+# server (line ~359) can't read it → get_token() None → no Authorization
+# header → every list_peers / A2A MCP call 401s (task #162 P0 root cause).
+# The line-~53 `chown -R agent:agent /configs` runs at T+0s, long before
+# this T+6s write, so it is a timing no-op for .auth_token (proven: the
+# same-root-writer .platform_inbound_secret also stays root:root post-chown).
+# Mirror the exact env used for the gosu'd MCP server at line ~359 so token
+# path resolution (configs_dir.resolve() explicit-override branch) stays
+# deterministic. This also fixes .platform_inbound_secret (same writer).
+exec gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
