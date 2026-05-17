@@ -45,6 +45,21 @@ name: CI
 
 on: [push, pull_request]
 
+# Defense-in-depth de-dup ONLY (the t4-conformance unique-name fix is the
+# actual fail-closed primitive against the shared-host-daemon race; see
+# that job). Scope per workflow + ref + EVENT so the push run and the
+# pull_request run of the same internal-PR commit get DISTINCT groups —
+# they must both complete (each emits its own required-status context;
+# feedback_gitea_gate_check_required_list_not_combined_status). Never
+# per-SHA-global: that silently cross-cancels legit required checks
+# (feedback_concurrency_group_per_sha). cancel-in-progress:false so an
+# in-flight live T4 probe is never aborted mid-assertion (a cancelled
+# privileged probe would look like a gate failure / flake); a newer push
+# to the same ref+event simply queues behind it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # Belt-and-suspenders against the runner-default trap
   # (feedback_act_runner_github_server_url). Runners are configured
@@ -176,12 +191,191 @@ jobs:
           fi
           docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
 
+  # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
+  # NOT a string-match. Builds the actual image, runs it under the EXACT
+  # flags the controlplane provisioner emits for tier-4
+  # (userdata_containerized.go @ec2384c: --privileged --pid=host
+  # -v /:/host -v /var/run/docker.sock:/var/run/docker.sock), then
+  # asserts BOTH properties on the RUNNING container, atomically
+  # (RFC §10 — either failing fails the build):
+  #   (a) the uid-1000 agent can attain host root
+  #       (sudo nsenter --target 1 --mount --pid -- id -u == 0)
+  #   (b) the REAL start.sh boot path execs molecule-runtime as uid 1000
+  #       — the property that determines /configs/.auth_token ownership
+  #       in SaaS/tenant mode, where the runtime (not the platform)
+  #       writes the token via save_token(). Asserted by running the
+  #       real entrypoint (smoke-mode) with a PATH shim that records the
+  #       terminal-exec uid. NOT a self-chown tautology — fails closed if
+  #       the `exec gosu agent` (PR#24 b682444) ever regresses to root.
+  # The flags are not hard-coded blind: they are the documented
+  # provisioner contract; drift is caught because the controlplane
+  # string-match unit test (userdata_t4_privileged_test.go) guards the
+  # emission side and this gate guards the runtime side. Mirrors the
+  # already-live-verified claude-code template gate (12dd604) verbatim.
+  t4-conformance:
+    name: T4 tier-4 conformance (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate-static
+    # Untrusted-by-design: builds + runs the PR's Dockerfile. Skip on
+    # fork PRs exactly like validate-runtime.
+    if: github.event.pull_request.head.repo.fork != true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build the runtime image
+        id: build
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
+            exit 1
+          fi
+          # Per-run-unique image tag + container name. This repo triggers
+          # `on: [push, pull_request]`, so a single push to an internal PR
+          # branch fires BOTH a `push` run AND a `pull_request` run for the
+          # SAME commit. The runners share one host Docker daemon
+          # (--network host + /var/run/docker.sock bind), so a STATIC
+          # `--name t4probe` / `-t t4-conformance-test` collides across the
+          # two concurrent same-commit runs: whichever event creates the
+          # container first wins, the other dies with
+          #   "docker: Error response from daemon: Conflict. The container
+          #    name "/t4probe" is already in use ..." (exit 125)
+          # — a FALSE NEGATIVE (the probe never runs; the build that wins
+          # the race passes all assertions). Scope every host-daemon object
+          # to GITHUB_RUN_ID + GITHUB_RUN_ATTEMPT so push and pull_request
+          # runs of the same SHA are isolated. This does NOT weaken the
+          # gate — the same privileged container, the same real start.sh
+          # uid probe, and the same host-root assertions still run, just
+          # under collision-proof names. (RFC internal#456 §11;
+          # feedback_concurrency_group_per_sha — unique-name is the
+          # fail-closed primitive, concurrency is only de-dup.)
+          # Deterministic function of run-id/attempt — recomputed
+          # identically in the next step (no cross-step $GITHUB_ENV
+          # round-trip, which can be fragile under act_runner).
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+      - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
+        run: |
+          set -euo pipefail
+          # EXACT flags from controlplane userdata_containerized.go
+          # (tier-4 emission @ec2384c). The Hermes start.sh entrypoint
+          # boots the hermes gateway + molecule-runtime and wants live
+          # creds; we only need the container up long enough to probe,
+          # so override the entrypoint with a sleep (same approach as
+          # the claude-code gate) and exercise the agent context directly.
+          # Per-run-unique container name (see Build step rationale): the
+          # shared host Docker daemon is concurrently used by the SAME
+          # commit's push + pull_request runs. A static name collides and
+          # false-negatives. T4_PROBE is unique per run-id/attempt.
+          # Recompute the SAME deterministic tag the build step used
+          # (pure function of run-id/attempt — no cross-step env reliance).
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          T4_PROBE="t4probe-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          # Defensive pre-removal of a LEAKED container from a crashed
+          # prior attempt of THIS SAME run-id only (the name is run-id
+          # scoped, so this can never reap a concurrent foreign run's
+          # probe). This is cleanup of our own debris, NOT a gate bypass —
+          # no `|| true` on the real assertions below; failure still fails.
+          docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
+          CID=$(docker run -d \
+            --name "$T4_PROBE" \
+            --network host \
+            --privileged \
+            --pid=host \
+            -v /:/host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            --entrypoint /bin/sh \
+            "$T4_TAG" -c 'sleep 600')
+          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
+
+          echo "=== (b) token agent-ownership: assert the REAL start.sh boot path execs molecule-runtime as uid 1000 ==="
+          # ROOT-CAUSE-ACCURATE assertion (RFC internal#456 §10, Hermes
+          # list_peers-401 class). In SaaS/tenant mode (prod Hermes,
+          # ws-tenant-*) the platform does NOT pre-seed /configs/.auth_token
+          # — workspace_provision.go issueAndInjectToken() returns early in
+          # saasMode(), there is no #1877 volume pre-write and no #418 tar
+          # re-injection. The token is delivered in the /registry/register
+          # response body and persisted IN-CONTAINER by the runtime itself
+          # via platform_auth.save_token() (main.py:364), which does
+          # os.open(.auth_token, O_CREAT, 0o600) — the file lands owned by
+          # WHATEVER UID molecule-runtime runs as. The pinned PR#23 image
+          # (git 66b7565) ran `exec molecule-runtime` as ROOT → token
+          # root:root 600 → uid-1000 a2a_mcp_server EACCES → empty bearer →
+          # HTTP 401 → list_peers "No peers found". PR#24 (b682444) fixed it
+          # by changing the terminal exec to `exec gosu agent ...
+          # molecule-runtime` (uid 1000 → token agent-owned), exactly the
+          # claude-code proven pattern.
+          #
+          # The previous version of this step `touch`ed + `chown`ed the
+          # token ITSELF and then stat'd it — a tautology that proved
+          # nothing about the boot path and would stay GREEN if the gosu
+          # exec ever regressed back to root. Instead, run the REAL
+          # entrypoint (smoke-mode short-circuits the gateway/creds) with a
+          # shim on PATH in place of molecule-runtime that records the uid
+          # the terminal `exec` actually confers, then assert it is 1000.
+          # This fails CLOSED on any future revert of the `gosu agent` exec
+          # — the property that genuinely prevents the 401.
+          # Build the probe script on the host (no nested-quote fragility),
+          # copy it in, run it. The shim replaces `molecule-runtime` on
+          # PATH; start.sh's terminal `exec gosu agent env HOME=/tmp
+          # CONFIGS_DIR=/configs molecule-runtime` resolves to it (the
+          # `env` form preserves PATH — it is not `env -i`), so the shim
+          # records the uid the real terminal exec confers. Smoke mode
+          # makes start.sh take its line-23 short-circuit (same `exec gosu
+          # agent ... molecule-runtime` codepath, no gateway/creds needed).
+          cat > t4_token_uid_probe.sh <<'PROBE'
+          #!/bin/sh
+          set -e
+          mkdir -p /shim
+          printf '%s\n' '#!/bin/sh' 'id -u > /shim/runtime_uid' > /shim/molecule-runtime
+          chmod +x /shim/molecule-runtime
+          rm -f /shim/runtime_uid
+          chown -R agent:agent /shim
+          MOLECULE_SMOKE_MODE=1 PATH="/shim:$PATH" /usr/local/bin/start.sh > /shim/start.log 2>&1 || true
+          PROBE
+          docker cp t4_token_uid_probe.sh "$T4_PROBE":/shim_probe.sh
+          docker exec "$T4_PROBE" sh /shim_probe.sh
+          RUNTIME_UID=$(docker exec "$T4_PROBE" cat /shim/runtime_uid 2>/dev/null || echo MISSING)
+          echo "molecule-runtime terminal-exec uid = $RUNTIME_UID"
+          if [ "$RUNTIME_UID" != "1000" ]; then
+            echo "::error::T4 contract violated: start.sh execs molecule-runtime as uid=$RUNTIME_UID (expected 1000). In SaaS mode platform_auth.save_token() then writes /configs/.auth_token as that uid; uid!=1000 re-ships the Hermes list_peers-401 class (RFC internal#456 §10). The 'exec gosu agent ... molecule-runtime' (PR#24 b682444) must NOT regress."
+            docker exec "$T4_PROBE" sh -c 'tail -20 /shim/start.log' || true
+            exit 1
+          fi
+
+          echo "=== (a) host-root reach AS THE uid-1000 AGENT (not root) ==="
+          # Run as the agent user (uid 1000), exactly as gosu would.
+          AGENT_HOSTROOT_UID=$(docker exec -u agent "$T4_PROBE" sudo -n nsenter --target 1 --mount --pid -- id -u)
+          echo "agent->host-root id -u = $AGENT_HOSTROOT_UID"
+          if [ "$AGENT_HOSTROOT_UID" != "0" ]; then
+            echo "::error::T4 contract violated: uid-1000 agent could NOT attain host root via 'sudo nsenter --target 1' (got uid=$AGENT_HOSTROOT_UID). T4 escalation leg ABSENT/broken."
+            exit 1
+          fi
+          # Defense-in-depth: host-filesystem write+readback through /host
+          # from the agent, proving real host reach (not just a namespace
+          # trick on an isolated PID 1). The probe file path is ALSO
+          # per-run-unique: /host maps to the SHARED host /, so a static
+          # /host/tmp/.t4-conformance-probe would let the concurrent
+          # same-commit push+pull_request runs clobber/rm each other's
+          # marker mid-readback (a second false-negative of the same
+          # class). Run-id scoping keeps each run asserting exactly the
+          # marker it wrote — still fully fail-closed.
+          PROBE_FILE="/host/tmp/.t4-conformance-probe-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MARKER="t4-conformance-$(date +%s)-$RANDOM"
+          docker exec -u agent "$T4_PROBE" sudo -n sh -c "echo $MARKER > $PROBE_FILE"
+          READBACK=$(docker exec -u agent "$T4_PROBE" sudo -n cat "$PROBE_FILE")
+          docker exec -u agent "$T4_PROBE" sudo -n rm -f "$PROBE_FILE"
+          if [ "$READBACK" != "$MARKER" ]; then
+            echo "::error::T4 host-fs write+readback through /host failed (got '$READBACK' expected '$MARKER')."
+            exit 1
+          fi
+          echo "::notice::T4 tier-4 conformance PASS — uid-1000 agent reaches host root AND start.sh execs molecule-runtime as uid 1000 (so SaaS-mode save_token() writes /configs/.auth_token agent-owned; list_peers-401 class closed), both atomically."
+
   # Aggregator that emits a single `validate` check name — matches the
   # historical required-check name on this repo's branch protection.
   validate:
     name: validate
     runs-on: ubuntu-latest
-    needs: [validate-static, validate-runtime]
+    needs: [validate-static, validate-runtime, t4-conformance]
     if: always()
     timeout-minutes: 1
     steps:
@@ -189,8 +383,10 @@ jobs:
         run: |
           static="${{ needs.validate-static.result }}"
           runtime="${{ needs.validate-runtime.result }}"
+          t4="${{ needs.t4-conformance.result }}"
           echo "validate-static:  $static"
           echo "validate-runtime: $runtime"
+          echo "t4-conformance:   $t4"
           if [ "$static" != "success" ]; then
             echo "::error::validate-static did not succeed: $static"
             exit 1
@@ -201,7 +397,16 @@ jobs:
             echo "::error::validate-runtime did not succeed: $runtime"
             exit 1
           fi
-          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime)"
+          # T4 conformance is a HARD gate on internal (non-fork) PRs and
+          # main pushes. `skipped` is only acceptable on fork PRs (where
+          # the `if:` fork guard short-circuits it) — there the static
+          # gate is the floor. Any other non-success fails the build:
+          # "verified" T4 requires this live gate green, never inference.
+          if [ "$t4" != "success" ] && [ "$t4" != "skipped" ]; then
+            echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
+            exit 1
+          fi
+          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4)"
 
   shell-tests:
     # Shell-level unit tests for scripts/*.sh. Pre-existing

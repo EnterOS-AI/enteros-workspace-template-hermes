@@ -7,14 +7,56 @@ FROM python:3.11-slim
 #   gosu         — drop privileges in start.sh (single-process friendly)
 #   xz-utils     — hermes installer extracts a Node 22 tarball (.tar.xz)
 #   build-essential — some python deps in hermes `.[all]` extra compile from src
+#
+# T4 escalation leg (RFC internal#456 §9 / PR#474 — mirrors the
+# already-live-verified claude-code template image, commit 12dd604):
+#   sudo + util-linux(nsenter) + docker.io(CLI) are baked here so the
+#   uid-1000 `agent` (see useradd below — UNCHANGED, agent stays
+#   uid-1000; start.sh still `exec gosu agent`) has a wired, audited
+#   path to host root inside the provisioner's `--privileged
+#   --pid=host -v /:/host -v /var/run/docker.sock:/var/run/docker.sock`
+#   container. Without sudo, a uid-1000 process in --privileged CANNOT
+#   nsenter/chroot /host (--privileged grants caps to root, not
+#   uid-1000) and cannot use the root:docker 0660 docker.sock — T4
+#   would be provisioner-shape-only (the documented ABSENT-escalation
+#   -leg gap). The sudoers drop-in + docker-group add are below, after
+#   useradd, so `agent` exists. This is ADDITIVE: it does NOT change
+#   the agent uid and does NOT change /configs token ownership (still
+#   uid-1000, enforced by start.sh's `chown -R agent:agent /configs`
+#   + the Layer-3 conformance gate). Hermes list_peers-401 class
+#   (RFC internal#456 §10) must NOT regress.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates git gosu xz-utils build-essential \
+    sudo util-linux docker.io \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root agent user. hermes-agent writes its state into ~/.hermes so
-# mounting /home/agent as a persistent volume keeps skills + memory
-# across workspace restarts.
+# Non-root agent user — UNCHANGED. hermes-agent writes its state into
+# ~/.hermes so mounting /home/agent as a persistent volume keeps skills
+# + memory across workspace restarts. The agent runs as uid-1000; the
+# T4 escalation leg below is additive and does NOT promote the agent to
+# root. /configs/.auth_token must stay agent-owned (Hermes list_peers
+# 401 class — RFC internal#456 §10).
 RUN useradd -u 1000 -m -s /bin/bash agent
+
+# --- T4 escalation leg (RFC internal#456 §9.3 / PR#474) ---
+# Wired path: uid-1000 agent -> host root inside the provisioner's
+# --privileged --pid=host -v /:/host -v docker.sock container.
+#   1. NOPASSWD sudoers drop-in (mode 0440, visudo-validated at build
+#      so a malformed sudoers can never ship a broken-sudo image).
+#   2. agent in the `docker` group so the bind-mounted root:docker
+#      0660 /var/run/docker.sock is usable without sudo.
+# Atomic co-sequencing (RFC §10): this ships in the SAME image
+# revision as the uid-1000 + agent-owned-token start.sh contract
+# (PR#24 b682444); the Layer-3 conformance gate asserts BOTH on the
+# running container. Mirrors claude-code template image (12dd604,
+# already live-verified) verbatim.
+RUN set -eux; \
+    printf 'agent ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/agent-t4; \
+    chmod 0440 /etc/sudoers.d/agent-t4; \
+    visudo -cf /etc/sudoers.d/agent-t4; \
+    groupadd -f docker; \
+    usermod -aG docker agent; \
+    id agent
 
 # --- Install molecule_runtime (bridge + A2A server) ---
 # RUNTIME_VERSION is forwarded from molecule-ci's reusable publish

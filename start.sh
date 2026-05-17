@@ -49,6 +49,16 @@ fi
 # running as root, with a comment explicitly naming ".auth_token
 # rotation" as a reason. start.sh runs as root here (before any gosu),
 # so the chown takes effect for the agent-context children below.
+#
+# T4 atomic-co-sequencing contract (RFC internal#456 §10): the T4
+# escalation leg (sudo NOPASSWD + docker group, baked in the
+# Dockerfile) is ADDITIVE. The agent still runs uid-1000 (the
+# `exec gosu agent` below is UNCHANGED) and /configs/.auth_token MUST
+# remain agent-owned — escalation must NOT regress the Hermes
+# list_peers-401 token-ownership class. This chown -R is the
+# agent-ownership half of that contract; the Layer-3 conformance gate
+# asserts owner_uid==1000 on the running container alongside the
+# host-root-reach assertion. Mirrors claude-code entrypoint.sh (12dd604).
 if [ "$(id -u)" = "0" ]; then
   chown -R agent:agent /configs 2>/dev/null || true
 fi
