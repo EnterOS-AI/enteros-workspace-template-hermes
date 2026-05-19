@@ -333,10 +333,14 @@ class HermesAgentProxyExecutor(AgentExecutor):
             )
             return
 
+        history = self._extract_history_from_context(context)
+
         if self._use_plugin:
-            await self._execute_via_plugin(context, event_queue, prompt)
+            await self._execute_via_plugin(context, event_queue, prompt, history)
         else:
-            await self._execute_via_chat_completions(event_queue, prompt)
+            await self._execute_via_chat_completions(
+                event_queue, prompt, history=history
+            )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # Both transports rely on a wall-clock timeout in execute() to
@@ -353,6 +357,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
         prompt: str,
+        history: list[dict[str, Any]] | None = None,
     ) -> None:
         message_id = uuid.uuid4().hex
         chat_id = self._derive_chat_id(context)
@@ -372,6 +377,18 @@ class HermesAgentProxyExecutor(AgentExecutor):
             "message_id": message_id,
             "callback_url": callback_url,
         }
+        # Forward canvas-shipped history so the hermes-daemon plugin can
+        # replay it on its side (the plugin owns its own session store but
+        # still benefits from being told the prior canvas turns when a
+        # fresh chat_id arrives). Plugin path is default-OFF today; this
+        # just stays correct when MOLECULE_A2A_PLATFORM_ENABLED=true.
+        if history:
+            payload["messages_history"] = history
+            logger.info(
+                "hermes_history_prepended turns=%d source=%s",
+                len(history),
+                "canvas_metadata_plugin",
+            )
         headers = {"Content-Type": "application/json"}
         if self._shared_secret:
             headers[SECRET_HEADER] = self._shared_secret
@@ -474,9 +491,12 @@ class HermesAgentProxyExecutor(AgentExecutor):
         self,
         event_queue: EventQueue,
         prompt: str,
+        history: list[dict[str, Any]] | None = None,
     ) -> None:
         peers_blurb = await self._fetch_peers_blurb()
-        messages = self._build_initial_messages(prompt, peers_blurb)
+        messages = self._build_initial_messages(
+            prompt, peers_blurb, history=history
+        )
         headers = self._build_chat_completions_headers()
 
         try:
@@ -535,7 +555,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
             )
 
     def _build_initial_messages(
-        self, user_text: str, peers_blurb: str = ""
+        self,
+        user_text: str,
+        peers_blurb: str = "",
+        history: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         system_content = self._config.system_prompt or ""
         if peers_blurb:
@@ -547,8 +570,87 @@ class HermesAgentProxyExecutor(AgentExecutor):
         messages: list[dict[str, Any]] = []
         if system_content:
             messages.append({"role": "system", "content": system_content})
+
+        # Replay prior canvas turns between system and the current user
+        # turn so hermes-agent has conversational context. Canvas ships
+        # the last 20 turns under metadata.history as
+        #   {"role": "user"|"agent",
+        #    "parts": [{"kind": "text", "text": "..."}]}
+        # (see canvas/src/components/tabs/chat/hooks/useChatSend.ts:104-111
+        # in molecule-core). We translate to OpenAI chat-completions shape
+        # (assistant role + flat string content). Unknown roles are skipped
+        # with a warning rather than smuggled in as raw text.
+        replayed = 0
+        if history:
+            for turn in history:
+                if not isinstance(turn, dict):
+                    continue
+                src_role = turn.get("role")
+                if src_role == "user":
+                    dst_role = "user"
+                elif src_role == "agent":
+                    dst_role = "assistant"
+                else:
+                    logger.warning(
+                        "hermes history: skipping turn with unknown role=%r",
+                        src_role,
+                    )
+                    continue
+                content = self._extract_history_text(turn)
+                if not content:
+                    continue
+                messages.append({"role": dst_role, "content": content})
+                replayed += 1
+
         messages.append({"role": "user", "content": user_text})
+
+        if replayed:
+            logger.info(
+                "hermes_history_prepended turns=%d source=%s",
+                replayed,
+                "canvas_metadata",
+            )
         return messages
+
+    @staticmethod
+    def _extract_history_text(turn: dict[str, Any]) -> str:
+        """Flatten a canvas A2A history turn into chat-completions text.
+
+        Canvas turns carry text inside `parts: [{kind: "text", text: "..."}]`.
+        Tolerate string-shaped content too in case a peer pre-flattens."""
+        content = turn.get("content")
+        if isinstance(content, str) and content:
+            return content
+        parts = turn.get("parts") or []
+        chunks: list[str] = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            if p.get("kind") == "text":
+                t = p.get("text")
+                if isinstance(t, str) and t:
+                    chunks.append(t)
+        return "\n".join(chunks)
+
+    @staticmethod
+    def _extract_history_from_context(
+        context: RequestContext,
+    ) -> list[dict[str, Any]]:
+        """Pull the canvas-shipped history array off context.message.metadata.
+
+        Tolerates missing metadata / wrong types — falls through to an
+        empty list so a malformed envelope just yields the legacy
+        no-history behavior rather than crashing the turn."""
+        message = getattr(context, "message", None)
+        if message is None:
+            return []
+        metadata = getattr(message, "metadata", None) or {}
+        if not isinstance(metadata, dict):
+            return []
+        history = metadata.get("history")
+        if not isinstance(history, list):
+            return []
+        return history
 
     def _build_chat_completions_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
