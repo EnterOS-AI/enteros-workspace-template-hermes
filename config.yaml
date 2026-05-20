@@ -12,6 +12,222 @@ description: >-
 version: 2.1.0
 tier: 2
 
+# Provider registry — declarative SSOT for the model-slug-prefix →
+# hermes-agent provider mapping. The authoritative runtime derivation
+# lives in scripts/derive-provider.sh (sourced by both install.sh and
+# start.sh), and this block mirrors that taxonomy 1:1 so workspace-server
+# (cp#220 hard-gate) and the canvas Config tab can validate / surface
+# providers without scraping the shell script.
+#
+# Adding a new provider here = also add the matching `case` arm to
+# scripts/derive-provider.sh, and (if cp#220 v1 still applies) extend
+# KnownProviderNames() in molecule-controlplane userdata_containerized.go.
+# Track that under SSOT audit comment 40629 finding #4.
+#
+# Schema per entry (subset of claude-code template's richer schema —
+# hermes-agent owns the model registry, so we don't enumerate model
+# aliases here):
+#   name           : provider name as hermes-agent expects it
+#                    (HERMES_INFERENCE_PROVIDER value)
+#   model_prefixes : model-slug prefixes that route to this provider
+#                    (matches derive-provider.sh case arms)
+#   base_url       : default upstream endpoint hermes-agent uses; null
+#                    when the provider owns its endpoint internally or
+#                    requires per-workspace configuration (custom, lmstudio).
+#   auth_env       : env vars that satisfy auth; ANY ONE being set is
+#                    sufficient (OR-semantics; mirrors hermes-agent
+#                    behaviour where its provider auto-resolves the key)
+#   notes          : (optional) free-text disambiguation for operator docs
+providers:
+  # ── Direct-SDK providers (1:1 prefix → provider) ──────────────────
+  - name: nous
+    model_prefixes: [nousresearch/]
+    base_url: https://inference-api.nousresearch.com/v1
+    auth_env: [HERMES_API_KEY, NOUS_API_KEY]
+    notes: >-
+      Nous Portal — direct path for Hermes 4 family. Falls back to
+      `openrouter` when neither HERMES_API_KEY nor NOUS_API_KEY is set
+      (see derive-provider.sh `nousresearch/*` arm).
+
+  - name: openrouter
+    model_prefixes: [openrouter/, nousresearch/, openai/]
+    base_url: https://openrouter.ai/api/v1
+    auth_env: [OPENROUTER_API_KEY]
+    notes: >-
+      Catch-all gateway. Also the fallback for `openai/*` slugs when
+      OPENAI_API_KEY is not set (hermes has no native `openai` provider —
+      see derive-provider.sh `openai/*` arm), and for `nousresearch/*`
+      when no Nous key is present.
+
+  - name: anthropic
+    model_prefixes: [anthropic/]
+    base_url: https://api.anthropic.com
+    auth_env: [ANTHROPIC_API_KEY]
+
+  - name: gemini
+    model_prefixes: [gemini/]
+    base_url: https://generativelanguage.googleapis.com
+    auth_env: [GEMINI_API_KEY]
+
+  - name: deepseek
+    model_prefixes: [deepseek/]
+    base_url: https://api.deepseek.com
+    auth_env: [DEEPSEEK_API_KEY]
+
+  - name: zai
+    model_prefixes: [zai/]
+    base_url: https://api.z.ai/api/anthropic
+    auth_env: [GLM_API_KEY, ZAI_API_KEY]
+
+  - name: kimi-coding
+    model_prefixes: [kimi-coding/]
+    base_url: https://api.kimi.com/coding/
+    auth_env: [KIMI_API_KEY]
+    notes: >-
+      Moonshot's Kimi-For-Coding gateway. Chinese-region variant
+      `kimi-coding-cn` keeps its full prefix as the provider name.
+
+  - name: kimi-coding-cn
+    model_prefixes: [kimi-coding-cn/]
+    base_url: https://api.kimi.cn/coding/
+    auth_env: [KIMI_API_KEY, KIMI_CN_API_KEY]
+
+  - name: minimax
+    model_prefixes: [minimax/]
+    base_url: https://api.minimax.io/v1
+    auth_env: [MINIMAX_API_KEY]
+
+  - name: minimax-cn
+    model_prefixes: [minimax-cn/]
+    base_url: https://api.minimaxi.com/v1
+    auth_env: [MINIMAX_CN_API_KEY, MINIMAX_API_KEY]
+
+  - name: alibaba
+    model_prefixes: [alibaba/, dashscope/, qwen/]
+    base_url: https://dashscope.aliyuncs.com
+    auth_env: [DASHSCOPE_API_KEY]
+
+  - name: xiaomi
+    model_prefixes: [xiaomi/, mimo/]
+    base_url: https://api.xiaomimimo.com
+    auth_env: [XIAOMI_API_KEY]
+
+  - name: arcee
+    model_prefixes: [arcee/, arcee-ai/]
+    base_url: https://api.arcee.ai
+    auth_env: [ARCEEAI_API_KEY]
+
+  - name: nvidia
+    model_prefixes: [nvidia/, nim/]
+    base_url: https://integrate.api.nvidia.com/v1
+    auth_env: [NVIDIA_API_KEY]
+
+  - name: ollama-cloud
+    model_prefixes: [ollama-cloud/]
+    base_url: https://ollama.com/api
+    auth_env: [OLLAMA_API_KEY]
+
+  - name: huggingface
+    model_prefixes: [huggingface/, hf/]
+    base_url: https://api-inference.huggingface.co
+    auth_env: [HF_TOKEN]
+
+  - name: ai-gateway
+    model_prefixes: [ai-gateway/, aigateway/]
+    base_url: https://ai-gateway.vercel.sh/v1
+    auth_env: [AI_GATEWAY_API_KEY]
+
+  - name: kilocode
+    model_prefixes: [kilocode/]
+    base_url: null
+    auth_env: [KILOCODE_API_KEY]
+
+  - name: opencode-zen
+    model_prefixes: [opencode-zen/]
+    base_url: null
+    auth_env: [OPENCODE_ZEN_API_KEY]
+
+  - name: opencode-go
+    model_prefixes: [opencode-go/]
+    base_url: null
+    auth_env: [OPENCODE_GO_API_KEY]
+
+  - name: xai
+    model_prefixes: [xai/, grok/]
+    base_url: https://api.x.ai/v1
+    auth_env: [XAI_API_KEY]
+
+  - name: bedrock
+    model_prefixes: [bedrock/, aws/]
+    base_url: null
+    auth_env: [AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN]
+    notes: SigV4 — uses the standard AWS credential chain.
+
+  - name: tencent-tokenhub
+    model_prefixes: [tencent/, tencent-tokenhub/]
+    base_url: https://api.tokenhub.tencentcloudapi.com
+    auth_env: [TENCENT_API_KEY]
+
+  - name: gmi
+    model_prefixes: [gmi/]
+    base_url: null
+    auth_env: [GMI_API_KEY]
+
+  # ── OAuth-based providers (hermes-agent owns the OAuth flow; no
+  #    base_url enforced by the template) ──────────────────────────
+  - name: openai-codex
+    model_prefixes: [openai-codex/]
+    base_url: null
+    auth_env: []
+    notes: OAuth-only (Codex models). hermes-agent owns the device-code flow.
+
+  - name: qwen-oauth
+    model_prefixes: [qwen-oauth/]
+    base_url: null
+    auth_env: []
+
+  - name: minimax-oauth
+    model_prefixes: [minimax-oauth/]
+    base_url: null
+    auth_env: []
+
+  - name: alibaba-coding-plan
+    model_prefixes: [alibaba-coding-plan/]
+    base_url: null
+    auth_env: []
+
+  - name: google-gemini-cli
+    model_prefixes: [google-gemini-cli/]
+    base_url: null
+    auth_env: []
+
+  - name: copilot-acp
+    model_prefixes: [copilot-acp/]
+    base_url: null
+    auth_env: []
+
+  - name: copilot
+    model_prefixes: [copilot/]
+    base_url: null
+    auth_env: []
+
+  # ── Self-hosted / local catch-alls ─────────────────────────────────
+  - name: custom
+    model_prefixes: [custom/]
+    base_url: null
+    auth_env: [HERMES_CUSTOM_API_KEY, OPENAI_API_KEY]
+    notes: >-
+      Self-hosted OpenAI-compat endpoint. Per derive-provider.sh, an
+      `openai/*` slug WITH OPENAI_API_KEY present routes through `custom`
+      pointed at api.openai.com (install.sh auto-populates
+      HERMES_CUSTOM_BASE_URL + HERMES_CUSTOM_API_KEY).
+
+  - name: lmstudio
+    model_prefixes: [lmstudio/, lm-studio/]
+    base_url: null
+    auth_env: []
+    notes: Local LM Studio endpoint; base_url configured per-workspace.
+
 runtime: hermes
 runtime_config:
   # Default model. hermes-agent owns provider resolution via the
