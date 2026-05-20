@@ -45,8 +45,14 @@ def _free_port() -> int:
 def _make_executor(monkeypatch, **env: str) -> HermesAgentProxyExecutor:
     """Test helper. Defaults MOLECULE_A2A_PLATFORM_ENABLED=true so the
     plugin-path tests below operate in plugin mode by default. Tests
-    that exercise the chat_completions fallback override this."""
+    that exercise the chat_completions fallback override this.
+
+    WORKSPACE_ID is explicitly UNSET by default so existing tests
+    continue to exercise the context_id/task_id fallback chain in
+    _derive_chat_id. Tests that need the workspace_id-first hot-patch
+    path (PR #37, task #262) set WORKSPACE_ID via env= kwarg."""
     env.setdefault("MOLECULE_A2A_PLATFORM_ENABLED", "true")
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     cfg = AdapterConfig(
@@ -709,26 +715,25 @@ async def test_fallback_handles_unexpected_response_shape(monkeypatch):
 # ---- chat_id derivation ----------------------------------------------
 
 
-def test_derive_chat_id_prefers_context_id_over_task_id():
-    """Load-bearing assertion: when both context_id and task_id are set,
-    chat_id must derive from context_id. Per a2a-sdk semantics, task_id
-    changes per turn (canvas creates a fresh task per inbound message)
-    while context_id is the stable conversation key. Keying SessionStore
-    on task_id was the RFC #600 runtime failure observed empirically in
-    chloe-dong on 2026-05-20 (sessions 20260520_080028 + 20260520_080035
-    7s apart in state.db — two different sessions for the same canvas
-    chat). Mirrors workspace-template-openclaw PR #29's
+def test_derive_chat_id_prefers_context_id_over_task_id(monkeypatch):
+    """Load-bearing assertion: when WORKSPACE_ID is unset and both
+    context_id and task_id are populated, chat_id must derive from
+    context_id (PR #35 priority chain, preserved as PR #37 fallback).
+    Mirrors workspace-template-openclaw PR #29's
     test_session_id_prefers_context_id_over_task_id."""
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
     ctx = MagicMock()
     ctx.context_id = "chat-stable"
     ctx.task_id = "task-changes-per-turn"
     assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "chat-stable"
 
 
-def test_derive_chat_id_falls_back_to_session_id_when_context_id_unset():
-    """Backwards-compat: when context_id is absent but session_id is set,
-    chat_id derives from session_id. Mid-priority in the new
-    (context_id, session_id, task_id) loop."""
+def test_derive_chat_id_falls_back_to_session_id_when_context_id_unset(
+    monkeypatch,
+):
+    """Backwards-compat (WORKSPACE_ID unset): when context_id is absent
+    but session_id is set, chat_id derives from session_id."""
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
     ctx = MagicMock()
     ctx.context_id = None
     ctx.session_id = "sess-B"
@@ -736,11 +741,13 @@ def test_derive_chat_id_falls_back_to_session_id_when_context_id_unset():
     assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "sess-B"
 
 
-def test_derive_chat_id_falls_back_to_task_id_when_context_and_session_unset():
-    """Backwards-compat for older a2a-sdk RequestContext shapes that
-    don't populate context_id or session_id. task_id is the last
-    context-level fallback before message-attr probing. Prevents an
-    adhoc-* session being silently created when task_id alone is set."""
+def test_derive_chat_id_falls_back_to_task_id_when_context_and_session_unset(
+    monkeypatch,
+):
+    """Backwards-compat (WORKSPACE_ID unset) for older a2a-sdk shapes
+    that don't populate context_id or session_id. task_id is the last
+    context-level fallback before message-attr probing."""
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
     ctx = MagicMock()
     ctx.context_id = None
     ctx.session_id = None
@@ -748,7 +755,8 @@ def test_derive_chat_id_falls_back_to_task_id_when_context_and_session_unset():
     assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "task-only"
 
 
-def test_derive_chat_id_synthesizes_when_nothing_present():
+def test_derive_chat_id_synthesizes_when_nothing_present(monkeypatch):
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
     ctx = MagicMock()
     ctx.context_id = None
     ctx.session_id = None
@@ -758,10 +766,10 @@ def test_derive_chat_id_synthesizes_when_nothing_present():
     assert derived.startswith("adhoc-")
 
 
-def test_derive_chat_id_falls_back_to_message_context_id():
-    """When ctx.{context_id,session_id,task_id} are all None but
-    ctx.message has context_id, derive_chat_id should use that —
-    matching the context_id-first priority on the message-attr loop."""
+def test_derive_chat_id_falls_back_to_message_context_id(monkeypatch):
+    """When WORKSPACE_ID + ctx.{context_id,session_id,task_id} are all
+    unset but ctx.message has context_id, derive_chat_id uses that."""
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
     ctx = MagicMock()
     ctx.context_id = None
     ctx.session_id = None
@@ -774,9 +782,10 @@ def test_derive_chat_id_falls_back_to_message_context_id():
     assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "ctx-from-message"
 
 
-def test_derive_chat_id_uses_message_id_camelcase():
+def test_derive_chat_id_uses_message_id_camelcase(monkeypatch):
     """The a2a-sdk uses messageId on the Message object — ensure we
     pick it up as a last fallback before synthesizing an adhoc id."""
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
     ctx = MagicMock()
     ctx.context_id = None
     ctx.session_id = None
@@ -1260,10 +1269,260 @@ async def test_plugin_path_payload_chat_id_uses_context_id_not_task_id(monkeypat
 
     assert len(inbound_received) == 1
     body = inbound_received[0]
-    # Load-bearing assertion — pins the priority order at the wire layer.
+    # Load-bearing assertion — pins the priority order at the wire layer
+    # when WORKSPACE_ID is unset (fallback chain). With WORKSPACE_ID set
+    # (the canvas-deployed case, PR #37) the workspace_id-first key wins;
+    # see test_plugin_path_payload_chat_id_uses_workspace_id_env.
     assert body["chat_id"] == "chat-stable-cross-turn", (
         f"chat_id must be context_id-derived (stable), got "
         f"{body['chat_id']!r} (likely fell back to task_id-first ordering)"
     )
-    # peer_id is currently aliased to chat_id, so it should match too.
-    assert body["peer_id"] == "chat-stable-cross-turn"
+    # peer_id MUST NOT be aliased to chat_id (PR #37 task #262 fix C):
+    # peer_id is the sender's identity, default "" for canvas_user.
+    assert body["peer_id"] == "", (
+        f"peer_id must default to empty (not chat_id-aliased), "
+        f"got {body['peer_id']!r}"
+    )
+
+
+# ---- PR #37 hot-patch: WORKSPACE_ID env-keyed chat_id ----------------
+
+
+def test_derive_chat_id_prefers_workspace_id_env(monkeypatch):
+    """RFC #600 layer-2 hot-patch (task #262). When WORKSPACE_ID is set
+    (canvas-deployed case), _derive_chat_id must return a stable
+    workspace-keyed identifier — regardless of what context_id /
+    task_id carry. This collapses all turns in the same workspace into
+    one hermes-daemon SessionStore session.
+
+    Diagnosis context (a60623344): a2a-sdk's
+    RequestContext._check_or_generate_context_id mints a fresh UUID per
+    turn when the inbound message has no context_id, and the platform
+    POST /workspaces/<id>/a2a does not yet thread a canvas-side
+    conversation key. Empirically 6 separate sessions appeared in 3
+    minutes in /tmp/.hermes/sessions/sessions.json on a single canvas
+    chat. Until the platform-side propagation fix lands (separate RFC),
+    we pin chat_id to WORKSPACE_ID."""
+    monkeypatch.setenv("WORKSPACE_ID", "ws-abc-123")
+    ctx = MagicMock()
+    # Even with context_id populated, WORKSPACE_ID wins under the
+    # hot-patch: context_id is per-turn, workspace is per-conversation.
+    ctx.context_id = "fresh-uuid-per-turn"
+    ctx.task_id = "task-changes-per-turn"
+    ctx.session_id = None
+    assert (
+        HermesAgentProxyExecutor._derive_chat_id(ctx)
+        == "workspace:ws-abc-123"
+    )
+
+
+def test_derive_chat_id_falls_back_to_context_id_when_workspace_id_unset(
+    monkeypatch,
+):
+    """Defensive fallback: when WORKSPACE_ID is unset (local dev,
+    non-canvas peer-agent turns), PR #35's context_id-first priority
+    chain still applies. Pins backward compatibility for environments
+    that don't carry the env."""
+    monkeypatch.delenv("WORKSPACE_ID", raising=False)
+    ctx = MagicMock()
+    ctx.context_id = "ctx-still-used"
+    ctx.session_id = None
+    ctx.task_id = "task-X"
+    assert (
+        HermesAgentProxyExecutor._derive_chat_id(ctx) == "ctx-still-used"
+    )
+
+
+def test_derive_chat_id_falls_back_when_workspace_id_is_empty_string(
+    monkeypatch,
+):
+    """Defensive: WORKSPACE_ID="" must behave like WORKSPACE_ID unset,
+    not produce a degenerate chat_id of "workspace:"."""
+    monkeypatch.setenv("WORKSPACE_ID", "")
+    ctx = MagicMock()
+    ctx.context_id = "ctx-still-used"
+    ctx.session_id = None
+    ctx.task_id = "task-X"
+    assert (
+        HermesAgentProxyExecutor._derive_chat_id(ctx) == "ctx-still-used"
+    )
+
+
+# ---- PR #37 hot-patch: peer_id MUST NOT conflate with chat_id --------
+
+
+@pytest.mark.asyncio
+async def test_plugin_path_payload_does_not_conflate_peer_id_with_chat_id(
+    monkeypatch,
+):
+    """Async variant of the decoupling assertion — captures the actual
+    wire-level POST body to the hermes daemon and proves:
+      * chat_id is the workspace-keyed hot-patch value
+      * peer_id is "" (no leak) when no peer metadata is provided
+      * peer_name is "" (no leak)
+    Per molecule MCP protocol semantics for canvas_user inbound."""
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    inbound_received: List[Dict[str, Any]] = []
+
+    async def fake_inbound(request: web.Request) -> web.Response:
+        body = await request.json()
+        inbound_received.append(body)
+        async def _delayed_reply():
+            await asyncio.sleep(0.02)
+            async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                await s.post(
+                    body["callback_url"],
+                    json={
+                        "chat_id": body["chat_id"],
+                        "content": "ok",
+                        "reply_to": body["message_id"],
+                        "metadata": {},
+                    },
+                )
+        asyncio.create_task(_delayed_reply())
+        return web.json_response({"ok": True, "queued": True})
+
+    plugin_app = web.Application()
+    plugin_app.router.add_post("/a2a/inbound", fake_inbound)
+    plugin_runner = web.AppRunner(plugin_app)
+    await plugin_runner.setup()
+    plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
+    await plugin_site.start()
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+        WORKSPACE_ID="ws-canvas-fixture",
+    )
+    queue = _CapturingQueue()
+    try:
+        await ex.start()
+        await ex.execute(_build_context("hi"), queue)
+    finally:
+        await ex.stop()
+        await plugin_site.stop()
+        await plugin_runner.cleanup()
+
+    assert len(inbound_received) == 1
+    body = inbound_received[0]
+    assert body["chat_id"] == "workspace:ws-canvas-fixture", (
+        f"WORKSPACE_ID hot-patch must win, got chat_id={body['chat_id']!r}"
+    )
+    assert body["peer_id"] == "", (
+        f"peer_id MUST be empty for canvas_user (no chat_id alias), "
+        f"got {body['peer_id']!r}"
+    )
+    assert body["peer_name"] == "", (
+        f"peer_name MUST NOT leak chat_id as display string, "
+        f"got {body['peer_name']!r}"
+    )
+    # And critically — peer_id != chat_id even when both happen to be
+    # non-empty later. Today the leak symptom is the UUID showing up
+    # as the bot's notion of who it's talking to.
+    assert body["peer_id"] != body["chat_id"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_path_peer_identity_from_metadata(monkeypatch):
+    """When the platform DOES supply peer identity via
+    context.message.metadata (peer_agent inbound case), it must be
+    propagated to the daemon — not silently dropped or overridden."""
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    inbound_received: List[Dict[str, Any]] = []
+
+    async def fake_inbound(request: web.Request) -> web.Response:
+        body = await request.json()
+        inbound_received.append(body)
+        async def _delayed_reply():
+            await asyncio.sleep(0.02)
+            async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                await s.post(
+                    body["callback_url"],
+                    json={
+                        "chat_id": body["chat_id"],
+                        "content": "ok",
+                        "reply_to": body["message_id"],
+                        "metadata": {},
+                    },
+                )
+        asyncio.create_task(_delayed_reply())
+        return web.json_response({"ok": True, "queued": True})
+
+    plugin_app = web.Application()
+    plugin_app.router.add_post("/a2a/inbound", fake_inbound)
+    plugin_runner = web.AppRunner(plugin_app)
+    await plugin_runner.setup()
+    plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
+    await plugin_site.start()
+
+    # Build a peer-agent-style context with metadata.peer_{id,name}.
+    ctx = MagicMock()
+    ctx.context_id = None
+    ctx.session_id = None
+    ctx.task_id = "task-peer-1"
+    msg = MagicMock()
+    msg.task_id = "task-peer-1"
+    text_part = MagicMock()
+    text_part.text = "hello from peer"
+    text_part.kind = "text"
+    msg.parts = [text_part]
+    msg.metadata = {
+        "peer_id": "ws-peer-uuid",
+        "peer_name": "ops-agent",
+    }
+    ctx.message = msg
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+        WORKSPACE_ID="ws-self-canvas",
+    )
+    queue = _CapturingQueue()
+    try:
+        await ex.start()
+        await ex.execute(ctx, queue)
+    finally:
+        await ex.stop()
+        await plugin_site.stop()
+        await plugin_runner.cleanup()
+
+    assert len(inbound_received) == 1
+    body = inbound_received[0]
+    assert body["chat_id"] == "workspace:ws-self-canvas"
+    assert body["peer_id"] == "ws-peer-uuid"
+    assert body["peer_name"] == "ops-agent"
+
+
+def test_derive_peer_identity_handles_missing_metadata():
+    """Defensive: missing/None/non-dict metadata → ("", "")."""
+    ctx = MagicMock()
+    msg = MagicMock()
+    msg.metadata = None
+    ctx.message = msg
+    assert HermesAgentProxyExecutor._derive_peer_identity(ctx) == ("", "")
+
+    ctx2 = MagicMock()
+    ctx2.message = None
+    assert HermesAgentProxyExecutor._derive_peer_identity(ctx2) == ("", "")
+
+    ctx3 = MagicMock()
+    msg3 = MagicMock()
+    msg3.metadata = "not-a-dict"
+    ctx3.message = msg3
+    assert HermesAgentProxyExecutor._derive_peer_identity(ctx3) == ("", "")
+
+
+def test_derive_peer_identity_handles_partial_metadata():
+    """Partial metadata — peer_id without peer_name (or vice versa) —
+    yields ("", "") for the missing field."""
+    ctx = MagicMock()
+    msg = MagicMock()
+    # MagicMock returns a child Mock for unknown attrs; we want a real
+    # dict so .get() returns None for missing peer_name.
+    msg.metadata = {"peer_id": "ws-X"}
+    ctx.message = msg
+    assert HermesAgentProxyExecutor._derive_peer_identity(ctx) == ("ws-X", "")

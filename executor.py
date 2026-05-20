@@ -393,6 +393,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
     ) -> None:
         message_id = uuid.uuid4().hex
         chat_id = self._derive_chat_id(context)
+        peer_id, peer_name = self._derive_peer_identity(context)
         callback_url = (
             f"http://{self._callback_host}:{self._callback_port}{_DEFAULT_CALLBACK_PATH}"
         )
@@ -407,10 +408,17 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # the daemon replays its own transcript on the next turn. Do NOT
         # ship messages_history in the payload — it's double-bookkeeping
         # and a divergence source (sibling to RFC #497).
+        #
+        # peer_id/peer_name are the SENDER's identity, NOT a copy of
+        # chat_id. Per molecule MCP protocol semantics: peer_id="" for
+        # canvas_user, set to peer workspace UUID for peer_agent. Aliasing
+        # them to chat_id surfaced as a UX leak — hermes would greet the
+        # user with "your peer ID is <uuid>" because the system context
+        # carried chat_id-as-peer-name. See task #262.
         payload = {
             "chat_id": chat_id,
-            "peer_id": chat_id,
-            "peer_name": chat_id,
+            "peer_id": peer_id,
+            "peer_name": peer_name,
             "content": prompt,
             "message_id": message_id,
             "callback_url": callback_url,
@@ -494,17 +502,30 @@ class HermesAgentProxyExecutor(AgentExecutor):
 
     @staticmethod
     def _derive_chat_id(context: RequestContext) -> str:
-        # Prefer context_id for stable cross-turn identity. Per a2a-sdk
-        # semantics, task_id changes per turn (each inbound canvas
-        # message creates a fresh task), while context_id is the stable
-        # conversation key. Keying chat_id on task_id breaks hermes's
-        # SessionStore continuity — every turn becomes a new session,
-        # which is exactly the runtime failure RFC #600 set out to fix
-        # (sibling to workspace-template-openclaw PR #29, which made
-        # the same correction for openclaw's --session-id). Fall back
-        # to session_id, then task_id, then message-side attrs; last
-        # resort is a synthetic ID so we always pass something hermes
-        # can use to key its session store.
+        # RFC #600 layer-2 hot-patch (task #262). PR #35 corrected the
+        # priority tuple to context_id-first, which is mechanically right
+        # — but the a2a-sdk's RequestContext._check_or_generate_context_id
+        # auto-mints a FRESH UUID per turn when the inbound message lacks
+        # a context_id, and the platform's POST /workspaces/<id>/a2a does
+        # not yet thread a canvas-side conversation key through. Result:
+        # context_id IS populated, but it changes every turn, so the
+        # hermes daemon's SessionStore still creates a new session per
+        # turn (empirically: 6 separate sessions in 3 minutes in
+        # /tmp/.hermes/sessions/sessions.json, diagnosis a60623344).
+        #
+        # Until the proper fix lands (RFC #600 layer-2 platform-side
+        # context_id propagation, separate PR), key chat_id on the
+        # workspace's own ID — it's stable per-workspace by definition,
+        # and a canvas chat is one-to-one with a workspace. This
+        # collapses all turns in the same workspace into one session,
+        # which is the desired UX.
+        workspace_id = os.environ.get("WORKSPACE_ID")
+        if workspace_id:
+            return f"workspace:{workspace_id}"
+        # Defensive fallback: preserve PR #35's context_id-first chain
+        # for environments without WORKSPACE_ID (local dev, peer-agent
+        # turns from non-canvas sources). Backwards-compat with all
+        # prior shapes.
         for attr in ("context_id", "session_id", "task_id"):
             value = getattr(context, attr, None)
             if value:
@@ -516,6 +537,38 @@ class HermesAgentProxyExecutor(AgentExecutor):
                 if value:
                     return str(value)
         return f"adhoc-{uuid.uuid4().hex[:12]}"
+
+    @staticmethod
+    def _derive_peer_identity(context: RequestContext) -> tuple[str, str]:
+        """Pull the sender's (peer_id, peer_name) off context.message.metadata.
+
+        Platform-side conventions (molecule MCP protocol):
+          * canvas_user → peer_id is the empty string. peer_name may be
+            absent or carry a user-facing display string the platform
+            attached (rare today; reserved).
+          * peer_agent  → peer_id is the sender workspace's UUID, and
+            peer_name is its display name from the registry.
+
+        We read off ``context.message.metadata`` if present and tolerate
+        missing/malformed shapes (return empty strings rather than
+        raise). The previous behavior — aliasing chat_id into both
+        fields — surfaced in canvas as hermes greeting the user with
+        ``your peer ID is <uuid>`` (task #262). Default to empty so the
+        daemon's system prompt doesn't leak chat_id as the peer label.
+        """
+        message = getattr(context, "message", None)
+        if message is None:
+            return ("", "")
+        metadata = getattr(message, "metadata", None) or {}
+        if not isinstance(metadata, dict):
+            return ("", "")
+        peer_id = metadata.get("peer_id") or ""
+        peer_name = metadata.get("peer_name") or ""
+        if not isinstance(peer_id, str):
+            peer_id = ""
+        if not isinstance(peer_name, str):
+            peer_name = ""
+        return (peer_id, peer_name)
 
     # ------------------------------------------------------------------
     # Legacy chat_completions transport (fallback)
