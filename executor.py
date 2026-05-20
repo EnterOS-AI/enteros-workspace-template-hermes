@@ -67,7 +67,10 @@ from a2a.server.events import EventQueue
 from a2a.helpers import new_text_message
 
 from molecule_runtime.adapters.base import AdapterConfig
-from molecule_runtime.executor_helpers import extract_message_text
+from molecule_runtime.executor_helpers import (
+    extract_attached_files,
+    extract_message_text,
+)
 try:
     from molecule_runtime.a2a_tools import (
         tool_check_task_status,
@@ -326,12 +329,32 @@ class HermesAgentProxyExecutor(AgentExecutor):
     # AgentExecutor contract
     # ------------------------------------------------------------------
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        prompt = extract_message_text(context.message) or ""
-        if not prompt.strip():
+        text = extract_message_text(context.message) or ""
+        # Phase 1 file-only message support (a1ea2200 archaeology — chloe-dong
+        # PDF-only canary 2026-05-20 01:04:27Z surfaced the opaque
+        # "(empty prompt — nothing to do)" reply). Mirror the claude-code
+        # reference impl (claude_sdk_executor.py:644-650): surface attached
+        # files to hermes as a manifest in the prompt — hermes reads files
+        # through its own tools by path. Phase 2 will wire actual
+        # file-content forwarding to the hermes daemon.
+        attached = extract_attached_files(context.message)
+        if attached:
+            manifest = "\n\nAttached files:\n" + "\n".join(
+                f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
+                for f in attached
+            )
+            text = (text + manifest) if text.strip() else manifest.lstrip()
+        if not text.strip():
+            # Truly empty — actionable per
+            # feedback_surface_actionable_failure_reason_to_user.
             await event_queue.enqueue_event(
-                new_text_message("(empty prompt — nothing to do)")
+                new_text_message(
+                    "Your message was empty. Please send text or a file "
+                    "with instructions."
+                )
             )
             return
+        prompt = text
 
         if self._use_plugin:
             # Plugin path → hermes daemon owns session state natively

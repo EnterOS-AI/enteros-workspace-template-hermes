@@ -256,7 +256,14 @@ async def test_execute_via_plugin_round_trips(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_execute_empty_prompt_short_circuits(monkeypatch):
+async def test_execute_empty_prompt_surfaces_actionable_reason(monkeypatch):
+    """Phase 1 file-only message support (a1ea2200): empty text AND no
+    files → actionable user-facing reason, NOT the old opaque
+    "(empty prompt — nothing to do)" string.
+
+    Per feedback_surface_actionable_failure_reason_to_user — the user
+    must be able to see WHY their turn produced nothing.
+    """
     ex = _make_executor(
         monkeypatch, MOLECULE_A2A_CALLBACK_PORT=str(_free_port())
     )
@@ -269,7 +276,121 @@ async def test_execute_empty_prompt_short_circuits(monkeypatch):
         await ex.stop()
 
     assert len(queue.events) == 1
-    assert "empty prompt" in repr(queue.events[0])
+    rendered = repr(queue.events[0])
+    assert "Your message was empty" in rendered
+    assert "send text or a file" in rendered
+    # The old opaque string must NOT appear.
+    assert "(empty prompt — nothing to do)" not in rendered
+
+
+def _build_context_with_file(
+    *, name: str, mime_type: str, path: str, text: str = "",
+    task_id: str = "task-file-only",
+):
+    """RequestContext stub with an attached FilePart (v0-flat shape).
+
+    Mirrors _build_context() but adds a file part. Pass ``text=""`` for
+    a true file-only message.
+    """
+    ctx = MagicMock()
+    ctx.task_id = task_id
+    ctx.session_id = None
+    ctx.context_id = None
+    msg = MagicMock()
+    msg.task_id = task_id
+    parts = []
+    if text:
+        text_part = MagicMock()
+        text_part.text = text
+        text_part.kind = "text"
+        parts.append(text_part)
+    file_part = MagicMock(spec=["kind", "root", "file", "url", "filename", "media_type"])
+    file_part.kind = "file"
+    file_part.root = file_part  # extract_attached_files uses .root or part itself
+    # Suppress .text so extract_message_text doesn't trip on a MagicMock value.
+    del file_part.text  # type: ignore[attr-defined]
+    file_obj = MagicMock(spec=["uri", "name", "mimeType", "mime_type"])
+    file_obj.uri = f"file://{path}"
+    file_obj.name = name
+    file_obj.mimeType = mime_type
+    file_part.file = file_obj
+    parts.append(file_part)
+    msg.parts = parts
+    ctx.message = msg
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_execute_file_only_no_longer_returns_opaque_empty(
+    monkeypatch, tmp_path,
+):
+    """File-only message must NOT short-circuit with the opaque
+    "(empty prompt — nothing to do)" string.
+
+    The fix passes the file manifest through to the plugin transport,
+    so we stub _execute_via_plugin and assert it received a prompt that
+    names the attached file (no event short-circuit).
+    """
+    import molecule_runtime.executor_helpers as _helpers
+    monkeypatch.setattr(_helpers, "WORKSPACE_MOUNT", str(tmp_path))
+
+    pdf = tmp_path / "chloe.pdf"
+    pdf.write_bytes(b"%PDF-1.4 stub\n")
+
+    ex = _make_executor(
+        monkeypatch, MOLECULE_A2A_CALLBACK_PORT=str(_free_port())
+    )
+    queue = _CapturingQueue()
+
+    captured: List[str] = []
+
+    async def fake_plugin(context, event_queue, prompt):  # type: ignore[no-untyped-def]
+        captured.append(prompt)
+
+    ex._execute_via_plugin = fake_plugin  # type: ignore[assignment,method-assign]
+
+    try:
+        await ex.start()
+        ctx = _build_context_with_file(
+            name="chloe.pdf",
+            mime_type="application/pdf",
+            path=str(pdf),
+        )
+        await ex.execute(ctx, queue)
+    finally:
+        await ex.stop()
+
+    blob = repr(queue.events) + repr(captured)
+    assert "empty prompt — nothing to do" not in blob
+    assert any("chloe.pdf" in p for p in captured), (
+        f"plugin transport never saw the file manifest; captured={captured!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_text_only_still_passes_prompt_unchanged(monkeypatch):
+    """Regression-pin: text-only messages keep working exactly as
+    before — the file-aware branch must not perturb the text path."""
+    ex = _make_executor(
+        monkeypatch, MOLECULE_A2A_CALLBACK_PORT=str(_free_port())
+    )
+    queue = _CapturingQueue()
+
+    captured: List[str] = []
+
+    async def fake_plugin(context, event_queue, prompt):  # type: ignore[no-untyped-def]
+        captured.append(prompt)
+
+    ex._execute_via_plugin = fake_plugin  # type: ignore[assignment,method-assign]
+
+    try:
+        await ex.start()
+        ctx = _build_context("write a haiku")
+        await ex.execute(ctx, queue)
+    finally:
+        await ex.stop()
+
+    assert captured == ["write a haiku"]
 
 
 # ---- error paths ----------------------------------------------------
