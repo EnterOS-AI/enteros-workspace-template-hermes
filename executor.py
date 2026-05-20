@@ -471,17 +471,24 @@ class HermesAgentProxyExecutor(AgentExecutor):
 
     @staticmethod
     def _derive_chat_id(context: RequestContext) -> str:
-        # Prefer task_id for stable per-conversation identity. Fall back
-        # to session/message attributes the a2a-sdk exposes; last resort
-        # is a synthetic ID so we always pass something hermes can use
-        # to key its session store.
-        for attr in ("task_id", "session_id", "context_id"):
+        # Prefer context_id for stable cross-turn identity. Per a2a-sdk
+        # semantics, task_id changes per turn (each inbound canvas
+        # message creates a fresh task), while context_id is the stable
+        # conversation key. Keying chat_id on task_id breaks hermes's
+        # SessionStore continuity — every turn becomes a new session,
+        # which is exactly the runtime failure RFC #600 set out to fix
+        # (sibling to workspace-template-openclaw PR #29, which made
+        # the same correction for openclaw's --session-id). Fall back
+        # to session_id, then task_id, then message-side attrs; last
+        # resort is a synthetic ID so we always pass something hermes
+        # can use to key its session store.
+        for attr in ("context_id", "session_id", "task_id"):
             value = getattr(context, attr, None)
             if value:
                 return str(value)
         message = getattr(context, "message", None)
         if message is not None:
-            for attr in ("task_id", "session_id", "context_id", "messageId"):
+            for attr in ("context_id", "session_id", "task_id", "messageId"):
                 value = getattr(message, attr, None)
                 if value:
                     return str(value)

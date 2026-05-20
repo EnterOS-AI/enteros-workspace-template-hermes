@@ -588,40 +588,67 @@ async def test_fallback_handles_unexpected_response_shape(monkeypatch):
 # ---- chat_id derivation ----------------------------------------------
 
 
-def test_derive_chat_id_prefers_task_id():
+def test_derive_chat_id_prefers_context_id_over_task_id():
+    """Load-bearing assertion: when both context_id and task_id are set,
+    chat_id must derive from context_id. Per a2a-sdk semantics, task_id
+    changes per turn (canvas creates a fresh task per inbound message)
+    while context_id is the stable conversation key. Keying SessionStore
+    on task_id was the RFC #600 runtime failure observed empirically in
+    chloe-dong on 2026-05-20 (sessions 20260520_080028 + 20260520_080035
+    7s apart in state.db — two different sessions for the same canvas
+    chat). Mirrors workspace-template-openclaw PR #29's
+    test_session_id_prefers_context_id_over_task_id."""
     ctx = MagicMock()
-    ctx.task_id = "task-A"
-    assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "task-A"
+    ctx.context_id = "chat-stable"
+    ctx.task_id = "task-changes-per-turn"
+    assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "chat-stable"
 
 
-def test_derive_chat_id_falls_back_to_session_id():
+def test_derive_chat_id_falls_back_to_session_id_when_context_id_unset():
+    """Backwards-compat: when context_id is absent but session_id is set,
+    chat_id derives from session_id. Mid-priority in the new
+    (context_id, session_id, task_id) loop."""
     ctx = MagicMock()
-    ctx.task_id = None
+    ctx.context_id = None
     ctx.session_id = "sess-B"
+    ctx.task_id = "task-C"
     assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "sess-B"
+
+
+def test_derive_chat_id_falls_back_to_task_id_when_context_and_session_unset():
+    """Backwards-compat for older a2a-sdk RequestContext shapes that
+    don't populate context_id or session_id. task_id is the last
+    context-level fallback before message-attr probing. Prevents an
+    adhoc-* session being silently created when task_id alone is set."""
+    ctx = MagicMock()
+    ctx.context_id = None
+    ctx.session_id = None
+    ctx.task_id = "task-only"
+    assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "task-only"
 
 
 def test_derive_chat_id_synthesizes_when_nothing_present():
     ctx = MagicMock()
-    ctx.task_id = None
-    ctx.session_id = None
     ctx.context_id = None
+    ctx.session_id = None
+    ctx.task_id = None
     ctx.message = None
     derived = HermesAgentProxyExecutor._derive_chat_id(ctx)
     assert derived.startswith("adhoc-")
 
 
-def test_derive_chat_id_falls_back_to_message_attrs():
-    """When ctx.task_id/session_id/context_id are all None but
-    ctx.message has one of them, derive_chat_id should use that."""
+def test_derive_chat_id_falls_back_to_message_context_id():
+    """When ctx.{context_id,session_id,task_id} are all None but
+    ctx.message has context_id, derive_chat_id should use that —
+    matching the context_id-first priority on the message-attr loop."""
     ctx = MagicMock()
-    ctx.task_id = None
-    ctx.session_id = None
     ctx.context_id = None
+    ctx.session_id = None
+    ctx.task_id = None
     msg = MagicMock()
-    msg.task_id = None
-    msg.session_id = None
     msg.context_id = "ctx-from-message"
+    msg.session_id = None
+    msg.task_id = "task-from-message"
     ctx.message = msg
     assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "ctx-from-message"
 
@@ -630,13 +657,13 @@ def test_derive_chat_id_uses_message_id_camelcase():
     """The a2a-sdk uses messageId on the Message object — ensure we
     pick it up as a last fallback before synthesizing an adhoc id."""
     ctx = MagicMock()
-    ctx.task_id = None
-    ctx.session_id = None
     ctx.context_id = None
+    ctx.session_id = None
+    ctx.task_id = None
     msg = MagicMock()
-    msg.task_id = None
-    msg.session_id = None
     msg.context_id = None
+    msg.session_id = None
+    msg.task_id = None
     msg.messageId = "msg-camelcase"
     ctx.message = msg
     assert HermesAgentProxyExecutor._derive_chat_id(ctx) == "msg-camelcase"
@@ -1029,3 +1056,93 @@ async def test_plugin_path_omits_history_from_daemon_payload(monkeypatch):
         "message_id", "callback_url",
     }
     assert "history" not in body
+
+
+@pytest.mark.asyncio
+async def test_plugin_path_payload_chat_id_uses_context_id_not_task_id(monkeypatch):
+    """Wire-level integration test: when the inbound RequestContext
+    carries both context_id and task_id, the daemon-side inbound POST
+    body's ``chat_id`` must be context_id, NOT task_id.
+
+    Background: hermes daemon's gateway/session.py SessionStore keys
+    sessions on session_key derived from SessionSource.chat_id. Per
+    a2a-sdk semantics, task_id changes per turn while context_id is the
+    stable cross-turn conversation key. If chat_id is keyed on task_id,
+    each turn arrives as a fresh session and the SessionStore-owns-state
+    contract from RFC #600 doesn't deliver continuity.
+
+    This was caught empirically on 2026-05-20 ~08:00Z in chloe-dong: a
+    2-turn name-test ("Hi I'm Hongming" / "what's my name?") produced
+    two distinct sqlite session rows (20260520_080028_18798d23 and
+    20260520_080035_9abd924a) 7s apart, with the second session's
+    assistant explicitly narrating no memory of the first.
+
+    Mirrors workspace-template-openclaw PR #29's
+    test_session_id_prefers_context_id_over_task_id, applied to hermes."""
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    inbound_received: List[Dict[str, Any]] = []
+
+    async def fake_inbound(request: web.Request) -> web.Response:
+        body = await request.json()
+        inbound_received.append(body)
+        async def _delayed_reply():
+            await asyncio.sleep(0.02)
+            async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                await s.post(
+                    body["callback_url"],
+                    json={
+                        "chat_id": body["chat_id"],
+                        "content": "ok",
+                        "reply_to": body["message_id"],
+                        "metadata": {},
+                    },
+                )
+        asyncio.create_task(_delayed_reply())
+        return web.json_response({"ok": True, "queued": True})
+
+    plugin_app = web.Application()
+    plugin_app.router.add_post("/a2a/inbound", fake_inbound)
+    plugin_runner = web.AppRunner(plugin_app)
+    await plugin_runner.setup()
+    plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
+    await plugin_site.start()
+
+    # Build a context where both context_id and task_id are populated;
+    # the captured payload must use context_id.
+    ctx = MagicMock()
+    ctx.context_id = "chat-stable-cross-turn"
+    ctx.task_id = "task-changes-per-turn"
+    ctx.session_id = None
+    msg = MagicMock()
+    msg.context_id = "chat-stable-cross-turn"
+    msg.task_id = "task-changes-per-turn"
+    text_part = MagicMock()
+    text_part.text = "hello"
+    text_part.kind = "text"
+    msg.parts = [text_part]
+    ctx.message = msg
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+    )
+    queue = _CapturingQueue()
+    try:
+        await ex.start()
+        await ex.execute(ctx, queue)
+    finally:
+        await ex.stop()
+        await plugin_site.stop()
+        await plugin_runner.cleanup()
+
+    assert len(inbound_received) == 1
+    body = inbound_received[0]
+    # Load-bearing assertion — pins the priority order at the wire layer.
+    assert body["chat_id"] == "chat-stable-cross-turn", (
+        f"chat_id must be context_id-derived (stable), got "
+        f"{body['chat_id']!r} (likely fell back to task_id-first ordering)"
+    )
+    # peer_id is currently aliased to chat_id, so it should match too.
+    assert body["peer_id"] == "chat-stable-cross-turn"
