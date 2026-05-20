@@ -783,3 +783,236 @@ def test_pytest_can_collect_module():
     and the test module imports cleanly without monkeypatch fixtures."""
     import executor  # noqa: F401
     assert hasattr(executor, "HermesAgentProxyExecutor")
+
+
+# ---- session continuity: canvas history prepend ----------------------
+
+
+def _build_context_with_history(text: str, history, *, task_id: str = "task-1"):
+    """Variant of _build_context that also attaches metadata.history,
+    the shape canvas/src/components/tabs/chat/hooks/useChatSend.ts:104-111
+    actually ships."""
+    ctx = MagicMock()
+    ctx.task_id = task_id
+    ctx.session_id = None
+    ctx.context_id = None
+    msg = MagicMock()
+    msg.task_id = task_id
+    text_part = MagicMock()
+    text_part.text = text
+    text_part.kind = "text"
+    msg.parts = [text_part]
+    msg.metadata = {"history": history}
+    ctx.message = msg
+    return ctx
+
+
+def test_build_initial_messages_with_history_prepends_prior_turns(monkeypatch):
+    """Forensic a819052e: hermes was building [system, user] every turn.
+    The fix prepends translated prior turns between them so the LLM sees
+    [system, ...history, user]."""
+    cfg = AdapterConfig(model="hermes-test", system_prompt="be helpful")
+    ex = HermesAgentProxyExecutor(cfg)
+
+    history = [
+        {"role": "user", "parts": [{"kind": "text", "text": "Hi, my name is Hongming."}]},
+        {"role": "agent", "parts": [{"kind": "text", "text": "Hello Hongming!"}]},
+    ]
+    messages = ex._build_initial_messages("What is my name?", history=history)
+
+    # Expect: [system, user(prior), assistant(prior), user(current)]
+    assert len(messages) == 4
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "user", "content": "Hi, my name is Hongming."}
+    assert messages[2] == {"role": "assistant", "content": "Hello Hongming!"}
+    assert messages[3] == {"role": "user", "content": "What is my name?"}
+
+
+def test_build_initial_messages_role_translation_agent_to_assistant(monkeypatch):
+    """Canvas uses role='agent' for assistant turns; chat-completions
+    requires role='assistant'. Unknown roles must be skipped (not
+    smuggled in as something the LLM will misinterpret)."""
+    cfg = AdapterConfig(model="hermes-test", system_prompt="")
+    ex = HermesAgentProxyExecutor(cfg)
+
+    history = [
+        {"role": "user", "parts": [{"kind": "text", "text": "u1"}]},
+        {"role": "agent", "parts": [{"kind": "text", "text": "a1"}]},
+        {"role": "system", "parts": [{"kind": "text", "text": "bogus"}]},
+        {"role": "tool", "parts": [{"kind": "text", "text": "alsobogus"}]},
+        {"role": "user", "parts": [{"kind": "text", "text": "u2"}]},
+    ]
+    messages = ex._build_initial_messages("current", history=history)
+
+    # No system prompt set → first message is the first history turn.
+    roles = [m["role"] for m in messages]
+    assert roles == ["user", "assistant", "user", "user"]
+    contents = [m["content"] for m in messages]
+    assert contents == ["u1", "a1", "u2", "current"]
+
+
+def test_build_initial_messages_no_history_matches_legacy_shape(monkeypatch):
+    """Regression guard: with history=None, behavior is identical to the
+    pre-fix [system, user] shape so callers that don't pass history (e.g.
+    peer-agent A2A turns with no metadata.history) aren't disturbed."""
+    cfg = AdapterConfig(model="hermes-test", system_prompt="be helpful")
+    ex = HermesAgentProxyExecutor(cfg)
+
+    messages = ex._build_initial_messages("hello", history=None)
+    assert messages == [
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "hello"},
+    ]
+
+
+def test_build_initial_messages_tolerates_string_content_in_history():
+    """If a peer pre-flattens parts into a content string, accept it
+    rather than dropping the turn on the floor."""
+    cfg = AdapterConfig(model="hermes-test", system_prompt="")
+    ex = HermesAgentProxyExecutor(cfg)
+
+    history = [
+        {"role": "user", "content": "string-form"},
+        {"role": "agent", "content": "also-string"},
+    ]
+    messages = ex._build_initial_messages("now", history=history)
+    assert messages == [
+        {"role": "user", "content": "string-form"},
+        {"role": "assistant", "content": "also-string"},
+        {"role": "user", "content": "now"},
+    ]
+
+
+def test_extract_history_from_context_reads_message_metadata():
+    """The history lives at context.message.metadata.history — confirm
+    the extractor finds it there and not elsewhere."""
+    history = [{"role": "user", "parts": [{"kind": "text", "text": "x"}]}]
+    ctx = _build_context_with_history("hi", history)
+    assert HermesAgentProxyExecutor._extract_history_from_context(ctx) == history
+
+
+def test_extract_history_from_context_handles_missing_metadata():
+    """Peer-agent A2A turns and old canvas builds may ship without
+    metadata.history — extractor returns [] not raises."""
+    ctx = MagicMock()
+    msg = MagicMock()
+    msg.metadata = None
+    ctx.message = msg
+    assert HermesAgentProxyExecutor._extract_history_from_context(ctx) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_via_chat_completions_extracts_history_from_metadata(
+    monkeypatch,
+):
+    """End-to-end of the fallback path: the executor must read
+    metadata.history off the incoming A2A request and emit
+    [system, ...history, user] in the chat-completions POST body."""
+    api_port = _free_port()
+    captured_bodies: List[Dict[str, Any]] = []
+
+    async def fake_chat_completions(request: web.Request) -> web.Response:
+        captured_bodies.append(await request.json())
+        return web.json_response({
+            "choices": [
+                {"message": {"role": "assistant", "content": "ack"}}
+            ]
+        })
+
+    api_app = web.Application()
+    api_app.router.add_post("/v1/chat/completions", fake_chat_completions)
+    api_runner = web.AppRunner(api_app)
+    await api_runner.setup()
+    api_site = web.TCPSite(api_runner, "127.0.0.1", api_port)
+    await api_site.start()
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_ENABLED="false",
+        HERMES_API_BASE=f"http://127.0.0.1:{api_port}/v1",
+    )
+    queue = _CapturingQueue()
+    history = [
+        {"role": "user", "parts": [{"kind": "text", "text": "turn1-u"}]},
+        {"role": "agent", "parts": [{"kind": "text", "text": "turn1-a"}]},
+    ]
+    try:
+        await ex.start()
+        await ex.execute(
+            _build_context_with_history("turn2-u", history), queue
+        )
+    finally:
+        await ex.stop()
+        await api_site.stop()
+        await api_runner.cleanup()
+
+    assert len(captured_bodies) == 1
+    sent = captured_bodies[0]["messages"]
+    # Expect [system, user(turn1), assistant(turn1), user(turn2)]
+    assert [m["role"] for m in sent] == [
+        "system", "user", "assistant", "user",
+    ]
+    assert sent[1]["content"] == "turn1-u"
+    assert sent[2]["content"] == "turn1-a"
+    assert sent[3]["content"] == "turn2-u"
+
+
+@pytest.mark.asyncio
+async def test_plugin_path_forwards_history_to_daemon(monkeypatch):
+    """When MOLECULE_A2A_PLATFORM_ENABLED=true, the executor must also
+    include messages_history in the POST to /a2a/inbound so the hermes
+    daemon can replay it on its side."""
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    inbound_received: List[Dict[str, Any]] = []
+
+    async def fake_inbound(request: web.Request) -> web.Response:
+        body = await request.json()
+        inbound_received.append(body)
+        # Synthesize a reply so execute() returns.
+        async def _delayed_reply():
+            await asyncio.sleep(0.02)
+            async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                await s.post(
+                    body["callback_url"],
+                    json={
+                        "chat_id": body["chat_id"],
+                        "content": "ok",
+                        "reply_to": body["message_id"],
+                        "metadata": {},
+                    },
+                )
+        asyncio.create_task(_delayed_reply())
+        return web.json_response({"ok": True, "queued": True})
+
+    plugin_app = web.Application()
+    plugin_app.router.add_post("/a2a/inbound", fake_inbound)
+    plugin_runner = web.AppRunner(plugin_app)
+    await plugin_runner.setup()
+    plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
+    await plugin_site.start()
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+    )
+    queue = _CapturingQueue()
+    history = [
+        {"role": "user", "parts": [{"kind": "text", "text": "old-u"}]},
+        {"role": "agent", "parts": [{"kind": "text", "text": "old-a"}]},
+    ]
+    try:
+        await ex.start()
+        await ex.execute(
+            _build_context_with_history("new-u", history), queue
+        )
+    finally:
+        await ex.stop()
+        await plugin_site.stop()
+        await plugin_runner.cleanup()
+
+    assert len(inbound_received) == 1
+    body = inbound_received[0]
+    assert body["content"] == "new-u"
+    assert body["messages_history"] == history
