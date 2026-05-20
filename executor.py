@@ -333,11 +333,21 @@ class HermesAgentProxyExecutor(AgentExecutor):
             )
             return
 
-        history = self._extract_history_from_context(context)
-
         if self._use_plugin:
-            await self._execute_via_plugin(context, event_queue, prompt, history)
+            # Plugin path → hermes daemon owns session state natively
+            # (gateway/session.py SessionStore: SQLite + JSONL, keyed by
+            # session_key derived from SessionSource.chat_id). The daemon
+            # replays its own transcript on each turn — shipping
+            # canvas-side history in the payload is double-bookkeeping
+            # and a source of the chloe-dong divergence (RFC #600,
+            # sibling to #497). Do NOT extract history here.
+            await self._execute_via_plugin(context, event_queue, prompt)
         else:
+            # Legacy chat_completions path: /v1/chat/completions is
+            # stateless by contract — it has no session store of its own,
+            # so the platform MUST thread context. Keep history extraction
+            # for this path until/unless this fallback is retired.
+            history = self._extract_history_from_context(context)
             await self._execute_via_chat_completions(
                 event_queue, prompt, history=history
             )
@@ -357,7 +367,6 @@ class HermesAgentProxyExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
         prompt: str,
-        history: list[dict[str, Any]] | None = None,
     ) -> None:
         message_id = uuid.uuid4().hex
         chat_id = self._derive_chat_id(context)
@@ -369,6 +378,12 @@ class HermesAgentProxyExecutor(AgentExecutor):
         future: asyncio.Future = loop.create_future()
         self._pending[message_id] = future
 
+        # Per RFC #600: the hermes daemon owns session state natively
+        # (gateway/session.py SessionStore, keyed by session_key derived
+        # from SessionSource.chat_id). The adapter hands chat_id through;
+        # the daemon replays its own transcript on the next turn. Do NOT
+        # ship messages_history in the payload — it's double-bookkeeping
+        # and a divergence source (sibling to RFC #497).
         payload = {
             "chat_id": chat_id,
             "peer_id": chat_id,
@@ -377,18 +392,6 @@ class HermesAgentProxyExecutor(AgentExecutor):
             "message_id": message_id,
             "callback_url": callback_url,
         }
-        # Forward canvas-shipped history so the hermes-daemon plugin can
-        # replay it on its side (the plugin owns its own session store but
-        # still benefits from being told the prior canvas turns when a
-        # fresh chat_id arrives). Plugin path is default-OFF today; this
-        # just stays correct when MOLECULE_A2A_PLATFORM_ENABLED=true.
-        if history:
-            payload["messages_history"] = history
-            logger.info(
-                "hermes_history_prepended turns=%d source=%s",
-                len(history),
-                "canvas_metadata_plugin",
-            )
         headers = {"Content-Type": "application/json"}
         if self._shared_secret:
             headers[SECRET_HEADER] = self._shared_secret

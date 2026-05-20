@@ -958,10 +958,13 @@ async def test_execute_via_chat_completions_extracts_history_from_metadata(
 
 
 @pytest.mark.asyncio
-async def test_plugin_path_forwards_history_to_daemon(monkeypatch):
-    """When MOLECULE_A2A_PLATFORM_ENABLED=true, the executor must also
-    include messages_history in the POST to /a2a/inbound so the hermes
-    daemon can replay it on its side."""
+async def test_plugin_path_omits_history_from_daemon_payload(monkeypatch):
+    """Per RFC #600: when MOLECULE_A2A_PLATFORM_ENABLED=true, the daemon
+    owns session state natively (gateway/session.py SessionStore keyed
+    by session_key). The inbound payload contract is
+    {chat_id, content, callback_url, peer_name, message_id} ONLY.
+    Shipping messages_history is the anti-pattern this RFC removes —
+    assert it is NOT present."""
     plugin_port = _free_port()
     cb_port = _free_port()
     inbound_received: List[Dict[str, Any]] = []
@@ -1015,4 +1018,14 @@ async def test_plugin_path_forwards_history_to_daemon(monkeypatch):
     assert len(inbound_received) == 1
     body = inbound_received[0]
     assert body["content"] == "new-u"
-    assert body["messages_history"] == history
+    # Per RFC #600: daemon owns session state; payload must NOT carry
+    # canvas-shipped history. The daemon replays its own transcript
+    # keyed by chat_id.
+    assert "messages_history" not in body
+    # Inbound contract is the minimal set — verify nothing surprising
+    # snuck back in.
+    assert set(body.keys()) >= {
+        "chat_id", "peer_id", "peer_name", "content",
+        "message_id", "callback_url",
+    }
+    assert "history" not in body
