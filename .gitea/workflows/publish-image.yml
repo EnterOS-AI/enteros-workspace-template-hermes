@@ -39,8 +39,14 @@ env:
   # Belt-and-suspenders for act_runner runners regenerated without the
   # config.yaml envs block. (feedback_act_runner_github_server_url)
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  ECR_REGISTRY: 153263036946.dkr.ecr.us-east-2.amazonaws.com
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspace-template-hermes
+  # SSOT-Instance-10 (#333): ECR registry triplet (account.dkr.ecr.region.amazonaws.com)
+  # sourced from org/repo var `ECR_REGISTRY` with the current prod-account literal as
+  # bootstrap fallback. When the org var is set, the fallback becomes dead code and
+  # switching accounts/regions is a one-line change at the org level (instead of
+  # touching every workflow). Pattern mirrors `vars.CP_URL || 'literal'` in
+  # molecule-core/staging-verify.yml.
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}
+  IMAGE_NAME: ${{ vars.ECR_REGISTRY || '153263036946.dkr.ecr.us-east-2.amazonaws.com' }}/molecule-ai/workspace-template-hermes
   AWS_DEFAULT_REGION: us-east-2
 
 permissions:
