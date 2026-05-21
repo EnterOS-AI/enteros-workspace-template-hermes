@@ -88,7 +88,17 @@ jobs:
     # molecule-core convention (publish-workspace-server-image.yml /
     # publish-runtime.yml / publish-canvas-image.yml: `runs-on: publish`)
     # and the codex sibling fix (PR#9).
-    runs-on: publish
+    #
+    # internal#597: tighten from `publish` (singular) to `[publish, release]`
+    # because the singular label is ALSO advertised by hongming-pc-runner-
+    # publish-{1,2} (WSL — agent_labels=["publish"]) where $HOME=/home/hongming
+    # does not exist on the runner uid, causing `docker login` to fail with
+    # `Error saving credentials: mkdir /home/hongming: permission denied`
+    # (task 140262). Only molecule-runner-publish-{1,2} advertise BOTH
+    # `publish` and `release`, so the array form excludes the WSL pair while
+    # keeping the dedicated Linux publish runners. Matches the sibling
+    # claude-code / codex templates which already use [publish, release].
+    runs-on: [publish, release]
     timeout-minutes: 30
     needs: resolve-version
     steps:
