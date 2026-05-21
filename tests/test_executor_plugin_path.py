@@ -350,7 +350,7 @@ async def test_execute_file_only_no_longer_returns_opaque_empty(
 
     captured: List[str] = []
 
-    async def fake_plugin(context, event_queue, prompt):  # type: ignore[no-untyped-def]
+    async def fake_plugin(context, event_queue, prompt, history=None):  # type: ignore[no-untyped-def]
         captured.append(prompt)
 
     ex._execute_via_plugin = fake_plugin  # type: ignore[assignment,method-assign]
@@ -384,7 +384,7 @@ async def test_execute_text_only_still_passes_prompt_unchanged(monkeypatch):
 
     captured: List[str] = []
 
-    async def fake_plugin(context, event_queue, prompt):  # type: ignore[no-untyped-def]
+    async def fake_plugin(context, event_queue, prompt, history=None):  # type: ignore[no-untyped-def]
         captured.append(prompt)
 
     ex._execute_via_plugin = fake_plugin  # type: ignore[assignment,method-assign]
@@ -1115,13 +1115,18 @@ async def test_execute_via_chat_completions_extracts_history_from_metadata(
 
 
 @pytest.mark.asyncio
-async def test_plugin_path_omits_history_from_daemon_payload(monkeypatch):
-    """Per RFC #600: when MOLECULE_A2A_PLATFORM_ENABLED=true, the daemon
-    owns session state natively (gateway/session.py SessionStore keyed
-    by session_key). The inbound payload contract is
-    {chat_id, content, callback_url, peer_name, message_id} ONLY.
-    Shipping messages_history is the anti-pattern this RFC removes —
-    assert it is NOT present."""
+async def test_executor_plugin_payload_includes_messages_history(monkeypatch):
+    """Belt-and-suspenders (task #385): the executor MUST forward
+    canvas-shipped metadata.history as ``messages_history`` on the
+    plugin path so the in-container plugin adapter can seed the daemon
+    transcript on a fresh session.
+
+    Reverses the prior PR #34 contract — that change trusted daemon
+    persistence, but HERMES_HOME defaults to container-/tmp which is
+    volatile across workspace restarts, so a fresh daemon has no
+    transcript to replay. Re-attaching client-side history is the
+    cheap, surgical fix; daemon-side HERMES_HOME persistence is a
+    separate follow-up."""
     plugin_port = _free_port()
     cb_port = _free_port()
     inbound_received: List[Dict[str, Any]] = []
@@ -1175,17 +1180,137 @@ async def test_plugin_path_omits_history_from_daemon_payload(monkeypatch):
     assert len(inbound_received) == 1
     body = inbound_received[0]
     assert body["content"] == "new-u"
-    # Per RFC #600: daemon owns session state; payload must NOT carry
-    # canvas-shipped history. The daemon replays its own transcript
-    # keyed by chat_id.
-    assert "messages_history" not in body
-    # Inbound contract is the minimal set — verify nothing surprising
-    # snuck back in.
+    # Load-bearing: messages_history must round-trip the canvas history
+    # so the plugin-side adapter can seed the daemon transcript.
+    assert body.get("messages_history") == history
+    # Other payload fields preserved.
     assert set(body.keys()) >= {
         "chat_id", "peer_id", "peer_name", "content",
-        "message_id", "callback_url",
+        "message_id", "callback_url", "messages_history",
     }
-    assert "history" not in body
+
+
+@pytest.mark.asyncio
+async def test_plugin_path_omits_messages_history_when_no_canvas_history(
+    monkeypatch,
+):
+    """Peer-agent A2A turns (no canvas) ship without metadata.history.
+    In that case the executor must omit ``messages_history`` from the
+    payload entirely — not send an empty list, which would look like
+    "explicitly clear my transcript" to a future plugin contract."""
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    inbound_received: List[Dict[str, Any]] = []
+
+    async def fake_inbound(request: web.Request) -> web.Response:
+        body = await request.json()
+        inbound_received.append(body)
+        async def _delayed_reply():
+            await asyncio.sleep(0.02)
+            async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                await s.post(
+                    body["callback_url"],
+                    json={
+                        "chat_id": body["chat_id"],
+                        "content": "ok",
+                        "reply_to": body["message_id"],
+                        "metadata": {},
+                    },
+                )
+        asyncio.create_task(_delayed_reply())
+        return web.json_response({"ok": True, "queued": True})
+
+    plugin_app = web.Application()
+    plugin_app.router.add_post("/a2a/inbound", fake_inbound)
+    plugin_runner = web.AppRunner(plugin_app)
+    await plugin_runner.setup()
+    plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
+    await plugin_site.start()
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+    )
+    queue = _CapturingQueue()
+    try:
+        await ex.start()
+        # _build_context sets msg as MagicMock so .metadata is a child
+        # mock (truthy non-dict) — _extract_history_from_context's
+        # isinstance guard yields [] → omitted.
+        await ex.execute(_build_context("hi"), queue)
+    finally:
+        await ex.stop()
+        await plugin_site.stop()
+        await plugin_runner.cleanup()
+
+    assert len(inbound_received) == 1
+    assert "messages_history" not in inbound_received[0]
+
+
+@pytest.mark.asyncio
+async def test_plugin_path_skips_messages_history_when_malformed(monkeypatch):
+    """Per feedback_surface_actionable_failure_reason_to_user — if
+    metadata.history is malformed (not a list), the executor must NOT
+    crash the turn. It logs + skips, dispatching the user's message
+    stateless. Belt-and-suspenders is best-effort; the user message
+    must always reach the daemon."""
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    inbound_received: List[Dict[str, Any]] = []
+
+    async def fake_inbound(request: web.Request) -> web.Response:
+        body = await request.json()
+        inbound_received.append(body)
+        async def _delayed_reply():
+            await asyncio.sleep(0.02)
+            async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                await s.post(
+                    body["callback_url"],
+                    json={
+                        "chat_id": body["chat_id"],
+                        "content": "ok",
+                        "reply_to": body["message_id"],
+                        "metadata": {},
+                    },
+                )
+        asyncio.create_task(_delayed_reply())
+        return web.json_response({"ok": True, "queued": True})
+
+    plugin_app = web.Application()
+    plugin_app.router.add_post("/a2a/inbound", fake_inbound)
+    plugin_runner = web.AppRunner(plugin_app)
+    await plugin_runner.setup()
+    plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
+    await plugin_site.start()
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+    )
+    queue = _CapturingQueue()
+    # Force a malformed history value through the plugin path by
+    # monkey-patching the extractor — _extract_history_from_context
+    # itself guards against non-list shapes, so we exercise the
+    # downstream defense in _execute_via_plugin.
+    monkeypatch.setattr(
+        HermesAgentProxyExecutor,
+        "_extract_history_from_context",
+        staticmethod(lambda _ctx: "not-a-list"),
+    )
+    try:
+        await ex.start()
+        await ex.execute(_build_context("hi"), queue)
+    finally:
+        await ex.stop()
+        await plugin_site.stop()
+        await plugin_runner.cleanup()
+
+    assert len(inbound_received) == 1
+    # Malformed → omitted, turn still dispatched.
+    assert "messages_history" not in inbound_received[0]
+    assert inbound_received[0]["content"] == "hi"
 
 
 @pytest.mark.asyncio

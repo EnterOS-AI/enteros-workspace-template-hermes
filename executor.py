@@ -359,12 +359,23 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if self._use_plugin:
             # Plugin path → hermes daemon owns session state natively
             # (gateway/session.py SessionStore: SQLite + JSONL, keyed by
-            # session_key derived from SessionSource.chat_id). The daemon
-            # replays its own transcript on each turn — shipping
-            # canvas-side history in the payload is double-bookkeeping
-            # and a source of the chloe-dong divergence (RFC #600,
-            # sibling to #497). Do NOT extract history here.
-            await self._execute_via_plugin(context, event_queue, prompt)
+            # session_key derived from SessionSource.chat_id).
+            #
+            # PR #34 dropped messages_history from the payload trusting
+            # daemon persistence. Empirically (chloe-dong workspace
+            # 5192737f, 2026-05-20) that's insufficient: HERMES_HOME
+            # defaults to container-/tmp which is volatile across
+            # workspace restarts, and a fresh daemon has no transcript
+            # to replay. Belt-and-suspenders: re-attach canvas-side
+            # history so the plugin adapter can seed the daemon's
+            # transcript on a fresh session. Once daemon persistence is
+            # durable (separate task: move HERMES_HOME to a workspace
+            # volume) this can be revisited. See RFC #600 sibling
+            # discussion in #497.
+            history = self._extract_history_from_context(context)
+            await self._execute_via_plugin(
+                context, event_queue, prompt, history=history
+            )
         else:
             # Legacy chat_completions path: /v1/chat/completions is
             # stateless by contract — it has no session store of its own,
@@ -390,6 +401,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
         prompt: str,
+        history: list[dict[str, Any]] | None = None,
     ) -> None:
         message_id = uuid.uuid4().hex
         chat_id = self._derive_chat_id(context)
@@ -402,19 +414,21 @@ class HermesAgentProxyExecutor(AgentExecutor):
         future: asyncio.Future = loop.create_future()
         self._pending[message_id] = future
 
-        # Per RFC #600: the hermes daemon owns session state natively
-        # (gateway/session.py SessionStore, keyed by session_key derived
-        # from SessionSource.chat_id). The adapter hands chat_id through;
-        # the daemon replays its own transcript on the next turn. Do NOT
-        # ship messages_history in the payload — it's double-bookkeeping
-        # and a divergence source (sibling to RFC #497).
+        # Belt-and-suspenders session continuity (task #385): the hermes
+        # daemon owns session state natively, but its store at
+        # HERMES_HOME=/tmp/.hermes is container-volatile, so a fresh
+        # daemon comes up with no transcript to replay. Canvas already
+        # ships the last 20 turns via metadata.history (see
+        # canvas/src/components/tabs/chat/hooks/useChatSend.ts) — we
+        # forward those as messages_history so the plugin adapter can
+        # seed the daemon's transcript on a fresh session (no-op when
+        # the daemon already has the turns). Once daemon persistence is
+        # durable this layer becomes a tautology and can be removed.
         #
         # peer_id/peer_name are the SENDER's identity, NOT a copy of
         # chat_id. Per molecule MCP protocol semantics: peer_id="" for
-        # canvas_user, set to peer workspace UUID for peer_agent. Aliasing
-        # them to chat_id surfaced as a UX leak — hermes would greet the
-        # user with "your peer ID is <uuid>" because the system context
-        # carried chat_id-as-peer-name. See task #262.
+        # canvas_user, set to peer workspace UUID for peer_agent. PR #34
+        # (task #262) decoupled them — keep that fix intact.
         payload = {
             "chat_id": chat_id,
             "peer_id": peer_id,
@@ -423,6 +437,20 @@ class HermesAgentProxyExecutor(AgentExecutor):
             "message_id": message_id,
             "callback_url": callback_url,
         }
+        # Defensive: if history is malformed (not a list), log + skip
+        # rather than crash the turn. Per
+        # feedback_surface_actionable_failure_reason_to_user, we still
+        # deliver the user's message — they get a stateless reply
+        # instead of an opaque error.
+        if history is not None:
+            if isinstance(history, list) and history:
+                payload["messages_history"] = history
+            elif not isinstance(history, list):
+                logger.warning(
+                    "hermes plugin: messages_history is not a list "
+                    "(type=%s); skipping seed",
+                    type(history).__name__,
+                )
         headers = {"Content-Type": "application/json"}
         if self._shared_secret:
             headers[SECRET_HEADER] = self._shared_secret
