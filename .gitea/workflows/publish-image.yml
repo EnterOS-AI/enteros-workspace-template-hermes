@@ -101,6 +101,18 @@ jobs:
     runs-on: [publish, release]
     timeout-minutes: 30
     needs: resolve-version
+    # task #393: bubble the Push step's digest to the job level so the
+    # downstream `promote-pin` job can consume `needs.publish.outputs.digest`.
+    # Without this block the expression resolved to "" at runtime and the
+    # promote job failed with "needs.publish.outputs.digest is empty — Push
+    # step did not expose digest" even though docker/build-push-action@v7
+    # internally captured the digest on the `push` step (run #89759 after
+    # PR#43 merged at 6fdae22; image published to ECR but pin never bumped).
+    # Job-level outputs are the canonical Gitea/GHA mechanism for surfacing
+    # step outputs across `needs:` edges — `steps.push.outputs.digest` is
+    # only visible WITHIN this job's expression context.
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
