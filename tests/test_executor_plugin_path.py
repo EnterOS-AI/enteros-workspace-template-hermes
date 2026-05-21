@@ -30,6 +30,7 @@ import pytest
 from aiohttp import ClientSession, ClientTimeout, web
 
 from executor import HermesAgentProxyExecutor, SECRET_HEADER
+import executor as executor_mod
 from molecule_runtime.adapters.base import AdapterConfig
 
 
@@ -130,6 +131,35 @@ def test_executor_respects_port_overrides(monkeypatch):
     )
     assert ex._plugin_port == 9999
     assert ex._callback_port == 9000
+
+
+def test_molecule_tools_come_from_runtime_contract():
+    from molecule_runtime.mcp_tools import openai_function_tools
+
+    assert executor_mod._ACTIVE_TOOLS == openai_function_tools()
+    assert not hasattr(executor_mod, "_MOLECULE_TOOLS")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_uses_runtime_dispatcher(monkeypatch):
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_dispatch(name: str, arguments: dict[str, Any]) -> str:
+        calls.append((name, arguments))
+        return "shared result"
+
+    monkeypatch.setattr(executor_mod, "handle_molecule_tool_call", fake_dispatch)
+    ex = _make_executor(monkeypatch)
+
+    result = await ex._dispatch_tool({
+        "function": {
+            "name": "delegate_task",
+            "arguments": '{"workspace_id":"ws-1","task":"hello"}',
+        }
+    })
+
+    assert result == "shared result"
+    assert calls == [("delegate_task", {"workspace_id": "ws-1", "task": "hello"})]
 
 
 # ---- lifecycle ------------------------------------------------------
