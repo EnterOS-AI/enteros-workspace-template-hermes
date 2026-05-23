@@ -10,6 +10,13 @@
 
 set -euo pipefail
 
+# Source persistent workspace secrets BEFORE anything else that might need them.
+# /configs is volume-mounted from the host so this survives container restart.
+if [ -f /configs/secrets.d/load.sh ]; then
+  # shellcheck disable=SC1091
+  . /configs/secrets.d/load.sh
+fi
+
 # Boot-smoke contract (molecule-core#2275): the publish-image gate
 # invokes the runtime with stub creds and no network so it can
 # exercise lazy imports inside executor.execute(). The hermes
