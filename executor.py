@@ -72,6 +72,11 @@ from molecule_runtime.executor_helpers import (
     extract_message_text,
 )
 try:
+    from molecule_runtime.attachment_vision import append_image_descriptions
+except ModuleNotFoundError:  # pragma: no cover - older local runtime
+    async def append_image_descriptions(text, files):
+        return text
+try:
     from molecule_runtime.mcp_tools import (
         handle_molecule_tool_call,
         openai_function_tools,
@@ -220,6 +225,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # file-content forwarding to the hermes daemon.
         attached = extract_attached_files(context.message)
         if attached:
+            text = await append_image_descriptions(text, attached)
             manifest = "\n\nAttached files:\n" + "\n".join(
                 f"- {f['name']} ({f['mime_type'] or 'unknown type'}) at {f['path']}"
                 for f in attached
