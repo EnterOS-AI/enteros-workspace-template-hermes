@@ -27,13 +27,20 @@ FAIL=0
 # either keep this in sync or make the test fail the parity check below.
 apply_install_logic() {
   # (A) auto-fill defaults when operator hasn't configured custom
-  if [ "${PROVIDER:-}" = "custom" ] \
-      && [ -n "${OPENAI_API_KEY:-}" ] \
-      && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] \
-      && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
-    export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
+    if [ "${PROVIDER:-}" = "custom" ] \
+        && [ -n "${OPENAI_API_KEY:-}" ] \
+        && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] \
+        && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
+    export HERMES_CUSTOM_BASE_URL="${OPENAI_BASE_URL:-${MOLECULE_LLM_BASE_URL:-https://api.openai.com/v1}}"
     export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
     export HERMES_CUSTOM_API_MODE="chat_completions"
+  fi
+
+  if [ "${MOLECULE_LLM_BILLING_MODE:-}" = "platform_managed" ] && [ -n "${HERMES_CUSTOM_BASE_URL:-}" ]; then
+    PLATFORM_OPENAI_BASE="${MOLECULE_LLM_BASE_URL:-${OPENAI_BASE_URL:-}}"
+    if [ -z "${PLATFORM_OPENAI_BASE}" ] || [ "${HERMES_CUSTOM_BASE_URL}" != "${PLATFORM_OPENAI_BASE}" ]; then
+      return 42
+    fi
   fi
 
   # (B) strip openai/ prefix iff final URL is api.openai.com (decoupled from A)
@@ -53,6 +60,9 @@ assert_model() {
     OPENAI_API_KEY=''
     OPENROUTER_API_KEY=''
     MINIMAX_API_KEY=''
+    MOLECULE_LLM_BILLING_MODE=''
+    MOLECULE_LLM_BASE_URL=''
+    OPENAI_BASE_URL=''
     HERMES_CUSTOM_BASE_URL=''
     HERMES_CUSTOM_API_KEY=''
     HERMES_CUSTOM_API_MODE=''
@@ -70,12 +80,79 @@ assert_model() {
   fi
 }
 
+assert_value() {
+  local label="$1" expected="$2"
+  shift 2
+  local actual
+  actual=$(bash -c "
+    set -u
+    $(declare -f apply_install_logic)
+    PROVIDER=''
+    OPENAI_API_KEY=''
+    OPENROUTER_API_KEY=''
+    MINIMAX_API_KEY=''
+    MOLECULE_LLM_BILLING_MODE=''
+    MOLECULE_LLM_BASE_URL=''
+    OPENAI_BASE_URL=''
+    HERMES_CUSTOM_BASE_URL=''
+    HERMES_CUSTOM_API_KEY=''
+    HERMES_CUSTOM_API_MODE=''
+    DEFAULT_MODEL=''
+    $*
+    apply_install_logic
+    printf '%s|%s' \"\$DEFAULT_MODEL\" \"\$HERMES_CUSTOM_BASE_URL\"
+  " 2>/dev/null)
+  if [ "$actual" = "$expected" ]; then
+    echo "  PASS  $label  ->  $actual"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL  $label  ->  got '$actual', expected '$expected'"
+    FAIL=$((FAIL+1))
+  fi
+}
+
+assert_reject() {
+  local label="$1"
+  shift
+  if bash -c "
+    set -u
+    $(declare -f apply_install_logic)
+    PROVIDER=''
+    OPENAI_API_KEY=''
+    OPENROUTER_API_KEY=''
+    MINIMAX_API_KEY=''
+    MOLECULE_LLM_BILLING_MODE=''
+    MOLECULE_LLM_BASE_URL=''
+    OPENAI_BASE_URL=''
+    HERMES_CUSTOM_BASE_URL=''
+    HERMES_CUSTOM_API_KEY=''
+    HERMES_CUSTOM_API_MODE=''
+    DEFAULT_MODEL=''
+    $*
+    apply_install_logic
+  " 2>/dev/null; then
+    echo "  FAIL  $label  ->  accepted"
+    FAIL=$((FAIL+1))
+  else
+    echo "  PASS  $label  ->  rejected"
+    PASS=$((PASS+1))
+  fi
+}
+
 echo "== install.sh prefix-strip =="
 
 # --- Case A: default bridge path (no operator HERMES_CUSTOM_*) ---
 assert_model "A: default bridge strips openai/" "gpt-4o" '
   PROVIDER=custom
   OPENAI_API_KEY=sk-test
+  DEFAULT_MODEL=openai/gpt-4o
+'
+
+assert_value "A2: platform bridge uses Molecule proxy URL" "openai/gpt-4o|https://cp.example.test/api/v1/internal/llm/openai/v1" '
+  PROVIDER=custom
+  OPENAI_API_KEY=tenant-proxy-token
+  MOLECULE_LLM_BILLING_MODE=platform_managed
+  MOLECULE_LLM_BASE_URL=https://cp.example.test/api/v1/internal/llm/openai/v1
   DEFAULT_MODEL=openai/gpt-4o
 '
 
@@ -145,6 +222,15 @@ assert_model "I: beta.api.openai.com NOT stripped" "openai/gpt-4o" '
   DEFAULT_MODEL=openai/gpt-4o
 '
 
+assert_reject "J: platform-managed rejects direct custom provider" '
+  PROVIDER=custom
+  MOLECULE_LLM_BILLING_MODE=platform_managed
+  MOLECULE_LLM_BASE_URL=https://cp.example.test/api/v1/internal/llm/openai/v1
+  HERMES_CUSTOM_BASE_URL=https://api.moonshot.ai/v1
+  HERMES_CUSTOM_API_KEY=sk-test
+  DEFAULT_MODEL=kimi/k2
+'
+
 # --- Parity check: install.sh must contain the exact logic we inlined here ---
 # Uses grep -F (fixed string) to avoid regex escaping hell. Each pattern is
 # a short unique substring from the real install.sh block.
@@ -153,6 +239,8 @@ echo "== parity with install.sh =="
 PARITY_FAIL=0
 for pattern in \
   '[ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]' \
+  'HERMES_CUSTOM_BASE_URL="${OPENAI_BASE_URL:-${MOLECULE_LLM_BASE_URL:-https://api.openai.com/v1}}"' \
+  'refusing direct HERMES_CUSTOM_BASE_URL in platform-managed LLM mode' \
   '=~ ^https?://api\.openai\.com(/|$)' \
   'DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"'; do
   if ! grep -F -q -- "$pattern" "$INSTALL"; then

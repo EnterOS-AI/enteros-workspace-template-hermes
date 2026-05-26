@@ -190,10 +190,19 @@ HERMES_INFERENCE_MODEL="${DEFAULT_MODEL}" \
 
 # (A) auto-fill defaults when operator hasn't configured custom
 if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
-  export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
+  export HERMES_CUSTOM_BASE_URL="${OPENAI_BASE_URL:-${MOLECULE_LLM_BASE_URL:-https://api.openai.com/v1}}"
   export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
   export HERMES_CUSTOM_API_MODE="chat_completions"
-  echo "[install.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com (api_mode=chat_completions)"
+  echo "[install.sh] bridged OPENAI_API_KEY -> custom provider @ ${HERMES_CUSTOM_BASE_URL} (api_mode=chat_completions)"
+fi
+
+if [ "${MOLECULE_LLM_BILLING_MODE:-}" = "platform_managed" ] && [ -n "${HERMES_CUSTOM_BASE_URL:-}" ]; then
+  PLATFORM_OPENAI_BASE="${MOLECULE_LLM_BASE_URL:-${OPENAI_BASE_URL:-}}"
+  if [ -z "${PLATFORM_OPENAI_BASE}" ] || [ "${HERMES_CUSTOM_BASE_URL}" != "${PLATFORM_OPENAI_BASE}" ]; then
+    echo "[install.sh] refusing direct HERMES_CUSTOM_BASE_URL in platform-managed LLM mode: ${HERMES_CUSTOM_BASE_URL}" >&2
+    echo "[install.sh] use the Molecule platform proxy env (MOLECULE_LLM_BASE_URL/OPENAI_BASE_URL) instead." >&2
+    exit 1
+  fi
 fi
 
 # (B) strip the openai/ prefix ONLY when the final URL is api.openai.com.

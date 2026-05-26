@@ -267,11 +267,20 @@ HERMES_INFERENCE_MODEL="${DEFAULT_MODEL}" . "$DERIVE_SCRIPT"
 # api_mode=chat_completions to get the OpenAI-compat /v1/chat/completions
 # path (not /v1/responses with encrypted_content, which 400s on gpt-4o).
 if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]; then
-  export HERMES_CUSTOM_BASE_URL="https://api.openai.com/v1"
+  export HERMES_CUSTOM_BASE_URL="${OPENAI_BASE_URL:-${MOLECULE_LLM_BASE_URL:-https://api.openai.com/v1}}"
   export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
   export HERMES_CUSTOM_API_MODE="chat_completions"
   DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"
-  echo "[start.sh] bridged OPENAI_API_KEY → custom provider @ api.openai.com (api_mode=chat_completions, model=${DEFAULT_MODEL})"
+  echo "[start.sh] bridged OPENAI_API_KEY -> custom provider @ ${HERMES_CUSTOM_BASE_URL} (api_mode=chat_completions, model=${DEFAULT_MODEL})"
+fi
+
+if [ "${MOLECULE_LLM_BILLING_MODE:-}" = "platform_managed" ] && [ -n "${HERMES_CUSTOM_BASE_URL:-}" ]; then
+  PLATFORM_OPENAI_BASE="${MOLECULE_LLM_BASE_URL:-${OPENAI_BASE_URL:-}}"
+  if [ -z "${PLATFORM_OPENAI_BASE}" ] || [ "${HERMES_CUSTOM_BASE_URL}" != "${PLATFORM_OPENAI_BASE}" ]; then
+    echo "[start.sh] refusing direct HERMES_CUSTOM_BASE_URL in platform-managed LLM mode: ${HERMES_CUSTOM_BASE_URL}" >&2
+    echo "[start.sh] use the Molecule platform proxy env (MOLECULE_LLM_BASE_URL/OPENAI_BASE_URL) instead." >&2
+    exit 1
+  fi
 fi
 
 {
