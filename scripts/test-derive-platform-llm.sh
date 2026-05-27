@@ -77,6 +77,13 @@ run_case "platform_managed without base url fails closed" \
   "1|kimi-coding||||moonshot/kimi-k2.6" \
   "MOLECULE_LLM_BILLING_MODE=platform_managed" "DEFAULT_MODEL=moonshot/kimi-k2.6"
 
+# (4b) platform_managed with a base URL but NO bearer token also fails closed
+# (symmetric) — booting with an empty key would defer to a runtime 401.
+run_case "platform_managed without bearer fails closed" \
+  "1|kimi-coding||||moonshot/kimi-k2.6" \
+  "MOLECULE_LLM_BILLING_MODE=platform_managed" "MOLECULE_LLM_BASE_URL=${PROXY}" \
+  "DEFAULT_MODEL=moonshot/kimi-k2.6"
+
 # (5) falls back to OPENAI_BASE_URL when MOLECULE_LLM_BASE_URL is absent.
 run_case "OPENAI_BASE_URL fallback" \
   "0|custom|${PROXY}|tok-123|chat_completions|moonshot/kimi-k2.6" \

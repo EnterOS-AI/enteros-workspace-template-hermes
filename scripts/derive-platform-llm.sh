@@ -43,9 +43,19 @@ if [ -z "${_PLATFORM_BASE}" ]; then
   return 1 2>/dev/null || exit 1
 fi
 
+# Fail closed on a missing bearer too (symmetric with the base-URL check) —
+# booting with an empty key would defer the failure to a runtime 401 at the
+# proxy (offered-but-unservable) instead of a clear boot-time error.
+_PLATFORM_TOKEN="${MOLECULE_LLM_USAGE_TOKEN:-${ANTHROPIC_API_KEY:-}}"
+if [ -z "${_PLATFORM_TOKEN}" ]; then
+  echo "[derive-platform-llm] platform_managed mode but neither MOLECULE_LLM_USAGE_TOKEN nor ANTHROPIC_API_KEY is set — no platform bearer" >&2
+  PLATFORM_LLM_ERROR=1
+  return 1 2>/dev/null || exit 1
+fi
+
 PROVIDER="custom"
 export HERMES_CUSTOM_BASE_URL="${_PLATFORM_BASE}"
-export HERMES_CUSTOM_API_KEY="${MOLECULE_LLM_USAGE_TOKEN:-${ANTHROPIC_API_KEY:-}}"
+export HERMES_CUSTOM_API_KEY="${_PLATFORM_TOKEN}"
 # chat_completions (NOT codex_responses) — the platform proxy exposes
 # /openai/v1/chat/completions, not /v1/responses.
 export HERMES_CUSTOM_API_MODE="chat_completions"
