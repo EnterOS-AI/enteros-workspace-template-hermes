@@ -261,6 +261,23 @@ DERIVE_SCRIPT="/app/scripts/derive-provider.sh"
 [ -f "$DERIVE_SCRIPT" ] || DERIVE_SCRIPT="/scripts/derive-provider.sh"
 HERMES_INFERENCE_MODEL="${DEFAULT_MODEL}" . "$DERIVE_SCRIPT"
 
+# --- Platform-managed LLM override ---
+# When the workspace's LLM billing mode is platform_managed, route ALL
+# inference through the Molecule platform proxy (OpenAI-compat surface)
+# regardless of the model's natural vendor prefix — the tenant has no BYOK
+# key in this mode (workspace-server strips them) and the proxy owns the
+# keys + billing. Sourced AFTER derive-provider.sh so it wins. Fails closed
+# (exit 1) if platform_managed is set but no platform base URL is present.
+PLATFORM_LLM_SCRIPT="/app/scripts/derive-platform-llm.sh"
+[ -f "$PLATFORM_LLM_SCRIPT" ] || PLATFORM_LLM_SCRIPT="/scripts/derive-platform-llm.sh"
+if [ -f "$PLATFORM_LLM_SCRIPT" ]; then
+  # shellcheck source=scripts/derive-platform-llm.sh
+  . "$PLATFORM_LLM_SCRIPT" || {
+    echo "[start.sh] platform-managed LLM routing failed — refusing to boot with an unroutable LLM config" >&2
+    exit 1
+  }
+fi
+
 # --- OpenAI bridge: custom provider + chat_completions api_mode ---
 # Symmetric with install.sh. See install.sh for the full explanation.
 # hermes has NO native "openai" provider — bridge must use custom+

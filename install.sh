@@ -159,6 +159,20 @@ DEFAULT_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL:-nousresearch/he
 HERMES_INFERENCE_MODEL="${DEFAULT_MODEL}" \
   . "$(dirname "$0")/scripts/derive-provider.sh"
 
+# --- Platform-managed LLM override (symmetric with start.sh) ---
+# In platform_managed billing mode, route ALL inference through the Molecule
+# platform proxy (OpenAI-compat surface) regardless of the model's vendor
+# prefix — the tenant has no BYOK key (stripped upstream) and the proxy owns
+# the keys + billing. Sourced AFTER derive-provider.sh so it wins; fails
+# closed if platform_managed is set with no platform base URL.
+if [ -f "$(dirname "$0")/scripts/derive-platform-llm.sh" ]; then
+  # shellcheck source=scripts/derive-platform-llm.sh
+  . "$(dirname "$0")/scripts/derive-platform-llm.sh" || {
+    echo "[install.sh] platform-managed LLM routing failed — unroutable LLM config" >&2
+    exit 1
+  }
+fi
+
 # --- OpenAI bridge: PROVIDER=custom + chat_completions api_mode ---
 #
 # hermes-agent does NOT have a native "openai" provider in its registry
