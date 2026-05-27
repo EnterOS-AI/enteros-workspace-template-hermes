@@ -441,6 +441,7 @@ jobs:
       # is exercised instead of the script's silent ImportError fallback.
       - run: pip install -q pyyaml
       - run: bash scripts/test-derive-provider.sh
+      - run: bash scripts/test-derive-platform-llm.sh
       - run: bash scripts/test-install-prefix-strip.sh
       - run: bash scripts/test-load-workspace-config.sh
       - run: bash scripts/test-mcp-configs-dir.sh
