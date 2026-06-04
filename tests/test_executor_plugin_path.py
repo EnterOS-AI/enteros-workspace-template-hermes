@@ -742,6 +742,148 @@ async def test_fallback_handles_unexpected_response_shape(monkeypatch):
     assert "no content" in repr(queue.events[0])
 
 
+# ---- reasoning-model content extraction (#2204) ----------------------
+
+
+def test_extract_assistant_text_returns_content_when_present():
+    """Regression-pin: a normal completion with non-empty content is
+    returned verbatim — the reasoning fallback must not perturb it."""
+    data = {"choices": [{"message": {"role": "assistant", "content": "PONG"}}]}
+    assert HermesAgentProxyExecutor._extract_assistant_text(data) == "PONG"
+
+
+def test_extract_assistant_text_falls_back_to_reasoning_content():
+    """#2204: reasoning models (MiniMax M2/M2.7, Moonshot K2.6) put the
+    turn in ``reasoning_content`` and leave ``content`` empty when the
+    whole budget went to reasoning. The extractor must surface that
+    rather than reporting an empty turn."""
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "Let me think... the answer is PONG.",
+                }
+            }
+        ]
+    }
+    assert (
+        HermesAgentProxyExecutor._extract_assistant_text(data)
+        == "Let me think... the answer is PONG."
+    )
+
+
+def test_extract_assistant_text_prefers_content_over_reasoning():
+    """When BOTH content and reasoning_content are present, content wins
+    — the reasoning preamble is not the final answer."""
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "PONG",
+                    "reasoning_content": "internal scratchpad",
+                }
+            }
+        ]
+    }
+    assert HermesAgentProxyExecutor._extract_assistant_text(data) == "PONG"
+
+
+def test_extract_assistant_text_null_content_with_reasoning():
+    """Some providers send content: null (not "") on a reasoning-only
+    turn. Treat null the same as empty and fall back to reasoning."""
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "reasoned answer",
+                }
+            }
+        ]
+    }
+    assert (
+        HermesAgentProxyExecutor._extract_assistant_text(data)
+        == "reasoned answer"
+    )
+
+
+def test_extract_assistant_text_both_empty_still_flagged():
+    """Genuine empty/error reply — content AND reasoning_content both
+    empty — must still return the sentinel, NOT a blank string. We do
+    NOT mask a truly empty turn as if it were a reasoning-only one."""
+    data = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "", "reasoning_content": ""}}
+        ]
+    }
+    assert (
+        HermesAgentProxyExecutor._extract_assistant_text(data)
+        == "(hermes-agent returned no content)"
+    )
+
+
+def test_extract_assistant_text_bad_shape_flagged():
+    """A malformed response (no choices/message) still returns the
+    sentinel rather than raising."""
+    assert (
+        HermesAgentProxyExecutor._extract_assistant_text({"not": "expected"})
+        == "(hermes-agent returned no content)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_surfaces_reasoning_only_completion(monkeypatch):
+    """End-to-end on the chat_completions path: an upstream that returns
+    a 2xx with empty content but populated reasoning_content (the staging
+    canary failure on MiniMax-M2 / kimi-k2.6) must emit the reasoning
+    text on the queue, NOT the empty-content sentinel."""
+    api_port = _free_port()
+
+    async def reasoning_only(request: web.Request) -> web.Response:
+        return web.json_response({
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "PONG",
+                    },
+                }
+            ]
+        })
+
+    api_app = web.Application()
+    api_app.router.add_post("/v1/chat/completions", reasoning_only)
+    api_runner = web.AppRunner(api_app)
+    await api_runner.setup()
+    api_site = web.TCPSite(api_runner, "127.0.0.1", api_port)
+    await api_site.start()
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_ENABLED="false",
+        HERMES_API_BASE=f"http://127.0.0.1:{api_port}/v1",
+    )
+    queue = _CapturingQueue()
+    try:
+        await ex.start()
+        await ex.execute(_build_context("ping"), queue)
+    finally:
+        await ex.stop()
+        await api_site.stop()
+        await api_runner.cleanup()
+
+    assert len(queue.events) == 1
+    rendered = repr(queue.events[0])
+    assert "PONG" in rendered
+    assert "no content" not in rendered
+
+
 # ---- chat_id derivation ----------------------------------------------
 
 
