@@ -708,7 +708,29 @@ class HermesAgentProxyExecutor(AgentExecutor):
     @staticmethod
     def _extract_assistant_text(data: dict[str, Any]) -> str:
         try:
-            return data["choices"][0]["message"]["content"] or ""
+            message = data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError):
             logger.warning("Unexpected hermes-agent response shape: %r", data)
             return "(hermes-agent returned no content)"
+
+        content = message.get("content") or ""
+        if content:
+            return content
+
+        # Reasoning models (MiniMax M2/M2.7, Moonshot Kimi K2.6) on their
+        # OpenAI-compatible endpoint return the assistant turn in a separate
+        # ``reasoning_content`` field and leave ``content`` empty when the
+        # whole turn was reasoning (e.g. a tight max_tokens budget consumed
+        # by the thinking preamble). Treating that as "no content" surfaced a
+        # genuine reply as an empty A2A turn (issue #2204 — staging canary
+        # red, and any real agent on a reasoning model). Fall back to it so
+        # the turn isn't seen as empty.
+        reasoning = message.get("reasoning_content") or ""
+        if reasoning:
+            return reasoning
+
+        # content AND reasoning_content both empty → a genuinely empty/error
+        # reply, NOT a reasoning-only turn. Keep the existing sentinel so this
+        # stays distinguishable from a real answer (do not mask it).
+        logger.warning("hermes-agent returned empty content and no reasoning: %r", data)
+        return "(hermes-agent returned no content)"
