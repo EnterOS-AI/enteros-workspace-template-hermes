@@ -343,3 +343,57 @@ jobs:
             exit 1
           fi
           echo "::notice::${ENV_NAME} runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
+
+  verify-pin:
+    # Keystone fail-loud gate (the durable guard the CTO asked for). After the
+    # promote, READ BACK runtime_image_pins via GET /cp/admin/runtime-image and
+    # ASSERT the (hermes, global) row's image_digest == the digest we just
+    # pushed. If they differ (promote silently skipped, wrong template, region
+    # skew, a 4xx that somehow didn't abort, etc.) this job goes RED. A green
+    # build that did not move the pin is exactly the failure this catches.
+    # The assertion logic lives in the shared, byte-identical
+    # .gitea/scripts/verify-runtime-pin.sh present in every runtime-template
+    # repo, so the guard covers hermes and every sibling template alike.
+    name: Verify runtime_image_pins moved (fail-loud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [resolve-version, publish, promote-pin]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: prod
+            cp_host: api.moleculesai.app
+          - env_name: staging
+            cp_host: staging-api.moleculesai.app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Assert pin == pushed digest (${{ matrix.env_name }})
+        env:
+          PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+          STAGING_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN_STAGING }}
+          ENV_NAME: ${{ matrix.env_name }}
+          CP_HOST: ${{ matrix.cp_host }}
+          TEMPLATE_NAME: hermes
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ "${ENV_NAME}" = "prod" ]; then
+            CP_ADMIN_API_TOKEN="${PROD_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN"
+          else
+            CP_ADMIN_API_TOKEN="${STAGING_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN_STAGING"
+          fi
+          chmod +x .gitea/scripts/verify-runtime-pin.sh
+          CP_HOST="${CP_HOST}" \
+          CP_ADMIN_API_TOKEN="${CP_ADMIN_API_TOKEN}" \
+          TOKEN_SECRET_NAME="${TOKEN_SECRET_NAME}" \
+          TEMPLATE_NAME="${TEMPLATE_NAME}" \
+          EXPECTED_DIGEST="${IMAGE_DIGEST}" \
+          ENV_NAME="${ENV_NAME}" \
+            .gitea/scripts/verify-runtime-pin.sh
