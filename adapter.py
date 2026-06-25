@@ -110,6 +110,28 @@ class HermesAgentAdapter(BaseAdapter):
         legacy api-server /health. Failing here marks the workspace
         unhealthy rather than silently forwarding to a dead port.
         """
+        # --- SSOT: publish the single base-built system prompt onto config ---
+        # The hermes executor consumes ``config.system_prompt`` as the
+        # ``{"role": "system"}`` message it sends to hermes-agent's
+        # /v1/chat/completions (executor.py ``_build_initial_messages``). That
+        # field is BASE-OWNED and is None until something fills it. Build it
+        # HERE via the one canonical builder (``build_system_prompt``), which
+        # honors ``config.prompt_files`` (with the legacy ``system-prompt.md``
+        # fallback baked in) — so a hermes concierge gets the SAME prompt-file
+        # resolution every other runtime gets, instead of an empty system
+        # message. This closes the per-runtime prompt drift (the executor must
+        # never re-read /configs/system-prompt.md itself and ignore
+        # prompt_files). Published BEFORE the smoke short-circuit so the field
+        # is always set on the config the executor receives.
+        from molecule_runtime.prompt import build_system_prompt
+        config.system_prompt = build_system_prompt(
+            config.config_path,
+            config.workspace_id,
+            [],  # skills: hermes owns its native skill tools, not the prompt
+            [],  # peers: appended live per-turn via _fetch_peers_blurb
+            prompt_files=config.prompt_files,
+        )
+
         # Boot-smoke contract (molecule-core#2275): start.sh's smoke-mode
         # branch exec's molecule-runtime without spawning the gateway,
         # so neither the plugin port nor :8642 is listening. Skip the

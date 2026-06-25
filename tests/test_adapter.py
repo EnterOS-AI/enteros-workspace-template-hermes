@@ -168,3 +168,84 @@ async def test_create_executor_when_plugin_disabled_skips_reply_server(monkeypat
         assert executor._reply_site is None
     finally:
         await executor.stop()
+
+
+# ---- system-prompt SSOT (task #76) -----------------------------------
+# The hermes executor consumes ``config.system_prompt`` as the
+# ``{"role": "system"}`` message it sends to /v1/chat/completions
+# (executor.py ``_build_initial_messages``). These tests pin the OTHER half:
+# ``adapter.setup()`` must PUBLISH that field via the single base builder
+# (``build_system_prompt``), which honors ``config.prompt_files``. Before this
+# fix hermes never called the builder, so ``config.system_prompt`` stayed None
+# and the system message was empty — the identity-less concierge bug. The
+# invariant: ONE source (build_system_prompt honoring prompt_files), never a
+# per-runtime re-read of /configs/system-prompt.md that ignores prompt_files.
+
+
+@pytest.mark.asyncio
+async def test_setup_publishes_system_prompt_honoring_prompt_files(
+    monkeypatch, tmp_path
+):
+    """setup() fills config.system_prompt from the declared prompt_files, not a
+    blind system-prompt.md re-read. Runs under smoke mode so it needs no live
+    hermes gateway (the publish happens before the smoke short-circuit)."""
+    monkeypatch.setenv("MOLECULE_SMOKE_MODE", "1")
+
+    configs = tmp_path / "configs"
+    (configs / "prompts").mkdir(parents=True)
+    # Concierge layout: identity declared via prompt_files...
+    (configs / "prompts" / "concierge.md").write_text("ORG-CONCIERGE-IDENTITY")
+    # ...with a STALE root system-prompt.md that must NOT shadow it.
+    (configs / "system-prompt.md").write_text("STALE-GENERIC-FALLBACK")
+
+    cfg = AdapterConfig(
+        model="hermes-test",
+        config_path=str(configs),
+        workspace_id="ws-hermes-concierge",
+        prompt_files=["prompts/concierge.md"],
+    )
+    await HermesAgentAdapter().setup(cfg)
+
+    assert cfg.system_prompt, "setup() left config.system_prompt empty"
+    # The declared prompt file is loaded...
+    assert "ORG-CONCIERGE-IDENTITY" in cfg.system_prompt
+    # ...and the stale single-file fallback is NOT (prompt_files wins).
+    assert "STALE-GENERIC-FALLBACK" not in cfg.system_prompt
+    # The base platform identity frame is always present (single builder).
+    assert "Molecule AI platform" in cfg.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_executor_initial_messages_use_published_prompt(
+    monkeypatch, tmp_path
+):
+    """End-to-end: the system message the executor builds is exactly the prompt
+    setup() published — no second source, prompt_files honored."""
+    monkeypatch.setenv("MOLECULE_SMOKE_MODE", "1")
+
+    configs = tmp_path / "configs"
+    (configs / "prompts").mkdir(parents=True)
+    (configs / "prompts" / "concierge.md").write_text("ORG-CONCIERGE-IDENTITY")
+    (configs / "system-prompt.md").write_text("STALE-GENERIC-FALLBACK")
+
+    from executor import HermesAgentProxyExecutor
+
+    cfg = AdapterConfig(
+        model="hermes-test",
+        config_path=str(configs),
+        workspace_id="ws-hermes-concierge",
+        prompt_files=["prompts/concierge.md"],
+    )
+    await HermesAgentAdapter().setup(cfg)
+
+    # Build the executor over the SAME config and inspect the system message
+    # it emits — without starting the reply server (we never call start()).
+    executor = HermesAgentProxyExecutor(cfg)
+    messages = executor._build_initial_messages("hello")
+
+    system = [m for m in messages if m["role"] == "system"]
+    assert system, "no system message emitted"
+    assert "ORG-CONCIERGE-IDENTITY" in system[0]["content"]
+    assert "STALE-GENERIC-FALLBACK" not in system[0]["content"]
+    # The system content is sourced from the published config field.
+    assert cfg.system_prompt in system[0]["content"]
