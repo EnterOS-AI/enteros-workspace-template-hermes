@@ -145,7 +145,7 @@ jobs:
       # Static-only validator — file existence checks, YAML parse,
       # AST inspection of adapter.py (no import). Doesn't execute any
       # third-party code; safe on fork PRs.
-      - run: pip install pyyaml -q
+      - run: pip install pyyaml jsonschema -q
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
 
   validate-runtime:
@@ -168,7 +168,7 @@ jobs:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: requirements.txt
-      - run: pip install pyyaml -q
+      - run: pip install pyyaml jsonschema -q
       # Install the template's runtime dependencies so the validator's
       # check_adapter_runtime_load() can import adapter.py the same way
       # the workspace container does at boot. Without this, a
