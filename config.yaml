@@ -46,8 +46,9 @@ providers:
     auth_env: [MOLECULE_LLM_USAGE_TOKEN, ANTHROPIC_API_KEY]
     notes: >-
       Molecule platform-managed LLM proxy (OpenAI-compat /chat/completions
-      surface). Auto-selected when the workspace LLM billing mode is
-      platform_managed; start.sh routes hermes-agent's `custom` provider
+      surface). Auto-selected when the workspace's resolved provider is
+      `platform` (LLM_PROVIDER=platform / a platform/ model — NOT a
+      billing-mode env); start.sh routes hermes-agent's `custom` provider
       here via scripts/derive-platform-llm.sh. Kimi is hermes's native
       platform model family — see the `provider: platform` entries in
       runtime_config.models. The live base_url + bearer token are injected
@@ -322,11 +323,11 @@ runtime_config:
       required_env: [GLM_API_KEY]
 
     # ── Molecule platform-managed (no API key — platform owns billing) ──
-    # Hermes's native platform family is Kimi. Offered only when the
-    # workspace runs in platform_managed LLM billing; start.sh routes these
-    # through the platform proxy's OpenAI-compat surface
-    # (scripts/derive-platform-llm.sh). Model ids match the proven proxy
-    # smoke (molecule-controlplane/scripts/e2e-llm-kimi-smoke.sh).
+    # Hermes's native platform family is Kimi. Selected when the workspace's
+    # resolved provider is `platform` (provider==platform — NOT a billing-mode
+    # env); start.sh routes these through the platform proxy's OpenAI-compat
+    # surface (scripts/derive-platform-llm.sh). Model ids match the proven
+    # proxy smoke (molecule-controlplane/scripts/e2e-llm-kimi-smoke.sh).
     - id: moonshot/kimi-k2.6
       name: Kimi K2.6 (Molecule platform)
       provider: platform
