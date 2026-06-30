@@ -36,7 +36,7 @@ apply_install_logic() {
     export HERMES_CUSTOM_API_MODE="chat_completions"
   fi
 
-  if [ "${MOLECULE_LLM_BILLING_MODE:-}" = "platform_managed" ] && [ -n "${HERMES_CUSTOM_BASE_URL:-}" ]; then
+  if [ "${MOLECULE_PLATFORM_LLM_ACTIVE:-}" = "1" ] && [ -n "${HERMES_CUSTOM_BASE_URL:-}" ]; then
     PLATFORM_OPENAI_BASE="${MOLECULE_LLM_BASE_URL:-${OPENAI_BASE_URL:-}}"
     if [ -z "${PLATFORM_OPENAI_BASE}" ] || [ "${HERMES_CUSTOM_BASE_URL}" != "${PLATFORM_OPENAI_BASE}" ]; then
       return 42
@@ -60,7 +60,7 @@ assert_model() {
     OPENAI_API_KEY=''
     OPENROUTER_API_KEY=''
     MINIMAX_API_KEY=''
-    MOLECULE_LLM_BILLING_MODE=''
+    MOLECULE_PLATFORM_LLM_ACTIVE=''
     MOLECULE_LLM_BASE_URL=''
     OPENAI_BASE_URL=''
     HERMES_CUSTOM_BASE_URL=''
@@ -91,7 +91,7 @@ assert_value() {
     OPENAI_API_KEY=''
     OPENROUTER_API_KEY=''
     MINIMAX_API_KEY=''
-    MOLECULE_LLM_BILLING_MODE=''
+    MOLECULE_PLATFORM_LLM_ACTIVE=''
     MOLECULE_LLM_BASE_URL=''
     OPENAI_BASE_URL=''
     HERMES_CUSTOM_BASE_URL=''
@@ -121,7 +121,7 @@ assert_reject() {
     OPENAI_API_KEY=''
     OPENROUTER_API_KEY=''
     MINIMAX_API_KEY=''
-    MOLECULE_LLM_BILLING_MODE=''
+    MOLECULE_PLATFORM_LLM_ACTIVE=''
     MOLECULE_LLM_BASE_URL=''
     OPENAI_BASE_URL=''
     HERMES_CUSTOM_BASE_URL=''
@@ -148,10 +148,10 @@ assert_model "A: default bridge strips openai/" "gpt-4o" '
   DEFAULT_MODEL=openai/gpt-4o
 '
 
-assert_value "A2: platform bridge uses Molecule proxy URL" "openai/gpt-4o|https://cp.example.test/api/v1/internal/llm/openai/v1" '
+assert_value "A2: platform-provider bridge uses Molecule proxy URL" "openai/gpt-4o|https://cp.example.test/api/v1/internal/llm/openai/v1" '
   PROVIDER=custom
   OPENAI_API_KEY=tenant-proxy-token
-  MOLECULE_LLM_BILLING_MODE=platform_managed
+  MOLECULE_PLATFORM_LLM_ACTIVE=1
   MOLECULE_LLM_BASE_URL=https://cp.example.test/api/v1/internal/llm/openai/v1
   DEFAULT_MODEL=openai/gpt-4o
 '
@@ -222,9 +222,9 @@ assert_model "I: beta.api.openai.com NOT stripped" "openai/gpt-4o" '
   DEFAULT_MODEL=openai/gpt-4o
 '
 
-assert_reject "J: platform-managed rejects direct custom provider" '
+assert_reject "J: platform provider rejects direct custom base url" '
   PROVIDER=custom
-  MOLECULE_LLM_BILLING_MODE=platform_managed
+  MOLECULE_PLATFORM_LLM_ACTIVE=1
   MOLECULE_LLM_BASE_URL=https://cp.example.test/api/v1/internal/llm/openai/v1
   HERMES_CUSTOM_BASE_URL=https://api.moonshot.ai/v1
   HERMES_CUSTOM_API_KEY=sk-test
@@ -240,7 +240,7 @@ PARITY_FAIL=0
 for pattern in \
   '[ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERMES_CUSTOM_BASE_URL:-}" ] && [ -z "${HERMES_CUSTOM_API_KEY:-}" ]' \
   'HERMES_CUSTOM_BASE_URL="${OPENAI_BASE_URL:-${MOLECULE_LLM_BASE_URL:-https://api.openai.com/v1}}"' \
-  'refusing direct HERMES_CUSTOM_BASE_URL in platform-managed LLM mode' \
+  'refusing direct HERMES_CUSTOM_BASE_URL for the platform provider' \
   '=~ ^https?://api\.openai\.com(/|$)' \
   'DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"'; do
   if ! grep -F -q -- "$pattern" "$INSTALL"; then

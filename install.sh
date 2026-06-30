@@ -159,12 +159,14 @@ DEFAULT_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL:-nousresearch/he
 HERMES_INFERENCE_MODEL="${DEFAULT_MODEL}" \
   . "$(dirname "$0")/scripts/derive-provider.sh"
 
-# --- Platform-managed LLM override (symmetric with start.sh) ---
-# In platform_managed billing mode, route ALL inference through the Molecule
-# platform proxy (OpenAI-compat surface) regardless of the model's vendor
-# prefix — the tenant has no BYOK key (stripped upstream) and the proxy owns
-# the keys + billing. Sourced AFTER derive-provider.sh so it wins; fails
-# closed if platform_managed is set with no platform base URL.
+# --- Platform provider override (symmetric with start.sh) ---
+# When the resolved provider is `platform` (LLM_PROVIDER=platform /
+# HERMES_INFERENCE_PROVIDER=platform / a platform/ model — NOT a billing-mode
+# env), route ALL inference through the Molecule platform proxy (OpenAI-compat
+# surface) regardless of the model's vendor prefix — for the platform arm the
+# tenant has no BYOK key (stripped upstream) and the proxy owns the keys +
+# billing. Sourced AFTER derive-provider.sh so it wins; fails closed if
+# provider==platform with no platform base URL.
 if [ -f "$(dirname "$0")/scripts/derive-platform-llm.sh" ]; then
   # shellcheck source=scripts/derive-platform-llm.sh
   . "$(dirname "$0")/scripts/derive-platform-llm.sh" || {
@@ -210,10 +212,14 @@ if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERME
   echo "[install.sh] bridged OPENAI_API_KEY -> custom provider @ ${HERMES_CUSTOM_BASE_URL} (api_mode=chat_completions)"
 fi
 
-if [ "${MOLECULE_LLM_BILLING_MODE:-}" = "platform_managed" ] && [ -n "${HERMES_CUSTOM_BASE_URL:-}" ]; then
+# Defense-in-depth: when the resolved provider is platform (derive-platform-llm.sh
+# set MOLECULE_PLATFORM_LLM_ACTIVE=1), refuse a HERMES_CUSTOM_BASE_URL that isn't
+# the injected platform proxy base. Keyed on provider==platform, not a
+# billing-mode env.
+if [ "${MOLECULE_PLATFORM_LLM_ACTIVE:-}" = "1" ] && [ -n "${HERMES_CUSTOM_BASE_URL:-}" ]; then
   PLATFORM_OPENAI_BASE="${MOLECULE_LLM_BASE_URL:-${OPENAI_BASE_URL:-}}"
   if [ -z "${PLATFORM_OPENAI_BASE}" ] || [ "${HERMES_CUSTOM_BASE_URL}" != "${PLATFORM_OPENAI_BASE}" ]; then
-    echo "[install.sh] refusing direct HERMES_CUSTOM_BASE_URL in platform-managed LLM mode: ${HERMES_CUSTOM_BASE_URL}" >&2
+    echo "[install.sh] refusing direct HERMES_CUSTOM_BASE_URL for the platform provider: ${HERMES_CUSTOM_BASE_URL}" >&2
     echo "[install.sh] use the Molecule platform proxy env (MOLECULE_LLM_BASE_URL/OPENAI_BASE_URL) instead." >&2
     exit 1
   fi

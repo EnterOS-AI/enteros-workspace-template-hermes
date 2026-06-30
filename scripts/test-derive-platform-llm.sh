@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tests/test_derive_platform_llm.sh — sh-style assertion tests for
-# scripts/derive-platform-llm.sh (the platform-managed LLM routing override).
+# scripts/derive-platform-llm.sh (the platform-provider LLM routing override,
+# selected by provider==platform — NOT a billing-mode env).
 #
 # Run with:   bash tests/test_derive_platform_llm.sh
 # Exit code:  0 on success, 1 on any failure.
@@ -33,8 +34,8 @@ run_case() {
   local actual
   actual="$(env -i PATH="$PATH" HOME="$HOME" "$@" bash -c "
     set -uo pipefail
-    unset MOLECULE_LLM_BILLING_MODE MOLECULE_LLM_BASE_URL OPENAI_BASE_URL
-    unset MOLECULE_LLM_USAGE_TOKEN ANTHROPIC_API_KEY
+    unset LLM_PROVIDER HERMES_INFERENCE_PROVIDER MOLECULE_LLM_BASE_URL OPENAI_BASE_URL
+    unset MOLECULE_LLM_USAGE_TOKEN ANTHROPIC_API_KEY MOLECULE_PLATFORM_LLM_ACTIVE
     for kv in \"\$@\"; do export \"\$kv\"; done
     # Caller seeds DEFAULT_MODEL / PROVIDER via the env list too; default them.
     : \"\${DEFAULT_MODEL:=moonshot/kimi-k2.6}\"
@@ -54,46 +55,57 @@ run_case() {
 
 PROXY="https://api.moleculesai.app/api/v1/internal/llm/openai/v1"
 
-# (1) Not platform-managed: no-op — PROVIDER, custom vars, and model untouched.
-run_case "byok mode is a no-op" \
+# (1) Resolved provider is not platform: no-op — PROVIDER, custom vars, and
+# model untouched. A bare vendor model + no platform signal is BYOK.
+run_case "non-platform provider is a no-op" \
   "0|kimi-coding||||kimi-coding/kimi-k2" \
   "DEFAULT_MODEL=kimi-coding/kimi-k2" "PROVIDER=kimi-coding"
 
-# (2) platform_managed + base + usage token: routes through custom proxy.
-run_case "platform_managed routes to custom proxy" \
+# (2) provider==platform (LLM_PROVIDER=platform) + base + usage token: routes
+# through the custom proxy. Note the model has NO platform/ prefix — the
+# LLM_PROVIDER signal (core-injected) is what selects platform.
+run_case "LLM_PROVIDER=platform routes to custom proxy" \
   "0|custom|${PROXY}|tok-123|chat_completions|moonshot/kimi-k2.6" \
-  "MOLECULE_LLM_BILLING_MODE=platform_managed" "MOLECULE_LLM_BASE_URL=${PROXY}" \
+  "LLM_PROVIDER=platform" "MOLECULE_LLM_BASE_URL=${PROXY}" \
   "MOLECULE_LLM_USAGE_TOKEN=tok-123" "DEFAULT_MODEL=moonshot/kimi-k2.6"
 
-# (3) platform/ prefix is stripped before reaching the proxy.
-run_case "platform/ prefix stripped" \
+# (2b) HERMES_INFERENCE_PROVIDER=platform is an equivalent provider==platform
+# signal (explicit operator override).
+run_case "HERMES_INFERENCE_PROVIDER=platform routes to custom proxy" \
+  "0|custom|${PROXY}|tok-123|chat_completions|moonshot/kimi-k2.6" \
+  "HERMES_INFERENCE_PROVIDER=platform" "MOLECULE_LLM_BASE_URL=${PROXY}" \
+  "MOLECULE_LLM_USAGE_TOKEN=tok-123" "DEFAULT_MODEL=moonshot/kimi-k2.6"
+
+# (3) A platform/ model namespace is ITSELF the provider==platform signal (no
+# env needed) and the marker is stripped before reaching the proxy.
+run_case "platform/ model selects platform + prefix stripped" \
   "0|custom|${PROXY}|tok-123|chat_completions|kimi-k2.6" \
-  "MOLECULE_LLM_BILLING_MODE=platform_managed" "MOLECULE_LLM_BASE_URL=${PROXY}" \
+  "MOLECULE_LLM_BASE_URL=${PROXY}" \
   "MOLECULE_LLM_USAGE_TOKEN=tok-123" "DEFAULT_MODEL=platform/kimi-k2.6"
 
-# (4) platform_managed but NO base URL: fails closed (rc=1) BEFORE mutating
+# (4) provider==platform but NO base URL: fails closed (rc=1) BEFORE mutating
 # PROVIDER / custom vars, so the caller (start.sh) can refuse to boot.
-run_case "platform_managed without base url fails closed" \
+run_case "platform without base url fails closed" \
   "1|kimi-coding||||moonshot/kimi-k2.6" \
-  "MOLECULE_LLM_BILLING_MODE=platform_managed" "DEFAULT_MODEL=moonshot/kimi-k2.6"
+  "LLM_PROVIDER=platform" "DEFAULT_MODEL=moonshot/kimi-k2.6"
 
-# (4b) platform_managed with a base URL but NO bearer token also fails closed
+# (4b) provider==platform with a base URL but NO bearer token also fails closed
 # (symmetric) — booting with an empty key would defer to a runtime 401.
-run_case "platform_managed without bearer fails closed" \
+run_case "platform without bearer fails closed" \
   "1|kimi-coding||||moonshot/kimi-k2.6" \
-  "MOLECULE_LLM_BILLING_MODE=platform_managed" "MOLECULE_LLM_BASE_URL=${PROXY}" \
+  "LLM_PROVIDER=platform" "MOLECULE_LLM_BASE_URL=${PROXY}" \
   "DEFAULT_MODEL=moonshot/kimi-k2.6"
 
 # (5) falls back to OPENAI_BASE_URL when MOLECULE_LLM_BASE_URL is absent.
 run_case "OPENAI_BASE_URL fallback" \
   "0|custom|${PROXY}|tok-123|chat_completions|moonshot/kimi-k2.6" \
-  "MOLECULE_LLM_BILLING_MODE=platform_managed" "OPENAI_BASE_URL=${PROXY}" \
+  "LLM_PROVIDER=platform" "OPENAI_BASE_URL=${PROXY}" \
   "MOLECULE_LLM_USAGE_TOKEN=tok-123" "DEFAULT_MODEL=moonshot/kimi-k2.6"
 
 # (6) bearer falls back to ANTHROPIC_API_KEY when no usage token.
 run_case "ANTHROPIC_API_KEY bearer fallback" \
   "0|custom|${PROXY}|sk-ant-xx|chat_completions|moonshot/kimi-k2.6" \
-  "MOLECULE_LLM_BILLING_MODE=platform_managed" "MOLECULE_LLM_BASE_URL=${PROXY}" \
+  "LLM_PROVIDER=platform" "MOLECULE_LLM_BASE_URL=${PROXY}" \
   "ANTHROPIC_API_KEY=sk-ant-xx" "DEFAULT_MODEL=moonshot/kimi-k2.6"
 
 echo
