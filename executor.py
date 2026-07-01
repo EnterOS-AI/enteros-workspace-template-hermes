@@ -111,6 +111,37 @@ SECRET_HEADER = "X-Molecule-A2A-Secret"
 _PLUGIN_REPLY_TIMEOUT = 600.0
 
 
+def _record_tool_activity() -> None:
+    """Tier-C turn-lease liveness ping on each tool call (RC #203, template side).
+
+    The base runtime EXPORTS ``MOLECULE_TOOL_ACTIVITY_FILE`` (a private, 0600,
+    per-turn file) when the mailbox kernel is on, and its turn-lease watcher
+    refreshes the lease whenever this file's mtime advances. A hermes turn that
+    is churning long tool calls emits no native runtime event, so without this
+    ping the lease can go stale and a live turn is mistaken for a stall — the
+    coarse tier-D output-liveness fallback. Touching the file on every tool call
+    mirrors how claude-code's native ``on_tool_start`` feeds the lease.
+
+    No-op when ``MOLECULE_TOOL_ACTIVITY_FILE`` is unset (off-kernel / older base
+    image) — additive and byte-identical off-kernel. Never raises: a liveness
+    ping must not break a tool call.
+    """
+    path = os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "w") as fh:
+            fh.write("1")
+    except OSError:
+        return
+    try:
+        # Keep the liveness file private even if we won a create-race with the
+        # runtime's ensure_tool_activity_file(). Best-effort (no-op on Windows).
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def _bool_env(name: str, default: bool) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
@@ -687,6 +718,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
 
     async def _dispatch_tool(self, tool_call: dict[str, Any]) -> str:
         """Dispatch a model-requested tool call to the Molecule platform."""
+        # RC #203 (tier-C liveness): a tool call is liveness. Bump the exported
+        # activity file so a long tool-running turn isn't mistaken for a stall.
+        # No-op when MOLECULE_TOOL_ACTIVITY_FILE is unset (off-kernel).
+        _record_tool_activity()
         fn = tool_call.get("function") or {}
         name = fn.get("name", "")
         args_raw = fn.get("arguments", "{}")
