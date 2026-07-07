@@ -249,3 +249,77 @@ async def test_executor_initial_messages_use_published_prompt(
     assert "STALE-GENERIC-FALLBACK" not in system[0]["content"]
     # The system content is sourced from the published config field.
     assert cfg.system_prompt in system[0]["content"]
+
+
+# ---- setup() plugin pipeline (skills-surfacing contract) -------------
+
+
+@pytest.mark.asyncio
+async def test_setup_drives_plugin_pipeline(monkeypatch, tmp_path):
+    """setup() must INSTALL the declared plugins via the base per-runtime
+    adaptor registry — the call this template previously never made, leaving
+    /configs/plugins fetched-but-never-installed on hermes (no skills in
+    /configs/skills, no rules in the prompt). A skills-shaped plugin's skill
+    dir must land in <configs>/skills (the canonical dir hermes-agent is
+    pointed at via skills.external_dirs), and its rules must fold into the
+    assembled system prompt (hermes never reads CLAUDE.md)."""
+
+    monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "true")
+    # Kernel-off memory target: append_to_memory writes under configs.
+    monkeypatch.delenv("MOLECULE_MAILBOX_KERNEL", raising=False)
+
+    configs = tmp_path / "configs"
+    plugin = configs / "plugins" / "probe-plugin"
+    skill = plugin / "skills" / "probe-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: probe-skill\ndescription: probe\n---\n\nDo the probe.\n"
+    )
+    rules = plugin / "rules"
+    rules.mkdir()
+    (rules / "always.md").write_text("ALWAYS-ON-PROBE-RULE")
+    # Point the shared-plugins fallback away from the real /plugins.
+    monkeypatch.setenv("PLUGINS_DIR", str(tmp_path / "no-shared-plugins"))
+
+    health_port = _free_port()
+
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "platform": "molecule-a2a"})
+
+    app = web.Application()
+    app.router.add_get("/a2a/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", health_port)
+    await site.start()
+
+    try:
+        monkeypatch.setenv("MOLECULE_A2A_PLATFORM_PORT", str(health_port))
+        cfg = AdapterConfig(model="hermes-test", config_path=str(configs))
+        await HermesAgentAdapter().setup(cfg)
+    finally:
+        await site.stop()
+        await runner.cleanup()
+
+    # AgentskillsAdaptor copied the plugin skill into the canonical dir.
+    assert (configs / "skills" / "probe-skill" / "SKILL.md").is_file()
+    # Plugin rules fold into the ONE prompt channel hermes actually consumes.
+    assert "ALWAYS-ON-PROBE-RULE" in (cfg.system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_smoke_mode_never_runs_plugin_installs(monkeypatch, tmp_path):
+    """Smoke boots (publish-image gate: stub creds, no network, no plugins
+    volume) must not execute plugin setup — the install call sits AFTER the
+    smoke short-circuit."""
+
+    monkeypatch.setenv("MOLECULE_SMOKE_MODE", "1")
+    adapter = HermesAgentAdapter()
+
+    async def _boom(*a, **kw):  # pragma: no cover - would fail the test
+        raise AssertionError("install_plugins_via_registry ran under smoke mode")
+
+    monkeypatch.setattr(adapter, "install_plugins_via_registry", _boom)
+    cfg = AdapterConfig(model="hermes-test", config_path=str(tmp_path / "configs"))
+    await adapter.setup(cfg)

@@ -123,13 +123,28 @@ class HermesAgentAdapter(BaseAdapter):
         # never re-read /configs/system-prompt.md itself and ignore
         # prompt_files). Published BEFORE the smoke short-circuit so the field
         # is always set on the config the executor receives.
+        #
+        # Plugins: load the declared set FIRST (pure filesystem read) so the
+        # plugin-shipped rules/prompt fragments fold into the assembled prompt
+        # — the same shape codex/claude-code build. hermes never consumes
+        # /configs/CLAUDE.md, so the prompt is the ONLY channel its model
+        # receives always-on plugin rules through.
+        from molecule_runtime.plugins import load_plugins
         from molecule_runtime.prompt import build_system_prompt
+
+        workspace_plugins_dir = os.path.join(config.config_path, "plugins")
+        plugins = load_plugins(
+            workspace_plugins_dir=workspace_plugins_dir,
+            shared_plugins_dir=os.environ.get("PLUGINS_DIR", "/plugins"),
+        )
         config.system_prompt = build_system_prompt(
             config.config_path,
             config.workspace_id,
             [],  # skills: hermes owns its native skill tools, not the prompt
             [],  # peers: appended live per-turn via _fetch_peers_blurb
             prompt_files=config.prompt_files,
+            plugin_rules=getattr(plugins, "rules", None),
+            plugin_prompts=list(getattr(plugins, "prompt_fragments", []) or []),
         )
 
         # Boot-smoke contract (molecule-core#2275): start.sh's smoke-mode
@@ -139,6 +154,28 @@ class HermesAgentAdapter(BaseAdapter):
         # short-circuit fires after create_executor() returns.
         if os.environ.get("MOLECULE_SMOKE_MODE") == "1":
             return
+
+        # --- Plugin pipeline: drive the base per-runtime adaptor registry ---
+        # Until now this template called the plugin pipeline ZERO times — the
+        # declared plugins fetched into /configs/plugins by the runtime's
+        # boot-install (plugin_sources.py) were never INSTALLED on hermes: no
+        # skills copied to /configs/skills, no rules injected, no MCP wired.
+        # This is the same call codex/openclaw/claude-code make from their own
+        # setup(). For a skills-shaped plugin it resolves AgentskillsAdaptor,
+        # which copies each skill into /configs/skills — the canonical dir the
+        # runtime's skills-surfacing PORT (skills_render) points hermes-agent
+        # at via ``skills.external_dirs`` in $HERMES_HOME/config.yaml, so the
+        # plugin's skills become natively visible to hermes' skills_list.
+        # For an MCP-server plugin the base hook dispatches to mcp_render,
+        # whose hermes renderer is a deliberate fail-loud stub: an ordinary
+        # MCP plugin records a loud install error, and the privileged
+        # management MCP (a hermes concierge) raises
+        # PrivilegedPluginInstallError so the boot fails CLOSED + loudly
+        # instead of the previous SILENT no-install (the worse failure mode:
+        # a concierge that looks online but can never create_workspace).
+        # Runs AFTER the smoke short-circuit: smoke boots have no plugins
+        # volume and must not execute plugin setup.sh scripts.
+        await self.install_plugins_via_registry(config, plugins)
 
         try:
             import httpx  # noqa: F401
