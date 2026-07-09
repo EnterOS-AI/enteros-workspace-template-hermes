@@ -132,6 +132,9 @@ derive "copilot-acp/claude-sonnet -> copilot-acp" \
 derive "minimax/* still routes to minimax (not minimax-oauth)" \
   "minimax" "HERMES_INFERENCE_MODEL=minimax/MiniMax-M2.7"
 
+derive "minimax:* routes to minimax for Molecule BYOK ids" \
+  "minimax" "HERMES_INFERENCE_MODEL=minimax:MiniMax-M2.7"
+
 derive "alibaba/* still routes to alibaba (not alibaba-coding-plan)" \
   "alibaba" "HERMES_INFERENCE_MODEL=alibaba/qwen3-32b"
 

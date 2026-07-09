@@ -47,6 +47,10 @@ apply_install_logic() {
   if [[ "${HERMES_CUSTOM_BASE_URL:-}" =~ ^https?://api\.openai\.com(/|$) ]]; then
     DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"
   fi
+
+  if [ "${PROVIDER:-}" = "minimax" ] && [[ "${DEFAULT_MODEL}" == minimax:* ]]; then
+    DEFAULT_MODEL="minimax/${DEFAULT_MODEL#minimax:}"
+  fi
 }
 
 assert_model() {
@@ -189,6 +193,12 @@ assert_model "E: minimax model untouched" "minimax/MiniMax-M2.7" '
   DEFAULT_MODEL=minimax/MiniMax-M2.7
 '
 
+assert_model "E2: minimax colon model normalized for Hermes" "minimax/MiniMax-M2.7" '
+  PROVIDER=minimax
+  MINIMAX_API_KEY=test
+  DEFAULT_MODEL=minimax:MiniMax-M2.7
+'
+
 # --- Case F: OpenAI URL but model already bare (idempotent) ---
 assert_model "F: idempotent on already-bare model" "gpt-4o" '
   PROVIDER=custom
@@ -242,7 +252,8 @@ for pattern in \
   'HERMES_CUSTOM_BASE_URL="${OPENAI_BASE_URL:-${MOLECULE_LLM_BASE_URL:-https://api.openai.com/v1}}"' \
   'refusing direct HERMES_CUSTOM_BASE_URL for the platform provider' \
   '=~ ^https?://api\.openai\.com(/|$)' \
-  'DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"'; do
+  'DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"' \
+  'DEFAULT_MODEL="minimax/${DEFAULT_MODEL#minimax:}"'; do
   if ! grep -F -q -- "$pattern" "$INSTALL"; then
     echo "  FAIL  install.sh missing substring: $pattern"
     PARITY_FAIL=$((PARITY_FAIL+1))

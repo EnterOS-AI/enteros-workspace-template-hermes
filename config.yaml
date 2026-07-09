@@ -109,7 +109,7 @@ providers:
     auth_env: [KIMI_API_KEY, KIMI_CN_API_KEY]
 
   - name: minimax
-    model_prefixes: [minimax/]
+    model_prefixes: [minimax/, "minimax:"]
     base_url: https://api.minimax.io/v1
     auth_env: [MINIMAX_API_KEY]
 
@@ -249,7 +249,7 @@ runtime_config:
   # Default model. hermes-agent owns provider resolution via the
   # HERMES_INFERENCE_PROVIDER env or its own `hermes model` wizard.
   # Override per-workspace in the canvas Config tab.
-  model: nousresearch/hermes-4-70b
+  model: minimax/MiniMax-M2.7
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
   # Required Env Vars from the selected entry's required_env. Provider
@@ -348,6 +348,9 @@ runtime_config:
       required_env: [MINIMAX_API_KEY]
     - id: minimax/MiniMax-M2.7-highspeed
       name: MiniMax M2.7 highspeed (Token Plan only)
+      required_env: [MINIMAX_API_KEY]
+    - id: minimax/MiniMax-M3
+      name: MiniMax M3 (direct)
       required_env: [MINIMAX_API_KEY]
     - id: minimax/MiniMax-M1
       name: MiniMax M1 (1M ctx)

@@ -54,7 +54,7 @@ case "${_HERMES_MODEL}" in
   kimi-coding-cn/*)        PROVIDER="kimi-coding-cn" ;;
 
   # Direct-SDK providers (clean 1:1 prefix→provider mapping)
-  minimax/*)               PROVIDER="minimax" ;;
+  minimax/*|minimax:*)     PROVIDER="minimax" ;;
   anthropic/*)             PROVIDER="anthropic" ;;
   gemini/*)                PROVIDER="gemini" ;;
   deepseek/*)              PROVIDER="deepseek" ;;

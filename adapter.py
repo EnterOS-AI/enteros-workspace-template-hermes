@@ -167,12 +167,12 @@ class HermesAgentAdapter(BaseAdapter):
         # at via ``skills.external_dirs`` in $HERMES_HOME/config.yaml, so the
         # plugin's skills become natively visible to hermes' skills_list.
         # For an MCP-server plugin the base hook dispatches to mcp_render,
-        # whose hermes renderer is a deliberate fail-loud stub: an ordinary
-        # MCP plugin records a loud install error, and the privileged
-        # management MCP (a hermes concierge) raises
-        # PrivilegedPluginInstallError so the boot fails CLOSED + loudly
-        # instead of the previous SILENT no-install (the worse failure mode:
-        # a concierge that looks online but can never create_workspace).
+        # whose hermes renderer writes ~/.hermes/config.yaml
+        # mcp_servers.<name> -- the native MCP map hermes-agent reads. If a
+        # privileged management MCP cannot be rendered, the base pipeline still
+        # raises PrivilegedPluginInstallError so the boot fails CLOSED + loudly
+        # instead of the previous SILENT no-install failure mode: a concierge
+        # that looks online but can never create_workspace.
         # Runs AFTER the smoke short-circuit: smoke boots have no plugins
         # volume and must not execute plugin setup.sh scripts.
         await self.install_plugins_via_registry(config, plugins)

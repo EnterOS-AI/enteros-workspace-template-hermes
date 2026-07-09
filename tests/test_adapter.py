@@ -12,10 +12,12 @@ Coverage targets the public adapter surface:
 
 from __future__ import annotations
 
+import json
 import socket
 from typing import Any
 
 import pytest
+import yaml
 from aiohttp import web
 
 from adapter import HermesAgentAdapter, Adapter
@@ -26,6 +28,12 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+@pytest.fixture(autouse=True)
+def _workspace_env(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_ID", "ws-hermes-test")
+    monkeypatch.setenv("PLATFORM_URL", "http://127.0.0.1:8080")
 
 
 # ---- structural -----------------------------------------------------
@@ -306,6 +314,100 @@ async def test_setup_drives_plugin_pipeline(monkeypatch, tmp_path):
     assert (configs / "skills" / "probe-skill" / "SKILL.md").is_file()
     # Plugin rules fold into the ONE prompt channel hermes actually consumes.
     assert "ALWAYS-ON-PROBE-RULE" in (cfg.system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_setup_wires_platform_mcp_into_hermes_native_config(
+    monkeypatch, tmp_path
+):
+    """setup() must install an MCP-shaped platform plugin into the Hermes-native
+    mcp_servers map. This pins the full adapter path:
+
+      load_plugins(<configs>/plugins) -> install_plugins_via_registry()
+      -> MCPServerAdaptor -> BaseAdapter.register_mcp_server_hook()
+      -> ~/.hermes/config.yaml mcp_servers.<name>
+
+    That is the runtime-visible gate the platform agent uses before coming
+    online; writing only .claude/settings.json would reproduce the
+    mcp_server_present=false failure.
+    """
+
+    monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "false")
+    monkeypatch.setenv("PLUGINS_DIR", str(tmp_path / "no-shared-plugins"))
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    hermes_cfg = home / ".hermes" / "config.yaml"
+    hermes_cfg.parent.mkdir(parents=True)
+    hermes_cfg.write_text(
+        yaml.safe_dump(
+            {
+                "model": "nous:existing-model",
+                "mcp_servers": {
+                    "keep-me": {"command": "uvx", "args": ["keep-server"]}
+                },
+            },
+            sort_keys=False,
+        )
+    )
+
+    configs = tmp_path / "configs"
+    plugin = configs / "plugins" / "molecule-platform-mcp"
+    plugin.mkdir(parents=True)
+    (plugin / "mcp-servers.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "molecule-platform": {
+                        "command": "npx",
+                        "args": ["-y", "@molecule-ai/mcp-server"],
+                        "env": {"MOLECULE_MCP_MODE": "management"},
+                    }
+                }
+            }
+        )
+    )
+
+    api_port = _free_port()
+
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok"})
+
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", api_port)
+    await site.start()
+
+    adapter = HermesAgentAdapter()
+    try:
+        monkeypatch.setenv(
+            "HERMES_API_BASE", f"http://127.0.0.1:{api_port}/v1"
+        )
+        cfg = AdapterConfig(model="hermes-test", config_path=str(configs))
+        await adapter.setup(cfg)
+    finally:
+        await site.stop()
+        await runner.cleanup()
+
+    parsed = yaml.safe_load(hermes_cfg.read_text())
+    assert parsed["model"] == "nous:existing-model"
+    assert parsed["mcp_servers"]["keep-me"] == {
+        "command": "uvx",
+        "args": ["keep-server"],
+    }
+    platform = parsed["mcp_servers"]["molecule-platform"]
+    assert platform["command"] == "npx"
+    assert platform["args"] == ["-y", "@molecule-ai/mcp-server"]
+    assert platform["env"]["MOLECULE_MCP_MODE"] == "management"
+    assert platform["env"]["WORKSPACE_ID"] == "ws-hermes-test"
+    assert platform["env"]["PLATFORM_URL"] == "http://127.0.0.1:8080"
+    assert not (configs / ".claude" / "settings.json").exists()
+    assert adapter.management_mcp_present(cfg) is True
 
 
 @pytest.mark.asyncio
