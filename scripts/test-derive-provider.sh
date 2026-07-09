@@ -57,6 +57,9 @@ assert_provider "HERMES_INFERENCE_PROVIDER=anthropic beats model slug" "anthropi
 assert_provider "minimax/M2 → minimax" "minimax" '
   HERMES_DEFAULT_MODEL=minimax/MiniMax-M2
 '
+assert_provider "minimax:M2 → minimax" "minimax" '
+  HERMES_DEFAULT_MODEL=minimax:MiniMax-M2
+'
 assert_provider "anthropic/claude → anthropic" "anthropic" '
   HERMES_DEFAULT_MODEL=anthropic/claude-sonnet-4-6
 '

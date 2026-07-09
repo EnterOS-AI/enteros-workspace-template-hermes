@@ -305,6 +305,16 @@ if [ "${MOLECULE_PLATFORM_LLM_ACTIVE:-}" = "1" ] && [ -n "${HERMES_CUSTOM_BASE_U
   fi
 fi
 
+# Molecule's BYOK registry uses `vendor:Model` for runtimes whose native UI
+# already reserves `vendor/Model` for platform-managed models. Hermes's existing
+# MiniMax slug grammar is slash-based, so normalize the BYOK colon form before
+# writing hermes-agent config.
+if [ "${PROVIDER}" = "minimax" ] && [[ "${DEFAULT_MODEL}" == minimax:* ]]; then
+  BEFORE="${DEFAULT_MODEL}"
+  DEFAULT_MODEL="minimax/${DEFAULT_MODEL#minimax:}"
+  echo "[start.sh] normalized MiniMax BYOK model ${BEFORE} -> ${DEFAULT_MODEL}"
+fi
+
 {
   echo "# Seeded by molecule template-hermes start.sh. Customize via"
   echo "# \`hermes config edit\` or by editing this file directly."

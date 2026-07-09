@@ -237,6 +237,16 @@ if [[ "${HERMES_CUSTOM_BASE_URL:-}" =~ ^https?://api\.openai\.com(/|$) ]]; then
   fi
 fi
 
+# Molecule's BYOK registry uses `vendor:Model` for runtimes whose native UI
+# already reserves `vendor/Model` for platform-managed models. Hermes's existing
+# MiniMax slug grammar is slash-based, so normalize the BYOK colon form before
+# writing hermes-agent config.
+if [ "${PROVIDER}" = "minimax" ] && [[ "${DEFAULT_MODEL}" == minimax:* ]]; then
+  BEFORE="${DEFAULT_MODEL}"
+  DEFAULT_MODEL="minimax/${DEFAULT_MODEL#minimax:}"
+  echo "[install.sh] normalized MiniMax BYOK model ${BEFORE} -> ${DEFAULT_MODEL}"
+fi
+
 {
   echo "# Seeded by template-hermes install.sh on $(date -u -Iseconds)"
   echo "# Rewritten each boot from HERMES_DEFAULT_MODEL + HERMES_INFERENCE_PROVIDER env."
