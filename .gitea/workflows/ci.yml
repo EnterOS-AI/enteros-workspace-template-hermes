@@ -394,7 +394,7 @@ jobs:
   validate:
     name: validate
     runs-on: ubuntu-latest
-    needs: [validate-static, validate-runtime, t4-conformance, shell-tests]
+    needs: [validate-static, validate-runtime, t4-conformance, conformance, shell-tests]
     timeout-minutes: 1
     steps:
       - name: Aggregate
@@ -402,10 +402,12 @@ jobs:
           static="${{ needs.validate-static.result }}"
           runtime="${{ needs.validate-runtime.result }}"
           t4="${{ needs.t4-conformance.result }}"
+          conformance="${{ needs.conformance.result }}"
           shell="${{ needs.shell-tests.result }}"
           echo "validate-static:  $static"
           echo "validate-runtime: $runtime"
           echo "t4-conformance:   $t4"
+          echo "conformance:      $conformance"
           echo "shell-tests:      $shell"
           if [ "$static" != "success" ]; then
             echo "::error::validate-static did not succeed: $static"
@@ -429,11 +431,19 @@ jobs:
               exit 1
             fi
           fi
+          # ADR-004 §4 adapter-socket conformance is a HARD gate: the SDK-owned
+          # AdapterConformance battery (tests/test_conformance.py) must pass on
+          # every push/PR so a hermes-only socket regression can't ship green
+          # (audit finding CI2). No fork carve-out — it runs no untrusted code.
+          if [ "$conformance" != "success" ]; then
+            echo "::error::conformance did not succeed: $conformance — ADR-004 adapter-socket conformance not green (audit CI2)."
+            exit 1
+          fi
           if [ "$shell" != "success" ] && [ "$shell" != "skipped" ]; then
             echo "::error::shell-tests did not succeed: $shell"
             exit 1
           fi
-          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4, shell=$shell)"
+          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4, conformance=$conformance, shell=$shell)"
 
   # New single-sentinel context for branch protection (internal#349).
   # Mirrors the existing `validate` aggregate but posts under the standardized
@@ -442,7 +452,7 @@ jobs:
   all-required:
     name: all-required
     runs-on: ubuntu-latest
-    needs: [validate-static, validate-runtime, t4-conformance, shell-tests]
+    needs: [validate-static, validate-runtime, t4-conformance, conformance, shell-tests]
     if: always()
     timeout-minutes: 1
     steps:
@@ -451,10 +461,12 @@ jobs:
           static="${{ needs.validate-static.result }}"
           runtime="${{ needs.validate-runtime.result }}"
           t4="${{ needs.t4-conformance.result }}"
+          conformance="${{ needs.conformance.result }}"
           shell="${{ needs.shell-tests.result }}"
           echo "validate-static:  $static"
           echo "validate-runtime: $runtime"
           echo "t4-conformance:   $t4"
+          echo "conformance:      $conformance"
           echo "shell-tests:      $shell"
           if [ "$static" != "success" ]; then
             echo "::error::validate-static did not succeed: $static"
@@ -477,11 +489,18 @@ jobs:
               exit 1
             fi
           fi
+          # ADR-004 §4 adapter-socket conformance — HARD gate (audit CI2). No
+          # fork carve-out: it executes no untrusted code, so it runs the same
+          # on fork PRs, internal PRs and main pushes.
+          if [ "$conformance" != "success" ]; then
+            echo "::error::conformance did not succeed: $conformance — ADR-004 adapter-socket conformance not green (audit CI2)."
+            exit 1
+          fi
           if [ "$shell" != "success" ] && [ "$shell" != "skipped" ]; then
             echo "::error::shell-tests did not succeed: $shell"
             exit 1
           fi
-          echo "::notice::All required CI jobs passed (static=$static, runtime=$runtime, t4=$t4, shell=$shell)"
+          echo "::notice::All required CI jobs passed (static=$static, runtime=$runtime, t4=$t4, conformance=$conformance, shell=$shell)"
 
   shell-tests:
     # Shell-level unit tests for scripts/*.sh. Pre-existing
@@ -508,3 +527,48 @@ jobs:
       - run: bash scripts/test-install-prefix-strip.sh
       - run: bash scripts/test-load-workspace-config.sh
       - run: bash scripts/test-mcp-configs-dir.sh
+
+  # --- ADR-004 §4 adapter-socket conformance (audit finding CI2) ---
+  # This repo SHIPS tests/test_conformance.py — a ~5-line subclass of the
+  # SDK-owned battery molecule_plugin.adapter_conformance.AdapterConformance
+  # pointed at this repo's Adapter — but until now NO CI job installed the SDK
+  # or ran pytest, so a hermes-only adapter-socket regression (path/render/
+  # present/enumerate/persona seam) shipped GREEN. The other three templates
+  # (codex/openclaw/claude-code) already run their conformance suite; this job
+  # closes the hermes gap and is wired into BOTH required-check aggregates
+  # (`validate` + `all-required`) so branch protection actually enforces it.
+  #
+  # SCOPE: this job runs the conformance test SPECIFICALLY, not the whole
+  # tests/ dir. The adapter-socket suite (16 cases) is the CI2 target and is
+  # green. tests/test_executor_plugin_path.py is intentionally NOT gated here
+  # — it is unrelated to the adapter socket and currently fails independently
+  # of this change (a2a extract_message_text / MagicMock-context version
+  # sensitivity); gating it would make CI red for reasons outside CI2. File a
+  # separate follow-up to fix + wire the executor tests. The other adapter-
+  # adjacent suites (test_adapter/test_registry_projection/test_release_
+  # contracts/test_tool_activity_liveness) all pass and can be folded in by
+  # that follow-up once the executor suite is fixed.
+  conformance:
+    name: Adapter-socket conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The conformance test imports the hermes Adapter (adapter.py), which
+      # imports molecule_runtime.adapters.base, so the runtime dist must be
+      # present. Install it exactly like validate-runtime does: explicit
+      # --extra-index-url for the private Gitea dist (hermetic dep policy —
+      # no global PIP_INDEX_URL; see the env: block), never routing public
+      # tooling at the private index.
+      - if: hashFiles('requirements.txt') != ''
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
+      # requirements-dev.txt pins pytest + pytest-asyncio and the molecule-ai-sdk
+      # (molecule_plugin) that ships the AdapterConformance battery that
+      # tests/test_conformance.py inherits. The SDK is a git-main pin there, so
+      # the private-index --extra-index-url is applied for its own private
+      # transitive deps.
+      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements-dev.txt
+      - run: python3 -m pytest tests/test_conformance.py -v
