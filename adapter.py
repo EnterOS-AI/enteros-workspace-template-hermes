@@ -423,6 +423,50 @@ class HermesAgentAdapter(BaseAdapter):
         target.write_text(body, encoding="utf-8")
         return target
 
+    def mcp_launch_env(self, config: AdapterConfig) -> dict:
+        """ADR-004 socket — DYNAMIC launch-env overlay for spawned MCP servers.
+
+        THE BUG this fixes: the hermes image bundles Node 22 under
+        ``$HERMES_HOME/node/bin`` (node/npm/npx, installed by the hermes installer)
+        but that dir is OFF the ``molecule-runtime`` process PATH — PATH is just the
+        system dirs. So when the runtime spawns the management MCP as a stdio child
+        (``npx @molecule-ai/mcp-server``) the child cannot resolve ``npx``/``node``,
+        the server never launches, ``loaded_mcp_tools`` never enumerates, the online
+        gate never flips, and the concierge is stuck "provisioning" forever.
+
+        The prior fix baked ``export PATH=…/.hermes/node/bin:$PATH`` into the
+        Dockerfile — a STATIC image-build hardcode. ADR-004 says the ADAPTER owns
+        this runtime-specific concern and resolves it DYNAMICALLY at launch: here we
+        resolve the bundled node bin dir the SAME HERMES_HOME-or-HOME way the rest of
+        this adapter resolves hermes' home (so node + MCP config + persona all agree
+        on one home), VERIFY node/npx actually exist there, and only then prepend it
+        to a PATH overlay merged into each spawned MCP server's env. If the bin dir
+        or the binaries are absent (e.g. a system-node image), we return ``{}`` — a
+        clean no-op that lets the child inherit the process PATH unchanged. Nothing
+        static, nothing baked; the engine names no runtime and reads no path.
+        """
+        home = os.environ.get("HERMES_HOME") or os.path.join(
+            os.path.expanduser("~"), ".hermes"
+        )
+        node_bin = os.path.join(home, "node", "bin")
+        # Verify the interpreter is actually present before injecting — never claim a
+        # PATH that doesn't resolve (that would just move the failure, not fix it).
+        if not all(
+            os.path.exists(os.path.join(node_bin, exe)) for exe in ("node", "npx")
+        ):
+            logger.info(
+                "mcp_launch_env: no bundled node/npx under %s — inheriting process "
+                "PATH unchanged (system node assumed)", node_bin,
+            )
+            return {}
+        existing = os.environ.get("PATH", "")
+        new_path = f"{node_bin}:{existing}" if existing else node_bin
+        logger.info(
+            "mcp_launch_env: prepending hermes bundled node bin dir %s to the "
+            "spawned MCP server PATH (was off the process PATH)", node_bin,
+        )
+        return {"PATH": new_path}
+
     async def enumerate_loaded_mcp_tools(
         self, config: AdapterConfig
     ) -> "list[str] | None":
@@ -449,7 +493,12 @@ class HermesAgentAdapter(BaseAdapter):
         specs = self._read_hermes_mcp_servers()
         if not specs:
             return None
-        return await enumerate_from_specs_async(specs)
+        # Pass the dynamic launch-env overlay so the spawned management MCP child
+        # can resolve hermes' bundled node/npx (off the process PATH) — the fix for
+        # the stuck-"provisioning" concierge, resolved at launch, not baked.
+        return await enumerate_from_specs_async(
+            specs, launch_env=self.mcp_launch_env(config)
+        )
 
     @staticmethod
     def _read_hermes_mcp_servers() -> dict:
