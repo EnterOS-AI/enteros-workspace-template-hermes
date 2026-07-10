@@ -35,6 +35,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The publish job uses shared host-Docker state and fixed local tags. Serialize
+# every Hermes publish so candidate cleanup cannot race another run.
+concurrency:
+  group: publish-image-hermes
+  cancel-in-progress: false
+
 env:
   # Belt-and-suspenders for act_runner runners regenerated without the
   # config.yaml envs block. (feedback_act_runner_github_server_url)
@@ -199,6 +205,25 @@ jobs:
           }
           echo "Docker daemon OK"
 
+      - name: Reclaim stale runner-local Hermes candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t stale_refs < <(
+            docker image ls \
+              --filter "reference=${PUSH_IMAGE_NAME}:sha-*" \
+              --format '{{.Repository}}:{{.Tag}}'
+          )
+          if docker image inspect "${PUSH_IMAGE_NAME}:latest" >/dev/null 2>&1; then
+            stale_refs+=("${PUSH_IMAGE_NAME}:latest")
+          fi
+          if [ "${#stale_refs[@]}" -gt 0 ]; then
+            printf 'Removing stale local candidate: %s\n' "${stale_refs[@]}"
+            docker image rm -f "${stale_refs[@]}"
+          fi
+          # Do not globally prune images, volumes, containers, or BuildKit
+          # caches used by other jobs on this shared runner.
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
@@ -262,11 +287,28 @@ jobs:
           set -euo pipefail
           SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
           LATEST_REF="${PUSH_IMAGE_NAME}:latest"
+          push_with_retry() {
+            local ref="$1" attempt output
+            for attempt in 1 2 3; do
+              if output="$(docker push "${ref}" 2>&1)"; then
+                printf '%s\n' "${output}"
+                return 0
+              fi
+              printf '%s\n' "${output}" >&2
+              if [ "${attempt}" -eq 3 ]; then
+                echo "::error::docker push ${ref} failed after ${attempt} attempts" >&2
+                return 1
+              fi
+              delay=$((attempt * 10))
+              echo "::warning::docker push ${ref} failed (attempt ${attempt}/3); retrying in ${delay}s" >&2
+              sleep "${delay}"
+            done
+          }
           # Push the IMMUTABLE sha tag FIRST and derive the pin digest from it;
           # only advance the floating :latest AFTER the sha publish + digest are
           # confirmed. A partial publish (latest ok, sha/digest fails) must never
           # leave :latest ahead of a promoted sha pin. (review #141/#201)
-          PUSHOUT="$(docker push "${SHA_REF}")"
+          PUSHOUT="$(push_with_retry "${SHA_REF}")"
           printf '%s\n' "${PUSHOUT}"
           # docker push stdout is not a stable API: prefer its digest line, but
           # fall back to an inspect of the just-pushed immutable ref so a missing/
@@ -281,9 +323,17 @@ jobs:
             exit 1
           fi
           docker tag "${SHA_REF}" "${LATEST_REF}"
-          docker push "${LATEST_REF}"
+          push_with_retry "${LATEST_REF}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST} (pins as ${IMAGE_NAME}@${DIGEST})"
+
+      - name: Release runner-local candidate image
+        if: always()
+        shell: bash
+        run: |
+          docker image rm -f \
+            "${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}" \
+            "${PUSH_IMAGE_NAME}:latest" >/dev/null 2>&1 || true
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
