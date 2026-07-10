@@ -325,13 +325,22 @@ jobs:
           fi
           docker tag "${SHA_REF}" "${LATEST_REF}"
           push_with_retry "${LATEST_REF}"
-          # ci-meta and the local control plane share this host Docker daemon.
-          # Keep the smoke-tested image under the provisioner's existing local
-          # fallback so a fresh concierge does not cold-pull multiple GiB inside
-          # core's 120-second control-plane request timeout.
-          docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            # ci-meta and the local control plane share this host Docker daemon.
+            # Keep the smoke-tested main image under the provisioner's existing
+            # local fallback. Branch dispatches must never mutate the live tag.
+            docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"
+            LOCAL_IMAGE_META="$(docker image inspect --format '{{.Id}}|{{json .RepoDigests}}' "${LOCAL_RUNTIME_REF}")"
+            if ! printf '%s\n' "${LOCAL_IMAGE_META}" | grep -Fq "@${DIGEST}"; then
+              echo "::error::${LOCAL_RUNTIME_REF} does not record the pushed digest ${DIGEST}"
+              exit 1
+            fi
+            echo "::notice::retained ${LOCAL_RUNTIME_REF} locally with verified digest ${DIGEST}"
+          else
+            echo "::notice::skipped local runtime retention for non-main ref ${GITHUB_REF}"
+          fi
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST}; retained ${LOCAL_RUNTIME_REF} locally (pins as ${IMAGE_NAME}@${DIGEST})"
+          echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST} (pins as ${IMAGE_NAME}@${DIGEST})"
 
       - name: Release runner-local candidate image
         if: always()
