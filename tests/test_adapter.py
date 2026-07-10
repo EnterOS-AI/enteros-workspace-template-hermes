@@ -425,3 +425,117 @@ async def test_smoke_mode_never_runs_plugin_installs(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "install_plugins_via_registry", _boom)
     cfg = AdapterConfig(model="hermes-test", config_path=str(tmp_path / "configs"))
     await adapter.setup(cfg)
+
+
+# ---------------------------------------------------------------------------
+# runtime#181 — hermes owns MCP-tool discovery (enumerate_loaded_mcp_tools).
+# The RUNTIME CONTRACT default reads a .claude settings.json hermes doesn't
+# have; hermes overrides it to read its own ~/.hermes/config.yaml mcp_servers
+# block, so a concierge's stdio molecule-platform management MCP is enumerated
+# and mcp__molecule-platform__provision_workspace reaches the first heartbeat.
+# ---------------------------------------------------------------------------
+
+def _write_hermes_config(home, servers):
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(yaml.safe_dump({"mcp_servers": servers}))
+
+
+def test_read_hermes_mcp_servers_keeps_only_stdio(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    _write_hermes_config(
+        home,
+        {
+            # url-transport a2a sidecar — NOT stdio-spawnable, must be skipped
+            "molecule": {"url": "http://127.0.0.1:9100/mcp"},
+            # stdio management MCP — the gate-relevant one
+            "molecule-platform": {
+                "command": "npx",
+                "args": ["-y", "--prefer-offline", "@molecule-ai/mcp-server@1.8.2"],
+                "env": {"MOLECULE_MCP_MODE": "management"},
+            },
+        },
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    specs = HermesAgentAdapter._read_hermes_mcp_servers()
+    assert list(specs) == ["molecule-platform"], "url sidecar must be dropped"
+    assert specs["molecule-platform"]["command"] == "npx"
+
+
+def test_read_hermes_mcp_servers_missing_file_returns_empty(monkeypatch, tmp_path):
+    # non-concierge / pre-write: no config.yaml -> {} (never raises)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "nope"))
+    assert HermesAgentAdapter._read_hermes_mcp_servers() == {}
+
+
+def test_read_hermes_mcp_servers_url_only_returns_empty(monkeypatch, tmp_path):
+    # an ordinary tenant hermes: only the url a2a server, no admin token, no
+    # molecule-platform. Nothing stdio-probable -> {} -> enumeration None.
+    home = tmp_path / ".hermes"
+    _write_hermes_config(home, {"molecule": {"url": "http://127.0.0.1:9100/mcp"}})
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert HermesAgentAdapter._read_hermes_mcp_servers() == {}
+
+
+def test_read_hermes_mcp_servers_bad_yaml_returns_empty(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("mcp_servers: [this: is: not: valid")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert HermesAgentAdapter._read_hermes_mcp_servers() == {}
+
+
+@pytest.mark.asyncio
+async def test_enumerate_routes_stdio_specs_to_probe_engine(monkeypatch, tmp_path):
+    """The override reads config.yaml and hands the stdio specs to the shared
+    boot-safe probe engine (enumerate_from_specs_async) — returning the loaded
+    tool ids the online gate keys on."""
+    home = tmp_path / ".hermes"
+    _write_hermes_config(
+        home,
+        {
+            "molecule": {"url": "http://127.0.0.1:9100/mcp"},
+            "molecule-platform": {
+                "command": "npx",
+                "args": ["-y", "@molecule-ai/mcp-server"],
+                "env": {"MOLECULE_MCP_MODE": "management"},
+            },
+        },
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    captured = {}
+
+    async def _fake_probe(servers):
+        captured["servers"] = servers
+        return ["mcp__molecule-platform__provision_workspace"]
+
+    import molecule_runtime.loaded_mcp_tools_probe as probe
+    monkeypatch.setattr(probe, "enumerate_from_specs_async", _fake_probe)
+
+    out = await HermesAgentAdapter().enumerate_loaded_mcp_tools(
+        AdapterConfig(model="hermes-test")
+    )
+    assert out == ["mcp__molecule-platform__provision_workspace"]
+    # only the stdio server reached the engine
+    assert list(captured["servers"]) == ["molecule-platform"]
+
+
+@pytest.mark.asyncio
+async def test_enumerate_returns_none_when_no_stdio_server(monkeypatch, tmp_path):
+    """A non-concierge hermes (url sidecar only) enumerates to None — the
+    producer stays unset and core's grace window applies (no false tools)."""
+    home = tmp_path / ".hermes"
+    _write_hermes_config(home, {"molecule": {"url": "http://127.0.0.1:9100/mcp"}})
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    async def _boom(servers):  # pragma: no cover - must not be called
+        raise AssertionError("probe engine must not run with no stdio specs")
+
+    import molecule_runtime.loaded_mcp_tools_probe as probe
+    monkeypatch.setattr(probe, "enumerate_from_specs_async", _boom)
+
+    out = await HermesAgentAdapter().enumerate_loaded_mcp_tools(
+        AdapterConfig(model="hermes-test")
+    )
+    assert out is None
