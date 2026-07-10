@@ -527,6 +527,7 @@ jobs:
       - run: bash scripts/test-install-prefix-strip.sh
       - run: bash scripts/test-load-workspace-config.sh
       - run: bash scripts/test-mcp-configs-dir.sh
+      - run: bash scripts/test-publish-local-runtime-cache.sh
 
   # --- ADR-004 §4 adapter-socket conformance (audit finding CI2) ---
   # This repo SHIPS tests/test_conformance.py — a ~5-line subclass of the

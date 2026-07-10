@@ -287,6 +287,7 @@ jobs:
           set -euo pipefail
           SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
           LATEST_REF="${PUSH_IMAGE_NAME}:latest"
+          LOCAL_RUNTIME_REF="workspace-template-hermes:latest"
           push_with_retry() {
             local ref="$1" attempt output
             for attempt in 1 2 3; do
@@ -324,8 +325,13 @@ jobs:
           fi
           docker tag "${SHA_REF}" "${LATEST_REF}"
           push_with_retry "${LATEST_REF}"
+          # ci-meta and the local control plane share this host Docker daemon.
+          # Keep the smoke-tested image under the provisioner's existing local
+          # fallback so a fresh concierge does not cold-pull multiple GiB inside
+          # core's 120-second control-plane request timeout.
+          docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST} (pins as ${IMAGE_NAME}@${DIGEST})"
+          echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST}; retained ${LOCAL_RUNTIME_REF} locally (pins as ${IMAGE_NAME}@${DIGEST})"
 
       - name: Release runner-local candidate image
         if: always()
