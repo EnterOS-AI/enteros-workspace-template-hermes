@@ -340,6 +340,11 @@ jobs:
           docker image rm -f \
             "${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}" \
             "${PUSH_IMAGE_NAME}:latest" >/dev/null 2>&1 || true
+          # Moving workspace-template-hermes:latest leaves the previous image
+          # dangling once no container references it. Reclaim only images built
+          # by this Hermes repository; never prune shared runner images globally.
+          docker image prune -f \
+            --filter "label=org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}" >/dev/null || true
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to

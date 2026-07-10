@@ -17,6 +17,8 @@ require_line() {
 # this tag prevents a multi-gigabyte pull from exceeding core's 120s CP timeout.
 require_line '          LOCAL_RUNTIME_REF="workspace-template-hermes:latest"'
 require_line '          docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"'
+require_line '          docker image prune -f \'
+require_line '            --filter "label=org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}" >/dev/null || true'
 
 # The generic post-job cleanup must remain scoped to the temporary registry
 # aliases. Deleting LOCAL_RUNTIME_REF here reintroduces the cold-pull failure.
