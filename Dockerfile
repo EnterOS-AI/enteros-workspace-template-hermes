@@ -155,6 +155,20 @@ RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && 
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir \
       "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
 
+# --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
+# The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
+# in a HARD-deadline enumeration spawn at boot; without a warm cache it cold-pulls
+# -> ETARGET / CF-WAF throttle -> #1027 "management MCP FAILED TO LAUNCH" fail-close
+# (the launch-side of RCA #2970). The bake LOGIC + the pinned version live ONCE in
+# the base runtime (molecule_runtime, pinned to the SDK contract
+# management_mcp_server block) — this template just DELEGATES to it (ADR-004: SDK
+# contract -> base-runtime default -> per-adapter override-if-needed; no per-template
+# bake fork). hermes ships node under ~/.hermes/node/bin (not global), so we point
+# the helper at it via MOLECULE_PREBAKE_NODE_BIN — the one sanctioned override. The
+# helper's build-time OFFLINE self-check fails the image if the bake is broken.
+RUN MOLECULE_PREBAKE_NODE_BIN=/home/agent/.hermes/node/bin \
+    bash "$(python3 -c 'import molecule_runtime, os; print(os.path.dirname(molecule_runtime.__file__))')/scripts/prebake-mgmt-mcp.sh"
+
 USER root
 WORKDIR /app
 
