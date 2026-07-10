@@ -13,6 +13,7 @@ Coverage targets the public adapter surface:
 from __future__ import annotations
 
 import json
+import os
 import socket
 from typing import Any
 
@@ -503,11 +504,18 @@ async def test_enumerate_routes_stdio_specs_to_probe_engine(monkeypatch, tmp_pat
         },
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Make the bundled node/npx resolvable so mcp_launch_env injects a PATH overlay.
+    node_bin = home / "node" / "bin"
+    node_bin.mkdir(parents=True)
+    for exe in ("node", "npx"):
+        (node_bin / exe).write_text("#!/bin/sh\n:\n")
+        (node_bin / exe).chmod(0o755)
 
     captured = {}
 
-    async def _fake_probe(servers):
+    async def _fake_probe(servers, launch_env=None):
         captured["servers"] = servers
+        captured["launch_env"] = launch_env
         return ["mcp__molecule-platform__provision_workspace"]
 
     import molecule_runtime.loaded_mcp_tools_probe as probe
@@ -519,6 +527,9 @@ async def test_enumerate_routes_stdio_specs_to_probe_engine(monkeypatch, tmp_pat
     assert out == ["mcp__molecule-platform__provision_workspace"]
     # only the stdio server reached the engine
     assert list(captured["servers"]) == ["molecule-platform"]
+    # the dynamic launch-env overlay was threaded into the probe spawn, prepending
+    # the bundled node bin dir to PATH (the off-PATH node/npx fix)
+    assert str(node_bin) in captured["launch_env"]["PATH"].split(":")[0]
 
 
 @pytest.mark.asyncio
@@ -529,7 +540,7 @@ async def test_enumerate_returns_none_when_no_stdio_server(monkeypatch, tmp_path
     _write_hermes_config(home, {"molecule": {"url": "http://127.0.0.1:9100/mcp"}})
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    async def _boom(servers):  # pragma: no cover - must not be called
+    async def _boom(servers, launch_env=None):  # pragma: no cover - must not be called
         raise AssertionError("probe engine must not run with no stdio specs")
 
     import molecule_runtime.loaded_mcp_tools_probe as probe
@@ -539,3 +550,76 @@ async def test_enumerate_returns_none_when_no_stdio_server(monkeypatch, tmp_path
         AdapterConfig(model="hermes-test")
     )
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# ADR-004 mcp_launch_env socket — DYNAMIC, adapter-resolved launch env.
+#
+# The live bug: the hermes image bundles Node 22 under $HERMES_HOME/node/bin but
+# that dir is OFF the runtime process PATH, so a spawned `npx @molecule-ai/
+# mcp-server` child can't resolve node/npx -> the management MCP never launches ->
+# the concierge is stuck "provisioning". These prove the override resolves it
+# DYNAMICALLY at launch (superseding the static Dockerfile PATH hardcode).
+# ---------------------------------------------------------------------------
+
+
+def _make_bundled_node(home):
+    """Create fake bundled node/npx under ``home/node/bin`` and return the bin dir."""
+    node_bin = home / "node" / "bin"
+    node_bin.mkdir(parents=True)
+    for exe in ("node", "npx"):
+        (node_bin / exe).write_text("#!/bin/sh\n:\n")
+        (node_bin / exe).chmod(0o755)
+    return node_bin
+
+
+def test_mcp_launch_env_prepends_bundled_node_bin_when_present(monkeypatch, tmp_path):
+    """With node/npx bundled under $HERMES_HOME/node/bin (off the process PATH), the
+    override returns a PATH overlay with that bin dir PREPENDED — the fix that makes
+    the off-PATH interpreter resolvable for the spawned management MCP."""
+    home = tmp_path / ".hermes"
+    node_bin = _make_bundled_node(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")  # node bin NOT on it
+
+    env = HermesAgentAdapter().mcp_launch_env(AdapterConfig(model="hermes-test"))
+
+    assert "PATH" in env
+    assert env["PATH"].split(":")[0] == str(node_bin)
+    assert env["PATH"].endswith("/usr/bin:/bin")
+    # dynamic resolution only — the process PATH itself is never mutated
+    assert str(node_bin) not in os.environ["PATH"]
+
+
+def test_mcp_launch_env_noop_when_no_bundled_node(monkeypatch, tmp_path):
+    """No bundled node under $HERMES_HOME (a system-node image) -> {} no-op, so the
+    spawned child inherits the process PATH unchanged (never a fake PATH claim)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert HermesAgentAdapter().mcp_launch_env(AdapterConfig(model="hermes-test")) == {}
+
+
+def test_mcp_launch_env_noop_when_only_node_present_not_npx(monkeypatch, tmp_path):
+    """Both node AND npx must be present — a partial install (node only) is treated
+    as absent so we never inject a PATH that still can't launch npx-based servers."""
+    home = tmp_path / ".hermes"
+    node_bin = home / "node" / "bin"
+    node_bin.mkdir(parents=True)
+    (node_bin / "node").write_text("#!/bin/sh\n:\n")
+    (node_bin / "node").chmod(0o755)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert HermesAgentAdapter().mcp_launch_env(AdapterConfig(model="hermes-test")) == {}
+
+
+def test_mcp_launch_env_resolves_via_hermes_home_default_when_unset(monkeypatch, tmp_path):
+    """HERMES_HOME unset -> resolves ~/.hermes (HOME-based), the SAME resolution the
+    rest of the adapter uses, so node + MCP config + persona share one home."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    node_bin = _make_bundled_node(tmp_path / ".hermes")
+
+    env = HermesAgentAdapter().mcp_launch_env(AdapterConfig(model="hermes-test"))
+    assert env["PATH"].split(":")[0] == str(node_bin)
