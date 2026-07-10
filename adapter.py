@@ -15,9 +15,12 @@ docs/PLANNING.md for the rewrite rationale.
 """
 from __future__ import annotations
 
+import logging
 import os
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig, RuntimeCapabilities
+
+logger = logging.getLogger(__name__)
 
 
 class HermesAgentAdapter(BaseAdapter):
@@ -147,6 +150,16 @@ class HermesAgentAdapter(BaseAdapter):
             plugin_prompts=list(getattr(plugins, "prompt_fragments", []) or []),
         )
 
+        # Materialize the identity to ~/.hermes/SOUL.md (hermes-agent's Layer-1
+        # Agent Identity). REQUIRED, not optional: the a2a-platform transport
+        # forwards to hermes-agent WITHOUT config.system_prompt, so SOUL.md is the
+        # only channel that makes a concierge speak as the Org Concierge on that
+        # transport. Done here (after config.system_prompt is assembled, before the
+        # workspace serves) so the file exists before the first a2a session caches
+        # its prompt. The base flow never invoked this socket for hermes (the
+        # "hermes skips _common_setup" gap) — call it explicitly.
+        self.materialize_persona(config)
+
         # Boot-smoke contract (molecule-core#2275): start.sh's smoke-mode
         # branch exec's molecule-runtime without spawning the gateway,
         # so neither the plugin port nor :8642 is listening. Skip the
@@ -229,6 +242,249 @@ class HermesAgentAdapter(BaseAdapter):
         executor = HermesAgentProxyExecutor(config)
         await executor.start()
         return executor
+
+    # ------------------------------------------------------------------
+    # ADR-004 adapter-socket: the MCP-config seam (native path / render /
+    # present / read), OWNED by this adapter.
+    # ------------------------------------------------------------------
+    # Per ADR-004 §3 the per-runtime shape moves OUT of the shared engine's
+    # ``mcp_render._RUNTIME_SPECS`` dispatch table and INTO the adapter. These
+    # methods are FAITHFUL copies of the hermes entry that lives in the engine
+    # today (``_hermes_path`` / ``render_hermes_config`` / ``_hermes_config_has``
+    # / ``_read_hermes_mcp_servers``) — byte-identical native-config output is
+    # mandatory (the golden-parity invariant), so the logic is copied verbatim,
+    # not "improved". During this additive phase BOTH the engine table and this
+    # adapter render identically; the engine phase later deletes the duplication.
+
+    # Hermes reads its native MCP servers from ~/.hermes/config.yaml under a
+    # top-level ``mcp_servers:`` map (NOT claude's ``mcpServers``). Kept in
+    # LOCKSTEP with _read_hermes_mcp_servers (same HERMES_HOME-or-HOME
+    # resolution) so a server the renderer writes is byte-for-byte the file the
+    # adapter enumerates.
+    _HERMES_MCP_KEY = "mcp_servers"
+
+    @staticmethod
+    def _hermes_config_path() -> str:
+        """Absolute path to hermes' native ``~/.hermes/config.yaml``.
+
+        HERMES_HOME overrides the dir; the container sets HERMES_HOME=/tmp/.hermes
+        with HOME=/tmp so both agree. Mirrors the engine's ``_hermes_path`` and the
+        home resolution ``_read_hermes_mcp_servers`` uses.
+        """
+        home = os.environ.get("HERMES_HOME") or os.path.join(
+            os.path.expanduser("~"), ".hermes"
+        )
+        return os.path.join(home, "config.yaml")
+
+    def mcp_settings_path(self, config: AdapterConfig) -> str:
+        """ADR-004 socket — native MCP-config file THIS runtime reads from.
+
+        hermes ignores ``config.config_path`` and resolves its own home
+        (HERMES_HOME-or-HOME), so the arg is unused but the signature is uniform.
+        """
+        return self._hermes_config_path()
+
+    def register_mcp_server_hook(
+        self, config: AdapterConfig, name: str, spec: dict
+    ) -> None:
+        """ADR-004 socket — additively merge ``name -> spec`` into hermes' native
+        ``~/.hermes/config.yaml`` ``mcp_servers`` map. Idempotent; preserves the
+        rest of the file (the ``model`` block, the a2a ``molecule`` url sidecar,
+        any other server or hand-written key).
+
+        FAITHFUL copy of the engine's ``render_hermes_config`` — writes the stdio
+        descriptor (``{command, args?, env?}``) verbatim under
+        ``mcp_servers.<name>`` and re-serializes with ``yaml.safe_dump(...,
+        sort_keys=False)`` (byte-identical to the engine renderer). The base hook
+        enriches the privileged management-MCP spec via ``inject_privileged_env``
+        BEFORE writing (no-op for non-management names; idempotent;
+        descriptor-wins), preserved here so a direct caller (the
+        ensure_management_mcp self-heal) gets the same enrichment as the install
+        funnel.
+        """
+        import yaml
+
+        from molecule_runtime.privileged_mcp_env import inject_privileged_env
+
+        # Belt-and-suspenders: enrich the privileged MCP spec for a caller that
+        # invokes this hook DIRECTLY. No-op for non-management names; idempotent +
+        # descriptor-wins. Matches BaseAdapter.register_mcp_server_hook.
+        spec = inject_privileged_env(name, spec)
+
+        from pathlib import Path
+
+        settings_path = Path(self._hermes_config_path())
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if settings_path.is_file():
+            try:
+                data = yaml.safe_load(settings_path.read_text())
+            except (OSError, yaml.YAMLError):
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+        else:
+            data = {}
+
+        servers = data.get(self._HERMES_MCP_KEY)
+        if not isinstance(servers, dict):
+            servers = {}
+        servers[name] = spec
+        data[self._HERMES_MCP_KEY] = servers
+
+        settings_path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+    def management_mcp_present(self, config: AdapterConfig) -> bool:
+        """ADR-004 socket — True when hermes' native ``~/.hermes/config.yaml``
+        declares the management ``molecule-platform`` MCP under ``mcp_servers``.
+
+        FAITHFUL copy of the engine's ``_hermes_config_has``. Fail-CLOSED by
+        construction: a missing / unreadable / malformed / structurally-unexpected
+        config yields ``False``, so a genuinely MCP-less hermes concierge stays
+        degraded at the RCA#2970 gate.
+        """
+        import yaml
+
+        from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
+
+        try:
+            data = yaml.safe_load(open(self._hermes_config_path(), encoding="utf-8").read())
+        except (OSError, yaml.YAMLError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        servers = data.get(self._HERMES_MCP_KEY)
+        return isinstance(servers, dict) and MANAGEMENT_MCP_NAME in servers
+
+    def materialize_persona(self, config: AdapterConfig) -> "object | None":
+        """ADR-004 socket — write hermes' identity to ``~/.hermes/SOUL.md``.
+
+        hermes-agent reads its **Layer-1 Agent Identity** from
+        ``$HERMES_HOME/SOUL.md`` (pinned against NousResearch/hermes-agent's own
+        prompt-assembly doc, verified live). This is the ONLY channel that reaches
+        the model on the **a2a-platform transport** (``MOLECULE_A2A_PLATFORM_ENABLED
+        =true``), which forwards to hermes-agent's ``/a2a/inbound`` WITHOUT
+        ``config.system_prompt`` — so a concierge relying on the ``{role:system}``
+        message alone boots as the base model ("I'm MiniMax-M3") instead of the Org
+        Concierge. Materializing SOUL.md fixes that: hermes-agent adopts the
+        identity for every session.
+
+        Source is ``config.system_prompt`` — the base-assembled prompt, which for a
+        concierge carries the persona via ``plugin_rules`` (the management plugin's
+        ``rules/concierge-identity.md``); ``prompt_files`` is empty for a concierge,
+        so ``read_canonical_persona`` alone would miss it. Runs in ``setup()`` before
+        the workspace serves, so SOUL.md exists before the first a2a session builds
+        its (cached) system prompt. Never bricks boot — a persona is not a
+        privileged capability.
+
+        ADR-004: the SOUL.md writer is OWNED by this adapter (was
+        ``persona_render.materialize_hermes_persona`` dispatch). It resolves the
+        HOME-based ``$HERMES_HOME/SOUL.md`` (HERMES_HOME-or-HOME, the SAME
+        resolution ``_read_hermes_mcp_servers`` uses) and writes byte-identical to
+        the engine's ``_write_persona_file`` (parents created, trailing newline
+        appended only when absent). ``read_canonical_persona`` is the one generic,
+        runtime-name-free helper the engine keeps."""
+        from molecule_runtime.persona_render import read_canonical_persona
+
+        persona = (config.system_prompt or "").strip() or (
+            read_canonical_persona(config.config_path, config.prompt_files) or ""
+        ).strip()
+        if not persona:
+            return None
+        try:
+            path = self._materialize_hermes_soul(persona)
+            logger.info("materialize_persona: wrote hermes identity to %s", path)
+            return path
+        except Exception:  # noqa: BLE001 — identity is not privileged; never brick boot
+            logger.warning(
+                "materialize_persona: failed to write ~/.hermes/SOUL.md", exc_info=True
+            )
+            return None
+
+    @staticmethod
+    def _materialize_hermes_soul(persona: str) -> "object":
+        """Write ``persona`` to hermes-agent's Layer-1 identity file
+        ``$HERMES_HOME/SOUL.md`` (~/.hermes/SOUL.md); returns the path written.
+
+        ADR-004 adapter-owned (faithful copy of the engine's
+        ``persona_render.materialize_hermes_persona`` + ``_hermes_persona_path`` +
+        ``_write_persona_file`` — byte-identical output is the golden-parity
+        invariant). ``config_path`` is unused: the identity file is HOME-based,
+        resolved the same HERMES_HOME-or-HOME way as ``_read_hermes_mcp_servers``
+        so persona + MCP config resolve against the same hermes home."""
+        from pathlib import Path
+
+        home = os.environ.get("HERMES_HOME") or os.path.join(
+            os.path.expanduser("~"), ".hermes"
+        )
+        target = Path(home) / "SOUL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = persona if persona.endswith("\n") else persona + "\n"
+        target.write_text(body, encoding="utf-8")
+        return target
+
+    async def enumerate_loaded_mcp_tools(
+        self, config: AdapterConfig
+    ) -> "list[str] | None":
+        """runtime#181 — hermes owns MCP-tool discovery for its OWN config shape.
+
+        The RUNTIME CONTRACT default (adapter_base) reads a ``.claude``-style
+        ``settings.json``; hermes has none. hermes declares its MCP servers in its
+        native ``~/.hermes/config.yaml`` ``mcp_servers:`` block (written by
+        start.sh). Override the contract to read THAT file and hand the resolved
+        ``{name: spec}`` map to the shared boot-safe probe engine, so a hermes
+        concierge's stdio ``molecule-platform`` management MCP is enumerated and
+        the ``mcp__molecule-platform__provision_workspace`` gate id reaches the
+        first heartbeat WITHOUT a user turn — the same online-without-a-turn
+        behaviour the base default gives claude/codex/openclaw, but keyed off
+        hermes' own config file (core's per-runtime enumeration switch previously
+        mapped hermes to ``{}`` — the runtime#181 false-degraded root cause).
+
+        Tri-state + never-raise are inherited from ``enumerate_from_specs_async``:
+        ``None`` when nothing is declared/observed, ``[]`` for a zero-tool server,
+        ``[ids]`` otherwise.
+        """
+        from molecule_runtime.loaded_mcp_tools_probe import enumerate_from_specs_async
+
+        specs = self._read_hermes_mcp_servers()
+        if not specs:
+            return None
+        return await enumerate_from_specs_async(specs)
+
+    @staticmethod
+    def _read_hermes_mcp_servers() -> dict:
+        """Parse hermes' native ``~/.hermes/config.yaml`` ``mcp_servers:`` block
+        into the runtime-agnostic ``{name: {command, args?, env?}}`` descriptor
+        map, keeping only STDIO (command-based) servers.
+
+        The url-transport a2a sidecar (``molecule`` -> ``http://127.0.0.1:9100/mcp``)
+        can't be stdio-spawned, so it's skipped — the online gate keys on the stdio
+        ``molecule-platform`` management server's ``provision_workspace`` regardless.
+        Returns ``{}`` on any missing-file / parse error, or when no stdio server is
+        declared (an ordinary, non-concierge hermes workspace). Never raises — a
+        discovery failure must fall through to the grace window, never crash boot.
+        """
+        import yaml
+
+        home = os.environ.get("HERMES_HOME") or os.path.join(
+            os.path.expanduser("~"), ".hermes"
+        )
+        path = os.path.join(home, "config.yaml")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except (OSError, yaml.YAMLError):
+            return {}
+        servers = data.get("mcp_servers") if isinstance(data, dict) else None
+        if not isinstance(servers, dict):
+            return {}
+        return {
+            name: spec
+            for name, spec in servers.items()
+            if isinstance(spec, dict)
+            and isinstance(spec.get("command"), str)
+            and spec["command"].strip()
+        }
 
 
 Adapter = HermesAgentAdapter
