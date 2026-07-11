@@ -562,6 +562,7 @@ jobs:
       - run: bash scripts/test-derive-platform-llm.sh
       - run: bash scripts/test-install-prefix-strip.sh
       - run: bash scripts/test-load-workspace-config.sh
+      - run: bash scripts/test-default-model-selection.sh
       - run: bash scripts/test-mcp-configs-dir.sh
       - run: bash scripts/test-process-liveness.sh
       - run: bash scripts/test-publish-local-runtime-cache.sh
