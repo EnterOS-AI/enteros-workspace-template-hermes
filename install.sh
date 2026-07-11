@@ -58,12 +58,14 @@ export PATH="$HOME/.local/bin:$PATH"
 # --- Ensure hermes home exists ---
 mkdir -p "$HERMES_HOME"
 
-# --- Generate API_SERVER_KEY if not already set in env ---
+# --- Resolve API_SERVER_KEY (persisted key wins on reruns) ---
 # hermes-agent requires a bearer for the api-server platform. The
 # molecule_runtime adapter (executor.py) reads this same var at
-# request time to auth against the gateway.
+# request time to auth against the gateway. Once a durable .env exists,
+# keep that key authoritative: an idempotent install must not rotate a
+# serving gateway across three files via non-atomic writes.
 reused_persisted_api_server_key=0
-if [ -z "${API_SERVER_KEY:-}" ] && [ -r "$HERMES_HOME/.env" ]; then
+if [ -r "$HERMES_HOME/.env" ]; then
   persisted_api_server_key=""
   while IFS= read -r env_line; do
     case "$env_line" in

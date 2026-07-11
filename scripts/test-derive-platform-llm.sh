@@ -200,7 +200,7 @@ ${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh"
 assert_provider_env_file "install.sh persists translated provider" "${ENTRYPOINT_TMP}/install-home/.env"
 
 API_KEY_BLOCK="$(awk '
-  /Generate API_SERVER_KEY if not already set in env/ { grab=1 }
+  /Resolve API_SERVER_KEY/ { grab=1 }
   grab && /FIX #12/ { exit }
   grab { print }
 ' "${SCRIPT_DIR}/install.sh")"
@@ -221,6 +221,19 @@ else
   FAIL=$((FAIL + 1))
   FAILURES+=("install rerun reuses gateway key: got [${REUSED_API_KEY}]")
   printf "  FAIL  %-46s -> generated a different key\n" "install rerun reuses gateway key"
+fi
+
+PINNED_API_KEY="$(env -i PATH="${PATH}" HOME="${HOME}" HERMES_HOME="${API_KEY_HOME}" \
+  API_SERVER_KEY="${ROTATED_API_KEY}" bash -c "set -euo pipefail
+${API_KEY_BLOCK}
+printf '%s' \"\${API_SERVER_KEY}\"" | tail -n 1)"
+if [ "${PINNED_API_KEY}" = "${EXISTING_API_KEY}" ]; then
+  PASS=$((PASS + 1))
+  printf "  PASS  %-46s -> existing key retained\n" "install rerun rejects implicit key rotation"
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("install rerun rejects implicit key rotation: got [${PINNED_API_KEY}]")
+  printf "  FAIL  %-46s -> caller key replaced durable key\n" "install rerun rejects implicit key rotation"
 fi
 
 assert_invalid_persisted_key_rejected() {
@@ -258,7 +271,7 @@ printf '%s\n' 'SENTINEL=keep' "API_SERVER_KEY=${EXISTING_API_KEY}" \
 cp "${ORIGINAL_ENV_FILE}" "${FAILED_INSTALL_HOME}/.env"
 SYSTEM_WRITE_LOG="${ENTRYPOINT_TMP}/system-writes.log"
 INSTALL_PREFLIGHT_BLOCK="$(awk '
-  /Generate API_SERVER_KEY if not already set in env/ { grab=1 }
+  /Resolve API_SERVER_KEY/ { grab=1 }
   grab && /OpenAI bridge: PROVIDER=custom/ { exit }
   grab { print }
 ' "${SCRIPT_DIR}/install.sh")"
