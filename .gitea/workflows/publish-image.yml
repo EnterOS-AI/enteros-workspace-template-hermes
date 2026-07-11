@@ -221,6 +221,33 @@ jobs:
             printf 'Removing stale local candidate: %s\n' "${stale_refs[@]}"
             docker image rm -f "${stale_refs[@]}"
           fi
+
+          # An ambiguous promote/read-back result deliberately preserves its
+          # pending alias. Never stack another multi-GiB candidate on top of it:
+          # remove only aliases already identical to the live tag, otherwise
+          # fail closed for operator reconciliation.
+          mapfile -t pending_refs < <(
+            docker image ls \
+              --filter "reference=workspace-template-hermes:pending-*" \
+              --format '{{.Repository}}:{{.Tag}}'
+          )
+          if [ "${#pending_refs[@]}" -gt 0 ]; then
+            live_id="$(docker image inspect --format '{{.Id}}' workspace-template-hermes:latest 2>/dev/null || true)"
+            unresolved_pending_refs=()
+            for ref in "${pending_refs[@]}"; do
+              pending_id="$(docker image inspect --format '{{.Id}}' "${ref}" 2>/dev/null || true)"
+              if [ -n "${live_id}" ] && [ "${pending_id}" = "${live_id}" ]; then
+                echo "Removing finalized pending alias: ${ref}"
+                docker image rm "${ref}" >/dev/null
+              else
+                unresolved_pending_refs+=("${ref}")
+              fi
+            done
+            if [ "${#unresolved_pending_refs[@]}" -gt 0 ]; then
+              printf '::error::refusing publish while unresolved local candidate exists: %s\n' "${unresolved_pending_refs[@]}" >&2
+              exit 1
+            fi
+          fi
           # Do not globally prune images, volumes, containers, or BuildKit
           # caches used by other jobs on this shared runner.
 
@@ -287,6 +314,7 @@ jobs:
           set -euo pipefail
           SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
           LATEST_REF="${PUSH_IMAGE_NAME}:latest"
+          LOCAL_CANDIDATE_REF="workspace-template-hermes:pending-${GITHUB_SHA}"
           push_with_retry() {
             local ref="$1" attempt output
             for attempt in 1 2 3; do
@@ -324,6 +352,20 @@ jobs:
           fi
           docker tag "${SHA_REF}" "${LATEST_REF}"
           push_with_retry "${LATEST_REF}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            # ci-meta and the local control plane share this host Docker daemon.
+            # Stage a unique local alias, but do not move the live runtime tag
+            # until promote-pin + verify-pin have both succeeded.
+            docker tag "${SHA_REF}" "${LOCAL_CANDIDATE_REF}"
+            CANDIDATE_IMAGE_META="$(docker image inspect --format '{{.Id}}|{{json .RepoDigests}}' "${LOCAL_CANDIDATE_REF}")"
+            if ! printf '%s\n' "${CANDIDATE_IMAGE_META}" | grep -Fq "@${DIGEST}"; then
+              echo "::error::${LOCAL_CANDIDATE_REF} does not record the pushed digest ${DIGEST}"
+              exit 1
+            fi
+            echo "::notice::staged ${LOCAL_CANDIDATE_REF} locally with verified digest ${DIGEST}"
+          else
+            echo "::notice::skipped local runtime staging for non-main ref ${GITHUB_REF}"
+          fi
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST} (pins as ${IMAGE_NAME}@${DIGEST})"
 
@@ -487,3 +529,48 @@ jobs:
           EXPECTED_DIGEST="${IMAGE_DIGEST}" \
           ENV_NAME="${ENV_NAME}" \
             .gitea/scripts/verify-runtime-pin.sh
+
+  retain-local-runtime:
+    name: Retain promoted runtime image on local Docker host
+    runs-on: ci-meta
+    timeout-minutes: 2
+    needs: [resolve-version, publish, promote-pin, verify-pin]
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Finalize digest-verified local runtime tag
+        shell: bash
+        env:
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          PROMOTE_RESULT: ${{ needs.promote-pin.result }}
+          VERIFY_RESULT: ${{ needs.verify-pin.result }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          LOCAL_CANDIDATE_REF="workspace-template-hermes:pending-${GITHUB_SHA}"
+          LOCAL_RUNTIME_REF="workspace-template-hermes:latest"
+
+          if [ "${PUBLISH_RESULT}" != "success" ] || [ "${PROMOTE_RESULT}" != "success" ] || [ "${VERIFY_RESULT}" != "success" ]; then
+            echo "::notice::not moving ${LOCAL_RUNTIME_REF}; publish=${PUBLISH_RESULT} promote=${PROMOTE_RESULT} verify=${VERIFY_RESULT}"
+            echo "::warning::preserving ${LOCAL_CANDIDATE_REF}; pin outcome is ambiguous"
+            exit 0
+          fi
+          if ! printf '%s' "${IMAGE_DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::invalid or empty promoted digest: ${IMAGE_DIGEST}"
+            exit 1
+          fi
+
+          CANDIDATE_IMAGE_META="$(docker image inspect --format '{{.Id}}|{{json .RepoDigests}}' "${LOCAL_CANDIDATE_REF}")"
+          if ! printf '%s\n' "${CANDIDATE_IMAGE_META}" | grep -Fq "@${IMAGE_DIGEST}"; then
+            echo "::error::${LOCAL_CANDIDATE_REF} does not record promoted digest ${IMAGE_DIGEST}"
+            exit 1
+          fi
+          docker tag "${LOCAL_CANDIDATE_REF}" "${LOCAL_RUNTIME_REF}"
+          LOCAL_IMAGE_META="$(docker image inspect --format '{{.Id}}|{{json .RepoDigests}}' "${LOCAL_RUNTIME_REF}")"
+          if ! printf '%s\n' "${LOCAL_IMAGE_META}" | grep -Fq "@${IMAGE_DIGEST}"; then
+            echo "::error::${LOCAL_RUNTIME_REF} does not record promoted digest ${IMAGE_DIGEST}"
+            exit 1
+          fi
+          echo "::notice::retained ${LOCAL_RUNTIME_REF} locally with verified digest ${IMAGE_DIGEST}"
+          docker image rm -f "${LOCAL_CANDIDATE_REF}" >/dev/null 2>&1 || true
