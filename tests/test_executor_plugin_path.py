@@ -162,6 +162,67 @@ async def test_dispatch_tool_uses_runtime_dispatcher(monkeypatch):
     assert calls == [("delegate_task", {"workspace_id": "ws-1", "task": "hello"})]
 
 
+@pytest.mark.asyncio
+async def test_dispatch_tool_emits_tool_call(monkeypatch):
+    """ADR-004: the in-process tool loop MUST emit a tool-call activity row via
+    the engine-owned emit_tool_call primitive so the canvas renders a
+    ToolTraceChip. Assert _dispatch_tool calls emit_tool_call with the tool
+    name and the engine's summary, and that it fires even if the underlying
+    dispatch later errors (emit is at the tool SITE, before dispatch)."""
+    emits: list[tuple[str, str]] = []
+
+    async def fake_emit(name, summary=None, status="ok"):
+        emits.append((name, summary))
+
+    async def fake_dispatch(name, arguments):
+        return "ok"
+
+    monkeypatch.setattr(executor_mod, "emit_tool_call", fake_emit)
+    monkeypatch.setattr(executor_mod, "handle_molecule_tool_call", fake_dispatch)
+    ex = _make_executor(monkeypatch)
+
+    await ex._dispatch_tool({
+        "function": {
+            "name": "delegate_task",
+            "arguments": '{"workspace_id":"ws-1","task":"hello"}',
+        }
+    })
+
+    assert len(emits) == 1
+    emitted_name, emitted_summary = emits[0]
+    assert emitted_name == "delegate_task"
+    # Engine generic summary is "🛠 <name>(…)"; assert the tool name rides in
+    # the summary rather than pinning the exact emoji/format the engine owns.
+    assert "delegate_task" in emitted_summary
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_emits_even_when_dispatch_errors(monkeypatch):
+    """The emit is at the tool SITE (before dispatch), so the ToolTraceChip
+    renders even when the tool itself errors — the failure is surfaced as the
+    tool's returned error string, not by suppressing the chip."""
+    emits: list[str] = []
+
+    async def fake_emit(name, summary=None, status="ok"):
+        emits.append(name)
+
+    async def boom_dispatch(name, arguments):
+        raise RuntimeError("tool blew up")
+
+    monkeypatch.setattr(executor_mod, "emit_tool_call", fake_emit)
+    monkeypatch.setattr(executor_mod, "handle_molecule_tool_call", boom_dispatch)
+    ex = _make_executor(monkeypatch)
+
+    result = await ex._dispatch_tool({
+        "function": {"name": "delegate_task", "arguments": "{}"},
+    })
+
+    # dispatch error is caught + returned as a string (existing behavior)…
+    assert "Tool error (delegate_task)" in result
+    # …and the chip was still emitted for the attempted call.
+    assert emits == ["delegate_task"]
+
+
 # ---- lifecycle ------------------------------------------------------
 
 
