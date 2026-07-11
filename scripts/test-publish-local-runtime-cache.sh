@@ -12,40 +12,58 @@ require_line() {
   fi
 }
 
-# The co-located control plane resolves this exact local fallback when a pinned
-# registry image is cold or unavailable. Retaining the just-verified image under
-# this tag prevents a multi-gigabyte pull from exceeding core's 120s CP timeout.
-require_line '          LOCAL_RUNTIME_REF="workspace-template-hermes:latest"'
-require_line '          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then'
-require_line '            docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"'
-require_line '            LOCAL_IMAGE_META="$(docker image inspect --format '\''{{.Id}}|{{json .RepoDigests}}'\'' "${LOCAL_RUNTIME_REF}")"'
-require_line '            if ! printf '\''%s\n'\'' "${LOCAL_IMAGE_META}" | grep -Fq "@${DIGEST}"; then'
-require_line '          docker image prune -f \'
-require_line '            --filter "label=org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}" >/dev/null || true'
+require_order() {
+  local block="$1" label="$2" expected line previous=0
+  shift 2
+  for expected in "$@"; do
+    line="$(grep -nF "$expected" <<<"$block" | head -1 | cut -d: -f1 || true)"
+    if [ -z "$line" ] || [ "$line" -le "$previous" ]; then
+      printf 'FAIL: %s ordering is invalid at: %s\n' "$label" "$expected" >&2
+      exit 1
+    fi
+    previous="$line"
+  done
+}
 
-push_block="$(sed -n '/- name: Push image to registry/,/- name: Release runner-local candidate image/p' "$WORKFLOW")"
-previous=0
-for expected in \
+# The publish job stages a digest-verified, unique local candidate without
+# moving the live runtime tag before control-plane promotion succeeds.
+require_line '          LOCAL_CANDIDATE_REF="workspace-template-hermes:pending-${GITHUB_SHA}"'
+require_line '            docker tag "${SHA_REF}" "${LOCAL_CANDIDATE_REF}"'
+require_line '            CANDIDATE_IMAGE_META="$(docker image inspect --format '\''{{.Id}}|{{json .RepoDigests}}'\'' "${LOCAL_CANDIDATE_REF}")"'
+require_line '            if ! printf '\''%s\n'\'' "${CANDIDATE_IMAGE_META}" | grep -Fq "@${DIGEST}"; then'
+
+publish_block="$(sed -n '/- name: Push image to registry/,/- name: Release runner-local candidate image/p' "$WORKFLOW")"
+require_order "$publish_block" "publish" \
   'if [ "${GITHUB_REF}" = "refs/heads/main" ]; then' \
-  'docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"' \
-  'LOCAL_IMAGE_META="$(docker image inspect' \
-  'if ! printf '\''%s\n'\'' "${LOCAL_IMAGE_META}" | grep -Fq "@${DIGEST}"; then' \
-  'echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"'; do
-  line="$(grep -nF "$expected" <<<"$push_block" | head -1 | cut -d: -f1)"
-  if [ -z "$line" ] || [ "$line" -le "$previous" ]; then
-    printf 'FAIL: publish workflow ordering is invalid at: %s\n' "$expected" >&2
-    exit 1
-  fi
-  previous="$line"
-done
+  'docker tag "${SHA_REF}" "${LOCAL_CANDIDATE_REF}"' \
+  'CANDIDATE_IMAGE_META="$(docker image inspect' \
+  'if ! printf '\''%s\n'\'' "${CANDIDATE_IMAGE_META}" | grep -Fq "@${DIGEST}"; then' \
+  'echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"'
+if grep -Fq 'docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"' <<<"$publish_block"; then
+  echo 'FAIL: publish job moves the live local tag before pin promotion' >&2
+  exit 1
+fi
 
-# The generic post-job cleanup must remain scoped to the temporary registry
-# aliases. Deleting LOCAL_RUNTIME_REF here reintroduces the cold-pull failure.
-cleanup_block="$({
-  sed -n '/- name: Release runner-local candidate image/,/^  promote-pin:/p' "$WORKFLOW"
-} || true)"
-if grep -Fq 'LOCAL_RUNTIME_REF' <<<"$cleanup_block"; then
-  echo 'FAIL: post-job cleanup deletes the retained local runtime image' >&2
+# The live tag moves only after promote + read-back verification. The unique
+# pending alias is always removed, and no shared-daemon prune may race a run.
+require_line '  retain-local-runtime:'
+require_line '    needs: [resolve-version, publish, promote-pin, verify-pin]'
+require_line '    if: ${{ always() && github.ref == '\''refs/heads/main'\'' }}'
+require_line '          trap '\''docker image rm -f "${LOCAL_CANDIDATE_REF}" >/dev/null 2>&1 || true'\'' EXIT'
+require_line '          docker tag "${LOCAL_CANDIDATE_REF}" "${LOCAL_RUNTIME_REF}"'
+require_line '          LOCAL_IMAGE_META="$(docker image inspect --format '\''{{.Id}}|{{json .RepoDigests}}'\'' "${LOCAL_RUNTIME_REF}")"'
+require_line '          echo "::notice::retained ${LOCAL_RUNTIME_REF} locally with verified digest ${IMAGE_DIGEST}"'
+
+finalize_block="$(sed -n '/^  retain-local-runtime:/,$p' "$WORKFLOW")"
+require_order "$finalize_block" "finalize" \
+  'if [ "${PUBLISH_RESULT}" != "success" ] || [ "${PROMOTE_RESULT}" != "success" ] || [ "${VERIFY_RESULT}" != "success" ]; then' \
+  'CANDIDATE_IMAGE_META="$(docker image inspect' \
+  'docker tag "${LOCAL_CANDIDATE_REF}" "${LOCAL_RUNTIME_REF}"' \
+  'LOCAL_IMAGE_META="$(docker image inspect' \
+  'echo "::notice::retained ${LOCAL_RUNTIME_REF} locally with verified digest ${IMAGE_DIGEST}"'
+
+if grep -Fq 'docker image prune' "$WORKFLOW"; then
+  echo 'FAIL: image prune can race digest verification and docker run on the shared daemon' >&2
   exit 1
 fi
 
