@@ -135,8 +135,7 @@ API_SERVER_ENABLED=true
 API_SERVER_KEY=${API_SERVER_KEY}
 API_SERVER_HOST=${API_SERVER_HOST:-127.0.0.1}
 API_SERVER_PORT=${API_SERVER_PORT:-8642}
-# Provider-selection override (optional; empty = hermes auto-detect).
-${HERMES_INFERENCE_PROVIDER:+HERMES_INFERENCE_PROVIDER=${HERMES_INFERENCE_PROVIDER}}
+# Provider selection is appended after platform-routing translation below.
 # Auxiliary model defaults — used by vision, web summarization, MoA.
 ${HERMES_AUXILIARY_PROVIDER:+HERMES_AUXILIARY_PROVIDER=${HERMES_AUXILIARY_PROVIDER}}
 # ── Primary inference providers (keyed) ───────────────────────
@@ -318,6 +317,13 @@ if [ -f "$PLATFORM_LLM_SCRIPT" ]; then
     echo "[start.sh] platform-managed LLM routing failed — refusing to boot with an unroutable LLM config" >&2
     exit 1
   }
+fi
+
+# Hermes reloads this file with override=True before every request. Persist the
+# translated value only after derive-platform-llm.sh has mapped the Molecule
+# `platform` arm to Hermes's native `custom` provider.
+if [ -n "${HERMES_INFERENCE_PROVIDER:-}" ]; then
+  printf 'HERMES_INFERENCE_PROVIDER=%s\n' "${HERMES_INFERENCE_PROVIDER}" >>"$ENV_FILE"
 fi
 
 # --- OpenAI bridge: custom provider + chat_completions api_mode ---
