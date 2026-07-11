@@ -62,6 +62,20 @@ mkdir -p "$HERMES_HOME"
 # hermes-agent requires a bearer for the api-server platform. The
 # molecule_runtime adapter (executor.py) reads this same var at
 # request time to auth against the gateway.
+if [ -z "${API_SERVER_KEY:-}" ] && [ -r "$HERMES_HOME/.env" ]; then
+  persisted_api_server_key=""
+  while IFS= read -r env_line; do
+    case "$env_line" in
+      API_SERVER_KEY=*) persisted_api_server_key="${env_line#API_SERVER_KEY=}" ;;
+    esac
+  done <"$HERMES_HOME/.env"
+  if [ -n "$persisted_api_server_key" ]; then
+    API_SERVER_KEY="$persisted_api_server_key"
+    export API_SERVER_KEY
+    echo "[install.sh] reusing existing gateway API key"
+  fi
+  unset persisted_api_server_key env_line
+fi
 if [ -z "${API_SERVER_KEY:-}" ]; then
   API_SERVER_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 40)"
   export API_SERVER_KEY

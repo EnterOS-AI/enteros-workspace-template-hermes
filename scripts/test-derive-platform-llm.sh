@@ -198,13 +198,37 @@ env -i PATH="${PATH}" HOME="${HOME}" \
 ${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh"
 assert_provider_env_file "install.sh persists translated provider" "${ENTRYPOINT_TMP}/install-home/.env"
 
+API_KEY_BLOCK="$(awk '
+  /Generate API_SERVER_KEY if not already set in env/ { grab=1 }
+  grab && /FIX #12/ { exit }
+  grab { print }
+' "${SCRIPT_DIR}/install.sh")"
+API_KEY_HOME="${ENTRYPOINT_TMP}/api-key-home"
+mkdir -p "${API_KEY_HOME}"
+printf '%s\n' 'API_SERVER_KEY=existing-key' >"${API_KEY_HOME}/.env"
+REUSED_API_KEY="$(env -i PATH="${PATH}" HOME="${HOME}" HERMES_HOME="${API_KEY_HOME}" \
+  bash -c "set -euo pipefail
+unset API_SERVER_KEY
+${API_KEY_BLOCK}
+printf '%s' \"\${API_SERVER_KEY}\"" | tail -n 1)"
+if [ "${REUSED_API_KEY}" = "existing-key" ]; then
+  PASS=$((PASS + 1))
+  printf "  PASS  %-46s -> reused\n" "install rerun reuses gateway key"
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("install rerun reuses gateway key: got [${REUSED_API_KEY}]")
+  printf "  FAIL  %-46s -> generated a different key\n" "install rerun reuses gateway key"
+fi
+
 FAILED_INSTALL_HOME="${ENTRYPOINT_TMP}/failed-install-home"
 mkdir -p "${FAILED_INSTALL_HOME}"
-ORIGINAL_ENV=$'SENTINEL=keep\nHERMES_INFERENCE_PROVIDER=custom'
-printf '%s\n' "${ORIGINAL_ENV}" >"${FAILED_INSTALL_HOME}/.env"
+ORIGINAL_ENV_FILE="${ENTRYPOINT_TMP}/original.env"
+printf '%s\n' 'SENTINEL=keep' 'API_SERVER_KEY=existing-key' \
+  'HERMES_INFERENCE_PROVIDER=custom' >"${ORIGINAL_ENV_FILE}"
+cp "${ORIGINAL_ENV_FILE}" "${FAILED_INSTALL_HOME}/.env"
 if env -i PATH="${PATH}" HOME="${HOME}" \
   HERMES_HOME="${FAILED_INSTALL_HOME}" \
-  API_SERVER_KEY=dummy API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 \
+  API_SERVER_KEY=existing-key API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 \
   HERMES_INFERENCE_PROVIDER=platform \
   HERMES_DEFAULT_MODEL=moonshot/kimi-k2.6 \
   MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_LLM_USAGE_TOKEN=dummy \
@@ -214,9 +238,8 @@ ${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1; then
   FAILURES+=("failed install preserves prior env: platform validation unexpectedly succeeded")
   printf "  FAIL  %-46s -> unexpected success\n" "failed install preserves prior env"
 else
-  FAILED_INSTALL_ENV="$(cat "${FAILED_INSTALL_HOME}/.env" 2>/dev/null || true)"
   FAILED_INSTALL_TEMPS="$(compgen -G "${FAILED_INSTALL_HOME}/.env.tmp.*" || true)"
-  if [ "${FAILED_INSTALL_ENV}" = "${ORIGINAL_ENV}" ] && [ -z "${FAILED_INSTALL_TEMPS}" ]; then
+  if cmp -s "${ORIGINAL_ENV_FILE}" "${FAILED_INSTALL_HOME}/.env" && [ -z "${FAILED_INSTALL_TEMPS}" ]; then
     PASS=$((PASS + 1))
     printf "  PASS  %-46s -> unchanged, temp cleaned\n" "failed install preserves prior env"
   else
