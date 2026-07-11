@@ -198,6 +198,34 @@ env -i PATH="${PATH}" HOME="${HOME}" \
 ${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh"
 assert_provider_env_file "install.sh persists translated provider" "${ENTRYPOINT_TMP}/install-home/.env"
 
+FAILED_INSTALL_HOME="${ENTRYPOINT_TMP}/failed-install-home"
+mkdir -p "${FAILED_INSTALL_HOME}"
+ORIGINAL_ENV=$'SENTINEL=keep\nHERMES_INFERENCE_PROVIDER=custom'
+printf '%s\n' "${ORIGINAL_ENV}" >"${FAILED_INSTALL_HOME}/.env"
+if env -i PATH="${PATH}" HOME="${HOME}" \
+  HERMES_HOME="${FAILED_INSTALL_HOME}" \
+  API_SERVER_KEY=dummy API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 \
+  HERMES_INFERENCE_PROVIDER=platform \
+  HERMES_DEFAULT_MODEL=moonshot/kimi-k2.6 \
+  MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_LLM_USAGE_TOKEN=dummy \
+  bash -c "set -euo pipefail
+${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1; then
+  FAIL=$((FAIL + 1))
+  FAILURES+=("failed install preserves prior env: platform validation unexpectedly succeeded")
+  printf "  FAIL  %-46s -> unexpected success\n" "failed install preserves prior env"
+else
+  FAILED_INSTALL_ENV="$(cat "${FAILED_INSTALL_HOME}/.env" 2>/dev/null || true)"
+  FAILED_INSTALL_TEMPS="$(compgen -G "${FAILED_INSTALL_HOME}/.env.tmp.*" || true)"
+  if [ "${FAILED_INSTALL_ENV}" = "${ORIGINAL_ENV}" ] && [ -z "${FAILED_INSTALL_TEMPS}" ]; then
+    PASS=$((PASS + 1))
+    printf "  PASS  %-46s -> unchanged, temp cleaned\n" "failed install preserves prior env"
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("failed install preserves prior env: durable .env changed or temp file leaked")
+    printf "  FAIL  %-46s -> durable .env changed or temp leaked\n" "failed install preserves prior env"
+  fi
+fi
+
 echo
 echo "derive-platform-llm: ${PASS} passed, ${FAIL} failed"
 if [ "${FAIL}" -ne 0 ]; then

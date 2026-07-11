@@ -103,7 +103,11 @@ echo "[install.sh] exported API_SERVER_KEY to /etc/environment + /etc/profile.d/
 # Every provider key the workspace's process env carries is forwarded.
 # CP's provisioner injects these from Secrets Manager + the per-tenant
 # shared secret bundle before this script runs.
-cat >"$HERMES_HOME/.env" <<EOF
+ENV_FILE="$HERMES_HOME/.env"
+ENV_FILE_TMP="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+trap 'if [ -n "${ENV_FILE_TMP:-}" ]; then rm -f "${ENV_FILE_TMP}"; fi' EXIT
+
+cat >"$ENV_FILE_TMP" <<EOF
 API_SERVER_ENABLED=true
 API_SERVER_KEY=${API_SERVER_KEY}
 API_SERVER_HOST=${API_SERVER_HOST}
@@ -136,7 +140,7 @@ ${OPENCODE_GO_API_KEY:+OPENCODE_GO_API_KEY=${OPENCODE_GO_API_KEY}}
 ${COPILOT_GITHUB_TOKEN:+COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN}}
 ${GH_TOKEN:+GH_TOKEN=${GH_TOKEN}}
 EOF
-chmod 600 "$HERMES_HOME/.env"
+chmod 600 "$ENV_FILE_TMP"
 
 # --- Write hermes-agent config.yaml ---
 # Unconditional overwrite — the hermes installer drops its
@@ -179,8 +183,13 @@ fi
 # translated value only after derive-platform-llm.sh has mapped the Molecule
 # `platform` arm to Hermes's native `custom` provider.
 if [ -n "${HERMES_INFERENCE_PROVIDER:-}" ]; then
-  printf 'HERMES_INFERENCE_PROVIDER=%s\n' "${HERMES_INFERENCE_PROVIDER}" >>"$HERMES_HOME/.env"
+  printf 'HERMES_INFERENCE_PROVIDER=%s\n' "${HERMES_INFERENCE_PROVIDER}" >>"$ENV_FILE_TMP"
 fi
+
+# Keep the last known-good durable env intact when platform validation fails or
+# install.sh is interrupted. The sibling temp file makes replacement atomic.
+mv -f "$ENV_FILE_TMP" "$ENV_FILE"
+ENV_FILE_TMP=""
 
 # --- OpenAI bridge: PROVIDER=custom + chat_completions api_mode ---
 #
