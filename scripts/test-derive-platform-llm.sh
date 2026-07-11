@@ -136,6 +136,68 @@ run_case "MOLECULE_RESOLVED_PROVIDER=platform fails closed without base url" \
   "1|kimi-coding|||||moonshot/kimi-k2.6" \
   "MOLECULE_RESOLVED_PROVIDER=platform" "DEFAULT_MODEL=moonshot/kimi-k2.6"
 
+# Exercise the real entrypoint regions from .env creation through platform
+# translation. This guards the ordering boundary: Hermes reloads .env with
+# override=True, so either entrypoint must persist exactly the translated value.
+ENTRYPOINT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/hermes-provider-entrypoints.XXXXXX")"
+trap 'rm -rf "${ENTRYPOINT_TMP}"' EXIT
+
+assert_provider_env_file() {
+  local name="$1"
+  local env_file="$2"
+  local actual
+  actual="$(grep '^HERMES_INFERENCE_PROVIDER=' "${env_file}" 2>/dev/null || true)"
+  if [ "${actual}" = "HERMES_INFERENCE_PROVIDER=custom" ]; then
+    PASS=$((PASS + 1))
+    printf "  PASS  %-46s -> %s\n" "${name}" "${actual}"
+  else
+    FAIL=$((FAIL + 1))
+    FAILURES+=("${name}: expected one custom provider line, got [${actual}]")
+    printf "  FAIL  %-46s -> %s\n" "${name}" "${actual:-<missing>}"
+  fi
+}
+
+START_BLOCK="$(awk '
+  index($0, "Write hermes-agent") && index($0, ".env") { grab=1 }
+  grab && /OpenAI bridge: custom provider/ { exit }
+  grab { print }
+' "${SCRIPT_DIR}/start.sh")"
+START_BLOCK="$(printf '%s\n' "${START_BLOCK}" | sed \
+  -e '/^chown agent:agent "[$]ENV_FILE"$/d' \
+  -e "s|^DERIVE_SCRIPT=.*$|DERIVE_SCRIPT=\"${SCRIPT_DIR}/scripts/derive-provider.sh\"|" \
+  -e "s|^PLATFORM_LLM_SCRIPT=.*$|PLATFORM_LLM_SCRIPT=\"${TARGET}\"|")"
+
+mkdir -p "${ENTRYPOINT_TMP}/start-home"
+env -i PATH="${PATH}" HOME="${HOME}" \
+  ENV_FILE="${ENTRYPOINT_TMP}/start.env" \
+  HERMES_HOME="${ENTRYPOINT_TMP}/start-home" \
+  API_SERVER_KEY=dummy API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 \
+  HERMES_INFERENCE_PROVIDER=platform \
+  HERMES_DEFAULT_MODEL=moonshot/kimi-k2.6 \
+  MOLECULE_RESOLVED_PROVIDER=platform \
+  MOLECULE_LLM_BASE_URL="${PROXY}" MOLECULE_LLM_USAGE_TOKEN=dummy \
+  bash -c "set -euo pipefail
+${START_BLOCK}"
+assert_provider_env_file "start.sh persists translated provider" "${ENTRYPOINT_TMP}/start.env"
+
+INSTALL_BLOCK="$(awk '
+  index($0, "Write hermes-agent") && index($0, ".env") { grab=1 }
+  grab && /OpenAI bridge: PROVIDER=custom/ { exit }
+  grab { print }
+' "${SCRIPT_DIR}/install.sh")"
+
+mkdir -p "${ENTRYPOINT_TMP}/install-home"
+env -i PATH="${PATH}" HOME="${HOME}" \
+  HERMES_HOME="${ENTRYPOINT_TMP}/install-home" \
+  API_SERVER_KEY=dummy API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 \
+  HERMES_INFERENCE_PROVIDER=platform \
+  HERMES_DEFAULT_MODEL=moonshot/kimi-k2.6 \
+  MOLECULE_RESOLVED_PROVIDER=platform \
+  MOLECULE_LLM_BASE_URL="${PROXY}" MOLECULE_LLM_USAGE_TOKEN=dummy \
+  bash -c "set -euo pipefail
+${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh"
+assert_provider_env_file "install.sh persists translated provider" "${ENTRYPOINT_TMP}/install-home/.env"
+
 echo
 echo "derive-platform-llm: ${PASS} passed, ${FAIL} failed"
 if [ "${FAIL}" -ne 0 ]; then
