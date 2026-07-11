@@ -289,6 +289,42 @@ jobs:
           # (pure function of run-id/attempt — no cross-step env reliance).
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           T4_PROBE="t4probe-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          CAPLESS_PROBE="capless-liveness-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+
+          echo "=== capability-independent child liveness under the local workspace profile ==="
+          docker rm -f "$CAPLESS_PROBE" >/dev/null 2>&1 || true
+          docker run --rm \
+            --name "$CAPLESS_PROBE" \
+            --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+            --cap-add SETGID --cap-add SETUID \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --entrypoint /bin/bash \
+            "$T4_TAG" -c '
+              set -euo pipefail
+              . /app/scripts/process-liveness.sh
+              gosu agent timeout 2s sleep 30 &
+              child_pid=$!
+              sleep 0.2
+              process_is_running "$child_pid" || {
+                echo "capability-independent liveness falsely reported the uid-1000 child dead" >&2
+                exit 1
+              }
+              set +e
+              wait "$child_pid"
+              child_rc=$?
+              set -e
+              [ "$child_rc" -eq 124 ] || {
+                echo "unexpected bounded child exit: $child_rc" >&2
+                exit 1
+              }
+              if process_is_running "$child_pid"; then
+                echo "capability-independent liveness reported the exited child alive" >&2
+                exit 1
+              fi
+            '
+
           # Defensive pre-removal of a LEAKED container from a crashed
           # prior attempt of THIS SAME run-id only (the name is run-id
           # scoped, so this can never reap a concurrent foreign run's
@@ -527,6 +563,7 @@ jobs:
       - run: bash scripts/test-install-prefix-strip.sh
       - run: bash scripts/test-load-workspace-config.sh
       - run: bash scripts/test-mcp-configs-dir.sh
+      - run: bash scripts/test-process-liveness.sh
       - run: bash scripts/test-publish-local-runtime-cache.sh
 
   # --- ADR-004 §4 adapter-socket conformance (audit finding CI2) ---

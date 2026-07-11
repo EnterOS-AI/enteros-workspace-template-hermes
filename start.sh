@@ -10,6 +10,9 @@
 
 set -euo pipefail
 
+# shellcheck source=scripts/process-liveness.sh
+. /app/scripts/process-liveness.sh
+
 # Source persistent workspace secrets BEFORE anything else that might need them.
 # /configs is volume-mounted from the host so this survives container restart.
 if [ -f /configs/secrets.d/load.sh ]; then
@@ -438,7 +441,7 @@ for _ in $(seq 1 15); do
     echo "[start.sh] MCP server /mcp initialize OK"
     break
   fi
-  if ! kill -0 "$MCP_PID" 2>/dev/null; then
+  if ! process_is_running "$MCP_PID"; then
     echo "[start.sh] MCP server exited before /mcp came up. Last log lines:" >&2
     tail -40 "$MCP_LOG" >&2
     exit 1
@@ -477,7 +480,7 @@ for _ in $(seq 1 $READY_TIMEOUT); do
   if curl -fsS "http://127.0.0.1:${API_SERVER_PORT:-8642}/health" >/dev/null 2>&1; then
     break
   fi
-  if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+  if ! process_is_running "$GATEWAY_PID"; then
     echo "[start.sh] hermes gateway exited during boot. Last log lines:" >&2
     tail -40 "$LOG_FILE" >&2
     exit 1
