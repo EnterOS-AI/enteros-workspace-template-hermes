@@ -52,6 +52,11 @@ assert_provider "HERMES_INFERENCE_PROVIDER=anthropic beats model slug" "anthropi
   HERMES_INFERENCE_PROVIDER=anthropic
   HERMES_DEFAULT_MODEL=openai/gpt-4o
 '
+assert_provider "resolved BYOK provider rejects stale platform override" "kimi-coding" '
+  export MOLECULE_RESOLVED_PROVIDER=kimi-coding
+  HERMES_INFERENCE_PROVIDER=platform
+  HERMES_DEFAULT_MODEL=kimi-coding/kimi-k2
+'
 
 # --- direct-SDK prefixes ---
 assert_provider "minimax/M2 → minimax" "minimax" '

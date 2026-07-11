@@ -79,6 +79,12 @@ derive "explicit HERMES_INFERENCE_PROVIDER wins over both model vars" \
   "HERMES_INFERENCE_PROVIDER=openrouter" \
   "HERMES_INFERENCE_MODEL=anthropic/claude-sonnet-4-5"
 
+derive "resolved BYOK provider rejects stale platform override" \
+  "kimi-coding" \
+  "MOLECULE_RESOLVED_PROVIDER=kimi-coding" \
+  "HERMES_INFERENCE_PROVIDER=platform" \
+  "HERMES_INFERENCE_MODEL=kimi-coding/kimi-k2"
+
 # --- Fix D: 12 newly-added providers --------------------------------------
 derive "xai/grok-4 -> xai" \
   "xai" "HERMES_INFERENCE_MODEL=xai/grok-4"
