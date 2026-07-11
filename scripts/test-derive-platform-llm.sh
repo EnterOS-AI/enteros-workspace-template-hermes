@@ -246,7 +246,17 @@ env -i PATH="${PATH}" HOME="${HOME}" PERSIST_WRITE_LOG="${PERSIST_WRITE_LOG}" \
   API_SERVER_KEY="${EXISTING_API_KEY}" bash -c "set -euo pipefail
 sudo() {
   case \"\${1:-}\" in
-    sh|test) return 0 ;;
+    sh)
+      probe=\"\${3:-}\"
+      if [[ \"\$probe\" == *\"stat -c\"* && \"\$probe\" == *\"%u:%g:%a\"* &&
+        \"\$probe\" == *\"0:0:644\"* && \"\$probe\" == *\"! -L /etc/environment\"* &&
+        \"\$probe\" == *\"! -L /etc/profile.d/hermes-api-key.sh\"* ]]; then
+        return 0
+      fi
+      printf 'write:unsafe-probe\\n' >>\"\$PERSIST_WRITE_LOG\"
+      return 1
+      ;;
+    test) return 0 ;;
     tee) printf 'write:%s\\n' \"\$1\" >>\"\$PERSIST_WRITE_LOG\"; cat >/dev/null; return 0 ;;
     *) printf 'write:%s\\n' \"\${1:-unknown}\" >>\"\$PERSIST_WRITE_LOG\"; return 0 ;;
   esac
