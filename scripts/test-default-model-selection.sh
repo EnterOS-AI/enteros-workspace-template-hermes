@@ -81,11 +81,41 @@ run_case() {
     unset HERMES_INFERENCE_MODEL HERMES_DEFAULT_MODEL HERMES_INFERENCE_PROVIDER \
           MOLECULE_MODEL MODEL HERMES_API_KEY NOUS_API_KEY ANTHROPIC_API_KEY \
           OPENAI_API_KEY MINIMAX_API_KEY MINIMAX_CN_API_KEY GEMINI_API_KEY \
-          GOOGLE_API_KEY DEEPSEEK_API_KEY KIMI_API_KEY OPENROUTER_API_KEY
+          GOOGLE_API_KEY DEEPSEEK_API_KEY KIMI_API_KEY OPENROUTER_API_KEY \
+          MOLECULE_RESOLVED_PROVIDER LLM_PROVIDER
     '"$envspec"'
     '"$BLOCK"'
     printf "%s\n" "${DEFAULT_MODEL}"
   ' | tail -1
+}
+
+# run_case_rc ENVSPEC → prints the block's EXIT CODE. Used for the
+# platform-managed fail-loud guard, which `exit 1`s before DEFAULT_MODEL is
+# printed. Diagnostics go to stderr; both streams are discarded here.
+run_case_rc() {
+  local envspec="$1"
+  # shellcheck disable=SC2086
+  env -i PATH="$PATH" bash -c '
+    set -u
+    unset HERMES_INFERENCE_MODEL HERMES_DEFAULT_MODEL HERMES_INFERENCE_PROVIDER \
+          MOLECULE_MODEL MODEL HERMES_API_KEY NOUS_API_KEY ANTHROPIC_API_KEY \
+          OPENAI_API_KEY MINIMAX_API_KEY MINIMAX_CN_API_KEY GEMINI_API_KEY \
+          GOOGLE_API_KEY DEEPSEEK_API_KEY KIMI_API_KEY OPENROUTER_API_KEY \
+          MOLECULE_RESOLVED_PROVIDER LLM_PROVIDER
+    '"$envspec"'
+    '"$BLOCK"'
+    printf "%s\n" "${DEFAULT_MODEL}"
+  ' >/dev/null 2>&1
+  echo "$?"
+}
+
+check_rc() {
+  local name="$1" got="$2" want="$3"
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1)); echo "PASS: $name -> rc=$got"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL: $name -> got rc=$got want rc=$want"
+  fi
 }
 
 check() {
@@ -131,6 +161,32 @@ check "HERMES_DEFAULT_MODEL wins" "$got" "zai/glm-4.6"
 # 6. No CP unified model at all → key-presence guess still fires (last resort).
 got=$(run_case 'MINIMAX_API_KEY=x')
 check "key-presence fallback still works (no CP model)" "$got" "minimax/MiniMax-M2.7-highspeed"
+
+# --- Platform-managed fail-loud guard (never silently boot the unpriced BYOK default) ---
+
+# 7. Platform arm (LLM_PROVIDER=platform) with NO injected model → FAIL LOUD
+#    (guard exits non-zero) instead of falling to nousresearch/hermes-4-70b.
+got=$(run_case_rc 'LLM_PROVIDER=platform')
+check_rc "platform arm + no model fails loud (LLM_PROVIDER)" "$got" "1"
+
+# 8. Platform arm (MOLECULE_RESOLVED_PROVIDER=platform, the SSOT) + no model → FAIL LOUD.
+got=$(run_case_rc 'MOLECULE_RESOLVED_PROVIDER=platform')
+check_rc "platform arm + no model fails loud (MOLECULE_RESOLVED_PROVIDER)" "$got" "1"
+
+# 9. Platform arm WITH the CP-injected model → inherits it, guard does NOT fire.
+got=$(run_case 'MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_MODEL=minimax/MiniMax-M2.7')
+check "platform arm inherits CP model (no false fire)" "$got" "minimax/MiniMax-M2.7"
+got=$(run_case_rc 'MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_MODEL=minimax/MiniMax-M2.7')
+check_rc "platform arm + CP model does NOT fail loud" "$got" "0"
+
+# 10. Platform arm with an explicit HERMES_DEFAULT_MODEL → honored, guard does NOT fire.
+got=$(run_case 'LLM_PROVIDER=platform HERMES_DEFAULT_MODEL=minimax/MiniMax-M2.7')
+check "platform arm honors explicit HERMES_DEFAULT_MODEL" "$got" "minimax/MiniMax-M2.7"
+
+# 11. NON-platform (BYOK) + no CP model + a provider key → key-presence still fires
+#     (the guard must NOT hijack ordinary BYOK boots).
+got=$(run_case_rc 'MINIMAX_API_KEY=x')
+check_rc "byok boot is unaffected by the guard" "$got" "0"
 
 echo "-----"
 echo "default-model-selection: $PASS passed, $FAIL failed"
