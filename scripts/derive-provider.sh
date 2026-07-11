@@ -34,10 +34,20 @@
 # See molecule-controlplane/docs/canary-tenants.md and the hermes-agent
 # providers.md docs for the full taxonomy.
 
-# Honour an explicit override.
+# Honour an explicit override unless it is a stale Molecule platform marker
+# contradicted by the authoritative resolved-provider arm. Without this guard a
+# workspace switched from platform-managed to BYOK keeps sending the literal
+# provider `platform` to Hermes, which has no provider by that name.
+_HERMES_STALE_PLATFORM_OVERRIDE=0
 if [ -n "${HERMES_INFERENCE_PROVIDER:-}" ]; then
-  PROVIDER="${HERMES_INFERENCE_PROVIDER}"
-  return 0 2>/dev/null || exit 0
+  if [ "${HERMES_INFERENCE_PROVIDER}" = "platform" ] && \
+     [ -n "${MOLECULE_RESOLVED_PROVIDER:-}" ] && \
+     [ "${MOLECULE_RESOLVED_PROVIDER}" != "platform" ]; then
+    _HERMES_STALE_PLATFORM_OVERRIDE=1
+  else
+    PROVIDER="${HERMES_INFERENCE_PROVIDER}"
+    return 0 2>/dev/null || exit 0
+  fi
 fi
 
 # Resolve the model slug — prefer the upstream env name, fall back to legacy.
@@ -45,6 +55,9 @@ _HERMES_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL:-}}"
 
 if [ -z "${_HERMES_MODEL}" ]; then
   PROVIDER="auto"
+  if [ "${_HERMES_STALE_PLATFORM_OVERRIDE}" = "1" ]; then
+    export HERMES_INFERENCE_PROVIDER="${PROVIDER}"
+  fi
   return 0 2>/dev/null || exit 0
 fi
 
@@ -130,3 +143,7 @@ case "${_HERMES_MODEL}" in
   # Unknown prefix → let hermes auto-detect
   *)                       PROVIDER="auto" ;;
 esac
+
+if [ "${_HERMES_STALE_PLATFORM_OVERRIDE}" = "1" ]; then
+  export HERMES_INFERENCE_PROVIDER="${PROVIDER}"
+fi
