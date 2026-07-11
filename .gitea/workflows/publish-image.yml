@@ -221,6 +221,33 @@ jobs:
             printf 'Removing stale local candidate: %s\n' "${stale_refs[@]}"
             docker image rm -f "${stale_refs[@]}"
           fi
+
+          # An ambiguous promote/read-back result deliberately preserves its
+          # pending alias. Never stack another multi-GiB candidate on top of it:
+          # remove only aliases already identical to the live tag, otherwise
+          # fail closed for operator reconciliation.
+          mapfile -t pending_refs < <(
+            docker image ls \
+              --filter "reference=workspace-template-hermes:pending-*" \
+              --format '{{.Repository}}:{{.Tag}}'
+          )
+          if [ "${#pending_refs[@]}" -gt 0 ]; then
+            live_id="$(docker image inspect --format '{{.Id}}' workspace-template-hermes:latest 2>/dev/null || true)"
+            unresolved_pending_refs=()
+            for ref in "${pending_refs[@]}"; do
+              pending_id="$(docker image inspect --format '{{.Id}}' "${ref}" 2>/dev/null || true)"
+              if [ -n "${live_id}" ] && [ "${pending_id}" = "${live_id}" ]; then
+                echo "Removing finalized pending alias: ${ref}"
+                docker image rm "${ref}" >/dev/null
+              else
+                unresolved_pending_refs+=("${ref}")
+              fi
+            done
+            if [ "${#unresolved_pending_refs[@]}" -gt 0 ]; then
+              printf '::error::refusing publish while unresolved local candidate exists: %s\n' "${unresolved_pending_refs[@]}" >&2
+              exit 1
+            fi
+          fi
           # Do not globally prune images, volumes, containers, or BuildKit
           # caches used by other jobs on this shared runner.
 

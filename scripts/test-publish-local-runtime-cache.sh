@@ -16,7 +16,7 @@ require_order() {
   local block="$1" label="$2" expected line previous=0
   shift 2
   for expected in "$@"; do
-    line="$(grep -nF "$expected" <<<"$block" | head -1 | cut -d: -f1 || true)"
+    line="$(grep -nF -- "$expected" <<<"$block" | head -1 | cut -d: -f1 || true)"
     if [ -z "$line" ] || [ "$line" -le "$previous" ]; then
       printf 'FAIL: %s ordering is invalid at: %s\n' "$label" "$expected" >&2
       exit 1
@@ -44,8 +44,8 @@ if grep -Fq 'docker tag "${SHA_REF}" "${LOCAL_RUNTIME_REF}"' <<<"$publish_block"
   exit 1
 fi
 
-# The live tag moves only after promote + read-back verification. The unique
-# pending alias is always removed, and no shared-daemon prune may race a run.
+# The live tag moves only after promote + read-back verification. A successful
+# handoff removes its pending alias; ambiguous outcomes preserve it.
 require_line '  retain-local-runtime:'
 require_line '    needs: [resolve-version, publish, promote-pin, verify-pin]'
 require_line '    if: ${{ always() && github.ref == '\''refs/heads/main'\'' }}'
@@ -65,8 +65,17 @@ require_order "$finalize_block" "finalize" \
   'docker image rm -f "${LOCAL_CANDIDATE_REF}"'
 
 reclaim_block="$(sed -n '/- name: Reclaim stale runner-local Hermes candidates/,/- name: Set up Docker Buildx/p' "$WORKFLOW")"
-if grep -Fq 'workspace-template-hermes:pending-' <<<"$reclaim_block"; then
-  echo 'FAIL: startup cleanup deletes candidates whose pin outcome may be ambiguous' >&2
+require_order "$reclaim_block" "pending preflight" \
+  'docker image ls' \
+  '--filter "reference=workspace-template-hermes:pending-*"' \
+  'live_id="$(docker image inspect --format' \
+  'if [ -n "${live_id}" ] && [ "${pending_id}" = "${live_id}" ]; then' \
+  'docker image rm "${ref}"' \
+  'unresolved_pending_refs+=("${ref}")' \
+  'if [ "${#unresolved_pending_refs[@]}" -gt 0 ]; then' \
+  'exit 1'
+if grep -Fq 'docker image rm -f "${ref}"' <<<"$reclaim_block"; then
+  echo 'FAIL: unresolved pending candidates must never be force-removed' >&2
   exit 1
 fi
 
