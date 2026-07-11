@@ -236,6 +236,32 @@ else
   printf "  FAIL  %-46s -> caller key replaced durable key\n" "install rerun rejects implicit key rotation"
 fi
 
+PERSIST_FUNCTION="$(awk '
+  /^persist_gateway_api_key\(\)/ { grab=1 }
+  grab { print }
+  grab && /^}/ { exit }
+' "${SCRIPT_DIR}/install.sh")"
+PERSIST_WRITE_LOG="${ENTRYPOINT_TMP}/persist-writes.log"
+env -i PATH="${PATH}" HOME="${HOME}" PERSIST_WRITE_LOG="${PERSIST_WRITE_LOG}" \
+  API_SERVER_KEY="${EXISTING_API_KEY}" bash -c "set -euo pipefail
+sudo() {
+  case \"\${1:-}\" in
+    sh|test) return 0 ;;
+    tee) printf 'write:%s\\n' \"\$1\" >>\"\$PERSIST_WRITE_LOG\"; cat >/dev/null; return 0 ;;
+    *) printf 'write:%s\\n' \"\${1:-unknown}\" >>\"\$PERSIST_WRITE_LOG\"; return 0 ;;
+  esac
+}
+${PERSIST_FUNCTION}
+persist_gateway_api_key" >/dev/null
+if [ ! -s "${PERSIST_WRITE_LOG}" ]; then
+  PASS=$((PASS + 1))
+  printf "  PASS  %-46s -> no writes\n" "synced gateway key persistence is a no-op"
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("synced gateway key persistence is a no-op: mutation command ran")
+  printf "  FAIL  %-46s -> mutation command ran\n" "synced gateway key persistence is a no-op"
+fi
+
 assert_invalid_persisted_key_rejected() {
   local name="$1"
   local value="$2"

@@ -111,6 +111,19 @@ unset reused_persisted_api_server_key
 # signal a restart at the end of install.sh so it re-reads the env. Durable
 # writes are deferred until platform routing has passed its fail-closed checks.
 persist_gateway_api_key() {
+  if sudo sh -c '
+    key=$1
+    env_total=$(grep -c "^API_SERVER_KEY=" /etc/environment 2>/dev/null || true)
+    env_exact=$(grep -Fxc "API_SERVER_KEY=$key" /etc/environment 2>/dev/null || true)
+    profile_total=$(grep -c "^export API_SERVER_KEY=" /etc/profile.d/hermes-api-key.sh 2>/dev/null || true)
+    profile_exact=$(grep -Fxc "export API_SERVER_KEY=\"$key\"" /etc/profile.d/hermes-api-key.sh 2>/dev/null || true)
+    [ "${env_total:-0}" -eq 1 ] && [ "${env_exact:-0}" -eq 1 ] &&
+      [ "${profile_total:-0}" -eq 1 ] && [ "${profile_exact:-0}" -eq 1 ]
+  ' sh "$API_SERVER_KEY"; then
+    echo "[install.sh] gateway API key already synchronized"
+    return 0
+  fi
+
   if [ -w /etc/environment ] || sudo test -w /etc/environment 2>/dev/null; then
     # Remove any prior entry (idempotent) then append fresh.
     sudo sed -i '/^API_SERVER_KEY=/d' /etc/environment
