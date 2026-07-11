@@ -242,35 +242,6 @@ if [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ] &&
   fi
 fi
 
-# --- Platform-managed model guard (fail-loud) ---
-# On a platform-routed workspace the CP is contracted to inject the resolved SSOT
-# model as MOLECULE_MODEL/MODEL (inherited just above) and the tenant BYOK keys
-# are STRIPPED by workspace-server. If we STILL have no model here, the
-# key-presence block below would silently pick the BYOK default
-# `nousresearch/hermes-4-70b` — which is deliberately unpriced (IsPlatform:false),
-# so the Molecule platform LLM proxy fail-closes it with a 422 "model has no
-# price catalog entry" on EVERY turn. That presents as a silent, minutes-long
-# provision_workspace retry loop rather than an obvious failure (the exact class
-# that took a full staging repro to diagnose). Refuse loudly instead — same
-# posture as the platform-routing guard below (derive-platform-llm.sh). This can
-# never mis-bill: it fires only when the platform arm is active but no model was
-# delivered.
-# Signal on the core-injected boot vars (MOLECULE_RESOLVED_PROVIDER is the SSOT;
-# LLM_PROVIDER=platform is the legacy force-pin). Deliberately NOT keyed on
-# HERMES_INFERENCE_PROVIDER — that is what the CP-inherit block above gates on,
-# and it is only set to `platform` LATER by derive-platform-llm.sh, so using it
-# here would risk firing when the inherit was simply bypassed.
-_HERMES_PLATFORM_ARM=0
-case "${MOLECULE_RESOLVED_PROVIDER:-}" in platform) _HERMES_PLATFORM_ARM=1 ;; esac
-case "${LLM_PROVIDER:-}" in platform) _HERMES_PLATFORM_ARM=1 ;; esac
-if [ "${_HERMES_PLATFORM_ARM}" = "1" ] && [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ]; then
-  echo "[start.sh] platform-managed hermes workspace has no injected model (MOLECULE_MODEL/MODEL empty) —" >&2
-  echo "[start.sh] refusing to boot on the unpriced BYOK default 'nousresearch/hermes-4-70b', which the" >&2
-  echo "[start.sh] platform LLM proxy rejects 422 'model has no price catalog entry' on every turn." >&2
-  echo "[start.sh] The control plane must inject the resolved platform model (MOLECULE_MODEL)." >&2
-  exit 1
-fi
-
 # Pick a default model. The fallback used to be `nousresearch/hermes-4-70b`
 # unconditionally, which derives PROVIDER=openrouter when no Nous key is
 # present — and if OPENROUTER_API_KEY isn't set either, hermes-agent boots
@@ -321,7 +292,43 @@ if [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ] &&
   echo "[start.sh] no model env was set; auto-selected '${HERMES_DEFAULT_MODEL}' from available API keys"
 fi
 
-DEFAULT_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL}}"
+# `:-` on the inner expansion so this is safe under `set -u` even when the
+# key-presence block above was gated off (e.g. HERMES_INFERENCE_PROVIDER set)
+# and never assigned HERMES_DEFAULT_MODEL — previously that dereferenced an
+# unbound var and crashed the container with a cryptic error.
+DEFAULT_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL:-}}"
+
+# --- Platform-managed model guard (fail-loud, OUTCOME-based) ---
+# On a platform-routed workspace (MOLECULE_RESOLVED_PROVIDER=platform — the SSOT
+# signal core injects; derive-platform-llm.sh keys on the SAME value) the tenant
+# BYOK keys are STRIPPED and the CP is contracted to deliver the resolved model.
+# If model selection nonetheless landed on the BYOK default
+# `nousresearch/hermes-4-70b` (the key-presence fallback with no keys present) or
+# on nothing at all, that model is deliberately unpriced (IsPlatform:false) and
+# the platform LLM proxy fail-closes it 422 "model has no price catalog entry" on
+# EVERY turn — a silent, minutes-long retry loop rather than an obvious failure
+# (the exact class that took a full staging repro to diagnose). Refuse loudly.
+#
+# This tests the FINAL resolved DEFAULT_MODEL (not intermediate HERMES_* proxies)
+# and keys ONLY on the authoritative MOLECULE_RESOLVED_PROVIDER, so it can never
+# false-fire: a workspace that actually resolved a model (whatever path delivered
+# it) has a non-default DEFAULT_MODEL and is left alone, and a byok arm (or a
+# stale legacy LLM_PROVIDER=platform) is never mis-classified as platform. It
+# fires ONLY on the exact unpriced BYOK default — the empty-model case is a
+# distinct concern already made non-fatal by the `:-` on DEFAULT_MODEL above.
+case "${MOLECULE_RESOLVED_PROVIDER:-}" in
+  platform)
+    if [ "${DEFAULT_MODEL}" = "nousresearch/hermes-4-70b" ]; then
+      echo "[start.sh] platform-managed hermes workspace fell through to the BYOK default 'nousresearch/hermes-4-70b'." >&2
+      echo "[start.sh] That model is unpriced (IsPlatform:false), so the platform LLM proxy rejects it 422" >&2
+      echo "[start.sh] 'model has no price catalog entry' on every turn. The control plane must inject the" >&2
+      echo "[start.sh] resolved platform model (MOLECULE_MODEL). Refusing to boot on the unpriced default." >&2
+      exit 1
+    fi
+    ;;
+esac
+# --- end platform-managed model guard ---
+
 # Derive provider from model slug prefix — shared with install.sh via
 # scripts/derive-provider.sh so Docker + bare-host paths match.
 # Dockerfile COPYs scripts/ to /app/scripts; fall back to /scripts
