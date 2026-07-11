@@ -297,6 +297,40 @@ jobs:
           '
           echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
 
+      - name: Smoke test — capless child liveness
+        shell: bash
+        env:
+          IMAGE: ${{ env.PUSH_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          probe_name="hermes-capless-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          docker rm -f "${probe_name}" >/dev/null 2>&1 || true
+          docker run --rm \
+            --name "${probe_name}" \
+            --cap-drop ALL \
+            --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
+            --cap-add SETGID --cap-add SETUID \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --entrypoint /bin/bash "${IMAGE}" -c '
+              set -euo pipefail
+              . /app/scripts/process-liveness.sh
+              gosu agent timeout 2s sleep 30 &
+              child_pid=$!
+              sleep 0.2
+              process_is_running "$child_pid" || {
+                echo "uid-1000 child falsely reported dead without CAP_KILL" >&2
+                exit 1
+              }
+              set +e
+              wait "$child_pid"
+              child_rc=$?
+              set -e
+              [ "$child_rc" -eq 124 ] || exit 1
+              ! process_is_running "$child_pid"
+            '
+          echo "::notice::${IMAGE}: child liveness works without CAP_KILL"
+
       - name: Push image to registry (CF-bypass local endpoint, post-smoke)
         id: push
         # Smoke passed. Push the locally-loaded image straight to the local Gitea
