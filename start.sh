@@ -242,6 +242,35 @@ if [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ] &&
   fi
 fi
 
+# --- Platform-managed model guard (fail-loud) ---
+# On a platform-routed workspace the CP is contracted to inject the resolved SSOT
+# model as MOLECULE_MODEL/MODEL (inherited just above) and the tenant BYOK keys
+# are STRIPPED by workspace-server. If we STILL have no model here, the
+# key-presence block below would silently pick the BYOK default
+# `nousresearch/hermes-4-70b` — which is deliberately unpriced (IsPlatform:false),
+# so the Molecule platform LLM proxy fail-closes it with a 422 "model has no
+# price catalog entry" on EVERY turn. That presents as a silent, minutes-long
+# provision_workspace retry loop rather than an obvious failure (the exact class
+# that took a full staging repro to diagnose). Refuse loudly instead — same
+# posture as the platform-routing guard below (derive-platform-llm.sh). This can
+# never mis-bill: it fires only when the platform arm is active but no model was
+# delivered.
+# Signal on the core-injected boot vars (MOLECULE_RESOLVED_PROVIDER is the SSOT;
+# LLM_PROVIDER=platform is the legacy force-pin). Deliberately NOT keyed on
+# HERMES_INFERENCE_PROVIDER — that is what the CP-inherit block above gates on,
+# and it is only set to `platform` LATER by derive-platform-llm.sh, so using it
+# here would risk firing when the inherit was simply bypassed.
+_HERMES_PLATFORM_ARM=0
+case "${MOLECULE_RESOLVED_PROVIDER:-}" in platform) _HERMES_PLATFORM_ARM=1 ;; esac
+case "${LLM_PROVIDER:-}" in platform) _HERMES_PLATFORM_ARM=1 ;; esac
+if [ "${_HERMES_PLATFORM_ARM}" = "1" ] && [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ]; then
+  echo "[start.sh] platform-managed hermes workspace has no injected model (MOLECULE_MODEL/MODEL empty) —" >&2
+  echo "[start.sh] refusing to boot on the unpriced BYOK default 'nousresearch/hermes-4-70b', which the" >&2
+  echo "[start.sh] platform LLM proxy rejects 422 'model has no price catalog entry' on every turn." >&2
+  echo "[start.sh] The control plane must inject the resolved platform model (MOLECULE_MODEL)." >&2
+  exit 1
+fi
+
 # Pick a default model. The fallback used to be `nousresearch/hermes-4-70b`
 # unconditionally, which derives PROVIDER=openrouter when no Nous key is
 # present — and if OPENROUTER_API_KEY isn't set either, hermes-agent boots
