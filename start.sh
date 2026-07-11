@@ -205,6 +205,44 @@ LOAD_CONFIG_SCRIPT="/app/scripts/load-workspace-config.sh"
 [ -f "$LOAD_CONFIG_SCRIPT" ] || LOAD_CONFIG_SCRIPT="/scripts/load-workspace-config.sh"
 [ -f "$LOAD_CONFIG_SCRIPT" ] && . "$LOAD_CONFIG_SCRIPT"
 
+# --- Honor the CP-injected unified workspace model (fleet contract) ---
+# The control-plane provisioner injects the ONE resolved model id the
+# workspace should run as MOLECULE_MODEL (SSOT, preferred) == MODEL (legacy)
+# — molecule-controlplane/internal/provisioner/local_docker_workspace.go
+# setUnifiedModel/unifiedWorkspaceModel. Every OTHER runtime (claude-code,
+# openclaw, codex) selects on MOLECULE_MODEL, but hermes historically read
+# ONLY HERMES_INFERENCE_MODEL / HERMES_DEFAULT_MODEL / config.yaml
+# runtime_config.model — so it IGNORED the CP-resolved model and fell through
+# to the hardcoded `nousresearch/hermes-4-70b` key-presence default below.
+#
+# For a PLATFORM-MANAGED CONCIERGE (kind=platform) that is fatal: the concierge
+# is Rule-#13-forbidden from pinning runtime_config.model in its config.yaml
+# (molecule-controlplane/internal/providers/template_model_gate.go), so
+# load-workspace-config.sh finds NO model, no HERMES_* env is set, and the
+# hardcoded fallback fires. `nousresearch/hermes-4-70b` has NO llm_price_catalog
+# row (it routes to the proxy's default `openai` arm), so the fail-closed LLM
+# proxy 422s EVERY tool-use turn ("model has no price catalog entry"). The
+# concierge is supposed to INHERIT the platform SSOT default
+# (MOLECULE_LLM_DEFAULT_MODEL, currently minimax/MiniMax-M2.7 — catalogued),
+# which the CP already delivers as MOLECULE_MODEL/MODEL.
+#
+# Fix: map the CP unified model into HERMES_DEFAULT_MODEL when no explicit
+# hermes selection exists yet, mirroring the CP's own precedence
+# (MOLECULE_MODEL → MODEL). An operator HERMES_* env or a canvas config.yaml
+# pick still wins (set above / by load-workspace-config.sh). The key-presence
+# guesses below become a true last resort — only reached when the CP passed no
+# unified model at all (dev / non-CP boots). No hardcoded model here: the value
+# is the SSOT id the CP resolved, so the catalog/default stays single-sourced.
+if [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ] && [ -z "${HERMES_INFERENCE_PROVIDER:-}" ]; then
+  if   [ -n "${MOLECULE_MODEL:-}" ]; then
+    HERMES_DEFAULT_MODEL="${MOLECULE_MODEL}"
+    echo "[start.sh] inheriting CP unified model MOLECULE_MODEL='${HERMES_DEFAULT_MODEL}'"
+  elif [ -n "${MODEL:-}" ]; then
+    HERMES_DEFAULT_MODEL="${MODEL}"
+    echo "[start.sh] inheriting CP unified model MODEL='${HERMES_DEFAULT_MODEL}'"
+  fi
+fi
+
 # Pick a default model. The fallback used to be `nousresearch/hermes-4-70b`
 # unconditionally, which derives PROVIDER=openrouter when no Nous key is
 # present — and if OPENROUTER_API_KEY isn't set either, hermes-agent boots
