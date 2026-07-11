@@ -195,6 +195,7 @@ env -i PATH="${PATH}" HOME="${HOME}" \
   MOLECULE_RESOLVED_PROVIDER=platform \
   MOLECULE_LLM_BASE_URL="${PROXY}" MOLECULE_LLM_USAGE_TOKEN=dummy \
   bash -c "set -euo pipefail
+persist_gateway_api_key() { :; }
 ${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh"
 assert_provider_env_file "install.sh persists translated provider" "${ENTRYPOINT_TMP}/install-home/.env"
 
@@ -204,14 +205,16 @@ API_KEY_BLOCK="$(awk '
   grab { print }
 ' "${SCRIPT_DIR}/install.sh")"
 API_KEY_HOME="${ENTRYPOINT_TMP}/api-key-home"
+EXISTING_API_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+ROTATED_API_KEY="BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 mkdir -p "${API_KEY_HOME}"
-printf '%s\n' 'API_SERVER_KEY=existing-key' >"${API_KEY_HOME}/.env"
+printf 'API_SERVER_KEY=%s\n' "${EXISTING_API_KEY}" >"${API_KEY_HOME}/.env"
 REUSED_API_KEY="$(env -i PATH="${PATH}" HOME="${HOME}" HERMES_HOME="${API_KEY_HOME}" \
   bash -c "set -euo pipefail
 unset API_SERVER_KEY
 ${API_KEY_BLOCK}
 printf '%s' \"\${API_SERVER_KEY}\"" | tail -n 1)"
-if [ "${REUSED_API_KEY}" = "existing-key" ]; then
+if [ "${REUSED_API_KEY}" = "${EXISTING_API_KEY}" ]; then
   PASS=$((PASS + 1))
   printf "  PASS  %-46s -> reused\n" "install rerun reuses gateway key"
 else
@@ -220,32 +223,73 @@ else
   printf "  FAIL  %-46s -> generated a different key\n" "install rerun reuses gateway key"
 fi
 
+assert_invalid_persisted_key_rejected() {
+  local name="$1"
+  local value="$2"
+  printf 'API_SERVER_KEY=%s\n' "${value}" >"${API_KEY_HOME}/.env"
+  if env -i PATH="${PATH}" HOME="${HOME}" HERMES_HOME="${API_KEY_HOME}" \
+    bash -c "set -euo pipefail
+unset API_SERVER_KEY
+${API_KEY_BLOCK}" >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1))
+    FAILURES+=("${name}: malformed persisted key was accepted")
+    printf "  FAIL  %-46s -> accepted\n" "${name}"
+  else
+    PASS=$((PASS + 1))
+    printf "  PASS  %-46s -> rejected\n" "${name}"
+  fi
+}
+
+KEY_PREFIX="CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+assert_invalid_persisted_key_rejected "persisted key rejects command substitution" \
+  "${KEY_PREFIX}\$(touch /tmp/hermes-key-injection)"
+assert_invalid_persisted_key_rejected "persisted key rejects quote syntax" \
+  "${KEY_PREFIX}\"; touch /tmp/hermes-key-injection; #"
+assert_invalid_persisted_key_rejected "persisted key rejects semicolon syntax" \
+  "${KEY_PREFIX};touch"
+assert_invalid_persisted_key_rejected "persisted key rejects control characters" \
+  "${KEY_PREFIX}"$'\tcontrol'
+
 FAILED_INSTALL_HOME="${ENTRYPOINT_TMP}/failed-install-home"
 mkdir -p "${FAILED_INSTALL_HOME}"
 ORIGINAL_ENV_FILE="${ENTRYPOINT_TMP}/original.env"
-printf '%s\n' 'SENTINEL=keep' 'API_SERVER_KEY=existing-key' \
+printf '%s\n' 'SENTINEL=keep' "API_SERVER_KEY=${EXISTING_API_KEY}" \
   'HERMES_INFERENCE_PROVIDER=custom' >"${ORIGINAL_ENV_FILE}"
 cp "${ORIGINAL_ENV_FILE}" "${FAILED_INSTALL_HOME}/.env"
+SYSTEM_WRITE_LOG="${ENTRYPOINT_TMP}/system-writes.log"
+INSTALL_PREFLIGHT_BLOCK="$(awk '
+  /Generate API_SERVER_KEY if not already set in env/ { grab=1 }
+  grab && /OpenAI bridge: PROVIDER=custom/ { exit }
+  grab { print }
+' "${SCRIPT_DIR}/install.sh")"
 if env -i PATH="${PATH}" HOME="${HOME}" \
-  HERMES_HOME="${FAILED_INSTALL_HOME}" \
-  API_SERVER_KEY=existing-key API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 \
+  HERMES_HOME="${FAILED_INSTALL_HOME}" SYSTEM_WRITE_LOG="${SYSTEM_WRITE_LOG}" \
+  API_SERVER_KEY="${ROTATED_API_KEY}" API_SERVER_HOST=127.0.0.1 API_SERVER_PORT=8642 \
   HERMES_INFERENCE_PROVIDER=platform \
   HERMES_DEFAULT_MODEL=moonshot/kimi-k2.6 \
   MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_LLM_USAGE_TOKEN=dummy \
   bash -c "set -euo pipefail
-${INSTALL_BLOCK}" "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1; then
+sudo() {
+  case \"\${1:-}\" in
+    test) return 0 ;;
+    tee) printf 'write:%s\\n' \"\$1\" >>\"\$SYSTEM_WRITE_LOG\"; cat >/dev/null; return 0 ;;
+    *) printf 'write:%s\\n' \"\${1:-unknown}\" >>\"\$SYSTEM_WRITE_LOG\"; return 0 ;;
+  esac
+}
+${INSTALL_PREFLIGHT_BLOCK}" "${SCRIPT_DIR}/install.sh" >/dev/null 2>&1; then
   FAIL=$((FAIL + 1))
   FAILURES+=("failed install preserves prior env: platform validation unexpectedly succeeded")
   printf "  FAIL  %-46s -> unexpected success\n" "failed install preserves prior env"
 else
   FAILED_INSTALL_TEMPS="$(compgen -G "${FAILED_INSTALL_HOME}/.env.tmp.*" || true)"
-  if cmp -s "${ORIGINAL_ENV_FILE}" "${FAILED_INSTALL_HOME}/.env" && [ -z "${FAILED_INSTALL_TEMPS}" ]; then
+  if cmp -s "${ORIGINAL_ENV_FILE}" "${FAILED_INSTALL_HOME}/.env" && \
+    [ -z "${FAILED_INSTALL_TEMPS}" ] && [ ! -s "${SYSTEM_WRITE_LOG}" ]; then
     PASS=$((PASS + 1))
-    printf "  PASS  %-46s -> unchanged, temp cleaned\n" "failed install preserves prior env"
+    printf "  PASS  %-46s -> no durable writes\n" "failed install preserves prior state"
   else
     FAIL=$((FAIL + 1))
-    FAILURES+=("failed install preserves prior env: durable .env changed or temp file leaked")
-    printf "  FAIL  %-46s -> durable .env changed or temp leaked\n" "failed install preserves prior env"
+    FAILURES+=("failed install preserves prior state: env changed, temp leaked, or system write ran")
+    printf "  FAIL  %-46s -> durable state changed\n" "failed install preserves prior state"
   fi
 fi
 
