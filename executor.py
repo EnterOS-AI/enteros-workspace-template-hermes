@@ -85,6 +85,25 @@ try:
 except ImportError:
     _MOLECULE_TOOLS_AVAILABLE = False
 
+# ADR-004 shared tool-call display: the engine owns the single `emit_tool_call`
+# primitive that POSTs the `agent_log` activity row core#2636 reconstructs into
+# the live progress line + persistent ToolTraceChips. Every adapter calls it at
+# its own tool site so the chip renders identically across runtimes (before this
+# ONLY the claude-code template emitted these rows; hermes showed a bare spinner).
+# Guarded like the mcp_tools import above so the executor still imports on an
+# older base runtime that predates the primitive — the emit just becomes a no-op.
+try:
+    from molecule_runtime.tool_trace import emit_tool_call, summarize_tool
+    _TOOL_TRACE_AVAILABLE = True
+except ImportError:  # pragma: no cover - older base runtime without the primitive
+    _TOOL_TRACE_AVAILABLE = False
+
+    async def emit_tool_call(name, summary=None, status="ok"):  # type: ignore[misc]
+        return None
+
+    def summarize_tool(name, args=None):  # type: ignore[misc]
+        return ""
+
 logger = logging.getLogger(__name__)
 
 
@@ -731,6 +750,26 @@ class HermesAgentProxyExecutor(AgentExecutor):
             )
         except json.JSONDecodeError:
             args = {}
+
+        # ADR-004 shared tool-call display: render this invocation as a
+        # ToolTraceChip on the canvas by POSTing an `agent_log` row via the
+        # engine-owned emit_tool_call primitive (method=<tool_name>). Fire it
+        # BEFORE dispatch so the chip appears as the tool starts, mirroring
+        # claude-code's on_tool_start emit. The primitive is fire-and-forget
+        # and swallows every exception, so it can never abort the tool loop.
+        #
+        # NOTE (plugin-transport follow-up): this only fires on the in-process
+        # chat-completions fallback path (MOLECULE_A2A_PLATFORM_ENABLED=false).
+        # In PROD hermes runs the PLUGIN transport (Dockerfile default true) —
+        # the tool loop lives inside the SEPARATE hermes-agent repo, which
+        # returns only {content} over /a2a/reply, so no per-tool events reach
+        # this executor and this emit is effectively dormant in prod. Closing
+        # the user-visible gap on the plugin path requires hermes-agent to
+        # either emit these `agent_log` rows itself or include a per-tool trace
+        # array in its /a2a/reply callback body (mirroring this same
+        # {activity_type:'agent_log', method:<tool>, summary} contract). That
+        # is a separate-repo change and is deliberately OUT OF SCOPE here.
+        await emit_tool_call(name, summarize_tool(name, args))
 
         if not _MOLECULE_TOOLS_AVAILABLE:
             return f"Tool {name!r} unavailable: molecule_runtime.mcp_tools not installed."
