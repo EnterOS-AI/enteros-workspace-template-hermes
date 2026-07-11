@@ -130,6 +130,27 @@ run_case "byok MOLECULE_RESOLVED_PROVIDER overrides legacy platform signals" \
   "MOLECULE_LLM_BASE_URL=${PROXY}" "MOLECULE_LLM_USAGE_TOKEN=tok-123" \
   "DEFAULT_MODEL=platform/kimi-k2.6" "PROVIDER=kimi-coding"
 
+# (7b.1) The complete derivation chain must also discard a stale explicit
+# Hermes `platform` override. That value otherwise wins in derive-provider.sh,
+# survives the non-platform no-op below, and reaches Hermes as an unknown
+# provider even though the authoritative arm is BYOK.
+actual="$(env -i PATH="$PATH" HOME="$HOME" \
+  MOLECULE_RESOLVED_PROVIDER=kimi-coding \
+  HERMES_INFERENCE_PROVIDER=platform \
+  HERMES_INFERENCE_MODEL=kimi-coding/kimi-k2 \
+  bash -c "set -uo pipefail
+    . '${SCRIPT_DIR}/scripts/derive-provider.sh'
+    DEFAULT_MODEL=\"\${HERMES_INFERENCE_MODEL}\" . '${TARGET}'
+    printf '%s|%s' \"\${PROVIDER:-}\" \"\${HERMES_INFERENCE_PROVIDER:-}\"" 2>/dev/null)"
+if [ "${actual}" = "kimi-coding|kimi-coding" ]; then
+  PASS=$((PASS + 1))
+  printf "  PASS  %-46s -> %s\n" "resolved BYOK clears stale platform override" "${actual}"
+else
+  FAIL=$((FAIL + 1))
+  FAILURES+=("resolved BYOK clears stale platform override: expected [kimi-coding|kimi-coding] got [${actual}]")
+  printf "  FAIL  %-46s -> %s\n" "resolved BYOK clears stale platform override" "${actual}"
+fi
+
 # (7c) MOLECULE_RESOLVED_PROVIDER=platform fails closed without a base URL,
 # same invariant as the legacy-signal path.
 run_case "MOLECULE_RESOLVED_PROVIDER=platform fails closed without base url" \
