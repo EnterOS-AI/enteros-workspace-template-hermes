@@ -49,10 +49,11 @@ fi
 require_line '  retain-local-runtime:'
 require_line '    needs: [resolve-version, publish, promote-pin, verify-pin]'
 require_line '    if: ${{ always() && github.ref == '\''refs/heads/main'\'' }}'
-require_line '          trap '\''docker image rm -f "${LOCAL_CANDIDATE_REF}" >/dev/null 2>&1 || true'\'' EXIT'
+require_line '            echo "::warning::preserving ${LOCAL_CANDIDATE_REF}; pin outcome is ambiguous"'
 require_line '          docker tag "${LOCAL_CANDIDATE_REF}" "${LOCAL_RUNTIME_REF}"'
 require_line '          LOCAL_IMAGE_META="$(docker image inspect --format '\''{{.Id}}|{{json .RepoDigests}}'\'' "${LOCAL_RUNTIME_REF}")"'
 require_line '          echo "::notice::retained ${LOCAL_RUNTIME_REF} locally with verified digest ${IMAGE_DIGEST}"'
+require_line '          docker image rm -f "${LOCAL_CANDIDATE_REF}" >/dev/null 2>&1 || true'
 
 finalize_block="$(sed -n '/^  retain-local-runtime:/,$p' "$WORKFLOW")"
 require_order "$finalize_block" "finalize" \
@@ -60,7 +61,14 @@ require_order "$finalize_block" "finalize" \
   'CANDIDATE_IMAGE_META="$(docker image inspect' \
   'docker tag "${LOCAL_CANDIDATE_REF}" "${LOCAL_RUNTIME_REF}"' \
   'LOCAL_IMAGE_META="$(docker image inspect' \
-  'echo "::notice::retained ${LOCAL_RUNTIME_REF} locally with verified digest ${IMAGE_DIGEST}"'
+  'echo "::notice::retained ${LOCAL_RUNTIME_REF} locally with verified digest ${IMAGE_DIGEST}"' \
+  'docker image rm -f "${LOCAL_CANDIDATE_REF}"'
+
+reclaim_block="$(sed -n '/- name: Reclaim stale runner-local Hermes candidates/,/- name: Set up Docker Buildx/p' "$WORKFLOW")"
+if grep -Fq 'workspace-template-hermes:pending-' <<<"$reclaim_block"; then
+  echo 'FAIL: startup cleanup deletes candidates whose pin outcome may be ambiguous' >&2
+  exit 1
+fi
 
 if grep -Fq 'docker image prune' "$WORKFLOW"; then
   echo 'FAIL: image prune can race digest verification and docker run on the shared daemon' >&2
