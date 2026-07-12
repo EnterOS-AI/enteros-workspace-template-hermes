@@ -1,5 +1,5 @@
 # Molecule AI workspace runtime — adapter + A2A server infra
---extra-index-url https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+# The Dockerfile supplies this wheel from the private index in the same solve.
 molecules-workspace-runtime>=0.3.10
 
 # P0 band-aid for canvas-chat upload 400 "failed to parse multipart form"

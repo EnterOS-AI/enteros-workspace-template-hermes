@@ -577,16 +577,13 @@ jobs:
   # closes the hermes gap and is wired into BOTH required-check aggregates
   # (`validate` + `all-required`) so branch protection actually enforces it.
   #
-  # SCOPE: this job runs the conformance test SPECIFICALLY, not the whole
-  # tests/ dir. The adapter-socket suite (16 cases) is the CI2 target and is
-  # green. tests/test_executor_plugin_path.py is intentionally NOT gated here
-  # — it is unrelated to the adapter socket and currently fails independently
-  # of this change (a2a extract_message_text / MagicMock-context version
-  # sensitivity); gating it would make CI red for reasons outside CI2. File a
-  # separate follow-up to fix + wire the executor tests. The other adapter-
-  # adjacent suites (test_adapter/test_registry_projection/test_release_
-  # contracts/test_tool_activity_liveness) all pass and can be folded in by
-  # that follow-up once the executor suite is fixed.
+  # SCOPE: this job runs adapter conformance plus the narrow release/runtime
+  # supply-chain contracts, not the whole tests/ dir. The adapter-socket suite
+  # (16 cases) is the CI2 target and is green. tests/test_executor_plugin_path.py
+  # is intentionally NOT gated here — it is unrelated to this contract and
+  # currently fails independently (a2a extract_message_text / MagicMock-context
+  # version sensitivity). The remaining adapter-adjacent suites can be folded
+  # in after that separate debt is fixed.
   conformance:
     name: Adapter-socket conformance
     runs-on: ubuntu-latest
@@ -610,4 +607,10 @@ jobs:
       # the private-index --extra-index-url is applied for its own private
       # transitive deps.
       - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements-dev.txt
-      - run: python3 -m pytest tests/test_conformance.py -v
+      - name: Run adapter and private-runtime contracts
+        run: >-
+          python3 -m pytest
+          tests/test_conformance.py
+          tests/test_release_contracts.py
+          tests/test_prepare_runtime_requirements.py
+          -v
