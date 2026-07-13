@@ -15,4 +15,4 @@ packaging>=23
 # (molecule_plugin.adapter_conformance); tests/test_conformance.py inherits it.
 # Pin the reviewed SDK contract commit so adapter conformance cannot drift when
 # SDK main advances. NOT public PyPI; this is a content-addressed Gitea source.
-molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@3474157daca56e3de5b7cffd2a2f84b78bf63b68
+molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586
