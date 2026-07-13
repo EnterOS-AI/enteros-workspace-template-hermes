@@ -658,7 +658,8 @@ jobs:
         run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
       # requirements-dev.txt pins pytest + pytest-asyncio and the molecule-ai-sdk
       # (molecule_plugin) that ships the AdapterConformance battery that
-      # tests/test_conformance.py inherits. The SDK is a git-main pin there, so
+      # tests/test_conformance.py inherits. The SDK is pinned to a reviewed
+      # immutable commit there, so
       # the private-index --extra-index-url is applied for its own private
       # transitive deps.
       - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements-dev.txt
