@@ -613,4 +613,9 @@ fi
 # Mirror the exact env used for the gosu'd MCP server at line ~359 so token
 # path resolution (configs_dir.resolve() explicit-override branch) stays
 # deterministic. This also fixes .platform_inbound_secret (same writer).
+#
+# The runtime also owns declared-plugin source parsing, fetching, and atomic
+# installation before adapter setup. Runtime 0.4 rejects unsafe dot/path install
+# names and contains every resolved destination under /configs/plugins. Keep
+# plugin installation out of this privileged boot script.
 exec gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
