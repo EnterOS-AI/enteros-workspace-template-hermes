@@ -1,6 +1,6 @@
 # Molecule AI workspace runtime — adapter + A2A server infra
 # The Dockerfile supplies this wheel from the private index in the same solve.
-molecules-workspace-runtime>=0.3.10
+molecules-workspace-runtime>=0.4.0
 
 # P0 band-aid for canvas-chat upload 400 "failed to parse multipart form"
 # (task #256; forensic a5bb950f). Starlette `Request.form()` raises
