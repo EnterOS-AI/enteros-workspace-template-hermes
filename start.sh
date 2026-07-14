@@ -79,7 +79,17 @@ if [ "$(id -u)" = "0" ]; then
   # here — /configs was chowned, /workspace was NOT, so every uid-1000 kernel
   # write failed (durability guard: UNWRITABLE; idle-digest providers
   # PermissionError; goal_set silently unable to persist). core#4295.
-  chown -R agent:agent /workspace 2>/dev/null || true
+  #
+  # GUARDED on current ownership: only claim a ROOT-owned tree (the broken-era
+  # named-volume shape — the heal fires exactly once, then steady-state boots
+  # skip the full tree walk). Never touch a /workspace owned by anyone else:
+  # in WorkspacePath mode it is an operator's real HOST directory, and
+  # recursively re-owning their files to uid 1000 would be a silent, harmful
+  # host mutation. Everything below runs uid-1000 via gosu, so an agent-owned
+  # tree never drifts back to root.
+  if [ "$(stat -c %u /workspace 2>/dev/null)" = "0" ]; then
+    chown -R agent:agent /workspace 2>/dev/null || true
+  fi
 fi
 
 HERMES_HOME="/tmp/.hermes"
