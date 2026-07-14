@@ -1,167 +1,86 @@
-# Architecture — A2A bridge to hermes-agent
+# Architecture — Molecule A2A bridge to Hermes
 
-## Port map
+This document describes the code on the current branch. Historical rewrite
+context lives in `PLANNING.md` and `MIGRATION.md` and is not an operating guide.
 
+## Process and port map
+
+```text
+platform/canvas
+      |
+      v
+molecule-runtime / A2A                    :8000
+      |
+      +--> Molecule MCP HTTP server       127.0.0.1:9100
+      |
+      v
+HermesAgentProxyExecutor
+      |
+      +--> Hermes plugin transport        127.0.0.1:8645 (opt-in)
+      |
+      +--> chat-completions fallback      127.0.0.1:8642
+                                                   ^
+                                                   |
+                                      hermes gateway
 ```
-┌─────────────────── workspace container ───────────────────┐
-│                                                           │
-│   :8000  ← molecule_runtime (A2A server + adapter) ──┐    │
-│                                                      │    │
-│                       proxy                          │    │
-│                                                      ▼    │
-│   :8642  → hermes-agent gateway (OpenAI-compat API)       │
-│            running as user `agent`, state in ~/.hermes    │
-│                                                           │
-└───────────────────────────────────────────────────────────┘
-            ▲
-            │  (only :8000 exposed outside)
-            │
-      platform + canvas
-```
 
-- **`:8000`** — A2A server, exposed to the rest of the platform.
-  Contract is stable across all runtimes (langgraph, claude-code,
-  hermes, etc.).
-- **`:8642`** — hermes-agent's OpenAI-compatible HTTP API. Loopback
-  only. Never routed outside the container.
+Only the A2A runtime is platform-facing. The Hermes and MCP surfaces are
+loopback services inside the workspace.
 
 ## Boot sequence
 
-`start.sh` (runs as root inside the container):
+`start.sh` is the supported container entrypoint:
 
-1. Generate a random `API_SERVER_KEY` if the env var isn't already
-   set. This is hermes-agent's bearer token; the executor reads it
-   from the env at request time.
-2. Write `/home/agent/.hermes/.env`:
-   - `API_SERVER_ENABLED=true`
-   - `API_SERVER_KEY=<generated>`
-   - `API_SERVER_HOST=127.0.0.1`
-   - `API_SERVER_PORT=8642`
-   - Any provider keys present in the container env (`HERMES_API_KEY`,
-     `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-     `GEMINI_API_KEY`, `MINIMAX_API_KEY`) forwarded through.
-3. Launch `hermes gateway` in the background as user `agent` via
-   `sudo -u agent -E bash -lc 'hermes gateway'`. Logs → `/var/log/hermes-gateway.log`.
-4. Poll `http://127.0.0.1:8642/health` up to 60×1s. Fail loud on
-   timeout — dumps last 80 log lines to stderr so provisioning logs
-   capture the reason.
-5. `exec molecule-runtime` — replaces the shell, becoming PID 1.
-   molecule-runtime loads `Adapter = HermesAgentAdapter` from
-   `__init__.py` and starts the A2A server on `:8000`.
+1. In smoke mode, skip gateway startup and execute `molecule-runtime` through
+   the same unprivileged-user path used by the image checks.
+2. Make `/configs` available to the uid-1000 `agent` process and load the
+   platform-projected workspace configuration.
+3. Create `/tmp/.hermes`, generate or reuse the loopback API key, and render
+   the Hermes environment and config from the selected model/provider.
+4. Start the Molecule MCP HTTP server on port 9100 and verify its JSON-RPC
+   initialize response.
+5. Start `hermes gateway` as `agent`, wait up to 120 seconds for port 8642's
+   `/health`, and verify that Hermes sees the `molecule` MCP server.
+6. Execute `molecule-runtime` as `agent` with `CONFIGS_DIR=/configs`.
 
-## Request flow
+Gateway and MCP logs live under `/tmp/.hermes` in the current image. Do not
+document `/var/log` or `/home/agent/.hermes` as the active log/config path.
 
-```
-canvas ─── POST /a2a/... ───▶ molecule_runtime (:8000)
-                                    │
-                                    ▼
-                        HermesAgentProxyExecutor.execute()
-                                    │
-                 ┌──────────────────┴──────────────────┐
-                 ▼                                     ▼
-      extract message text                  build {model, messages[], stream:false}
-                                                      │
-                                                      ▼
-                                  POST 127.0.0.1:8642/v1/chat/completions
-                                  Authorization: Bearer ${API_SERVER_KEY}
-                                                      │
-                                                      ▼
-                                  hermes-agent runs the turn with its
-                                  native tools (terminal, files, web,
-                                  memory, skills), resolves provider
-                                  from the `model` string, returns
-                                  OpenAI-format response.
-                                                      │
-                                                      ▼
-                           extract choices[0].message.content
-                                                      │
-                                                      ▼
-                              event_queue.enqueue_event(
-                                new_agent_text_message(...)
-                              )
-                                                      │
-                                                      ▼
-                                            canvas receives the reply
-```
+## Adapter setup
 
-## What the bridge is intentionally **not** doing
+`HermesAgentAdapter.setup()`:
 
-- **Provider selection.** The bridge sends the `model` string
-  verbatim. hermes-agent owns the registry and picks provider + API
-  keys. If you ever feel tempted to add fallback chains here, stop —
-  that's a regression to v1.x.
-- **Tool routing.** Tools are hermes-agent's job. Our bridge sees
-  only the final assistant text.
+- builds the platform system prompt, including plugin rules/fragments;
+- materializes the agent identity to Hermes' native persona file;
+- installs declared plugins through the runtime's adapter registry;
+- verifies the active Hermes transport health endpoint; and
+- exposes adapter-native MCP configuration and loaded-tool enumeration.
 
-## Provider routing (how keys become inference)
+Smoke mode intentionally skips live gateway/plugin probes.
 
-Provider resolution happens inside hermes-agent, driven by:
+## Turn execution
 
-1. **`~/.hermes/cli-config.yaml`** — `model.provider` field. start.sh
-   seeds this file on first boot (`auto` by default, or whatever
-   `HERMES_INFERENCE_PROVIDER` specifies).
-2. **`~/.hermes/.env`** — every provider key we forward from the
-   container env (see start.sh for the full list; see
-   `CONFIGURATION.md#provider-matrix` for the mapping).
-3. **Auto-detection** — when `provider: auto`, hermes walks its
-   internal resolution order and picks the first provider whose
-   credential is present. When multiple keys are set, prefer explicit
-   `HERMES_INFERENCE_PROVIDER` to avoid surprises.
+`HermesAgentProxyExecutor.execute()` extracts text and attachment metadata,
+rejects a truly empty request with an actionable response, and preserves recent
+canvas history.
 
-### Common routing gotcha
+- When `MOLECULE_A2A_PLATFORM_ENABLED` is true, the executor uses the Hermes
+  plugin transport and waits for the callback reply.
+- Otherwise it uses the loopback OpenAI-compatible chat-completions endpoint.
 
-With only `OPENAI_API_KEY` set and `provider: auto`, hermes-agent will
-route to `openai-codex` (Codex API, OAuth-only) and return:
+Both paths have bounded wall-clock timeouts. The executor also exposes the
+Molecule MCP dispatcher so peer and workspace tools use the common runtime
+contract instead of a template-local implementation.
 
-```
-401 - Missing Authentication header
-```
+## Sources of truth
 
-The fix is to set `HERMES_INFERENCE_PROVIDER=openrouter` — hermes's
-openrouter provider accepts `OPENAI_API_KEY` as alt-auth and routes
-OpenAI-format Chat Completions correctly. This is documented in
-`CONFIGURATION.md#forcing-a-provider`.
+| Concern | Source |
+|---|---|
+| Boot, rendered Hermes config, provider env | `start.sh` and `scripts/*.sh` |
+| Adapter hooks and health selection | `adapter.py` |
+| Transport choice and turn behavior | `executor.py` |
+| Models/providers shown by the template | `config.yaml` |
+| Image publication and pin checks | `.gitea/workflows/publish-image.yml` |
 
-### Auxiliary model
-
-Vision, web summarization, and MoA use a separate auxiliary model —
-defaults to Gemini Flash via OpenRouter. If `OPENROUTER_API_KEY` is
-absent, these capabilities break silently (the primary path still
-works). Set `HERMES_AUXILIARY_PROVIDER` to override.
-- **Streaming.** `stream: false` in the request payload. A later
-  revision can upgrade to SSE by subscribing to
-  `GET /v1/runs/{run_id}/events` and pushing partial messages into
-  the A2A event queue — the `AgentExecutor` contract already
-  supports multiple `enqueue_event` calls per turn.
-- **Caching.** hermes-agent has its own session store
-  (`X-Hermes-Session-Id`); the bridge does not attempt to pin
-  conversations. Molecule's A2A layer already carries session
-  context in its message envelope.
-
-## Failure modes
-
-| Symptom                                             | Likely cause                                  | Where to look                                                  |
-|-----------------------------------------------------|-----------------------------------------------|---------------------------------------------------------------|
-| Provisioning fails at "health probe"                | `hermes gateway` crashed during boot          | `/var/log/hermes-gateway.log` (tail in start.sh stderr dump)  |
-| Every request returns `[hermes-agent error 401]`    | `API_SERVER_KEY` mismatch between processes   | Inspect `/home/agent/.hermes/.env` + container env            |
-| Every request returns `[hermes-agent error 400]`    | Model string unrecognized by hermes-agent     | `docker exec -u agent … hermes model` inside the container    |
-| `[hermes-agent unreachable]`                        | Gateway exited post-boot (OOM, crash)         | `/var/log/hermes-gateway.log`; may need container restart     |
-| Skills disappear between sessions                   | `/home/agent/.hermes` not volume-mounted      | Platform-side volume config; see `CONFIGURATION.md`            |
-| Agent ignores provider key                          | Key not forwarded from container env          | Workspace secrets; see runbooks/saas-secrets.md in monorepo   |
-
-## Future work
-
-- **Streaming:** subscribe to `/v1/runs/.../events` and pipe partial
-  assistant tokens + tool progress into the A2A queue.
-- **Session pinning:** thread hermes-agent's `X-Hermes-Session-Id`
-  through the A2A envelope so long conversations keep server-side
-  context when beneficial.
-- **`hermes config set` sync:** when canvas Config tab changes the
-  `model` field, also invoke `hermes model <id>` so CLI usage inside
-  the workspace's Terminal tab stays in sync.
-- **Gateway platforms passthrough:** let customers opt their workspace
-  into hermes-agent's Telegram/Discord/Slack platforms without
-  duplicating the config surface.
-- **Install pin:** once stabilized, replace `curl install.sh | bash`
-  in the Dockerfile with a pinned commit SHA so a bad upstream
-  release doesn't break builds.
+Open future architecture work as a Gitea issue. Do not append speculative
+phases or manual deployment procedures to this file.
