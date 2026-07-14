@@ -134,7 +134,7 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # Two refs are installed into the same venv that the upstream installer
 # created above:
 #
-#   1. A pinned hermes-agent fork carrying the proposed
+#   1. The Molecule-maintained hermes-agent fork carrying the proposed
 #      `register_platform_adapter` patch series (NousResearch/hermes-agent
 #      PR #18775). Installed --force-reinstall over the upstream wheel so
 #      `hermes_cli/plugins.py` exposes PluginContext.register_platform_adapter
@@ -147,8 +147,7 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # exists. Once merged + released, the fork install can be dropped and the
 # plugin will load against the official wheel unchanged.
 #
-# moved to git.moleculesai.app/molecule-ai/hermes-agent (post-suspension migration; see internal#72)
-# Previously: github.com/HongmingWang-Rabbit/hermes-agent (account suspended 2026-05-06).
+# The maintained fork lives at git.moleculesai.app/molecule-ai/hermes-agent.
 ARG HERMES_FORK_REF=feat/platform-adapter-plugins
 ARG HERMES_PLATFORM_MOLECULE_A2A_REF=24f4300a566eaa4af51e94c5e54f34af0978e508
 # The hermes installer uses uv to create the venv and doesn't seed pip

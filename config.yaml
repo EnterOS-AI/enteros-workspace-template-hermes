@@ -436,7 +436,7 @@ runtime_config:
   # banner (Molecule-AI/molecule-core#2054). Hermes installs ripgrep +
   # ffmpeg + node22 + builds hermes-agent from source + pulls Playwright
   # + Chromium (~300MB), so cold boots routinely land at 8-13 min on
-  # staging EC2. 720s aligns with the SaaS E2E PROVISION_TIMEOUT_SECS=900
+  # a fresh workspace host. 720s aligns with the SaaS E2E PROVISION_TIMEOUT_SECS=900
   # so the UI warning surfaces shortly before the backend itself gives
   # up. Without this declaration, canvas falls back to its 2-min default
   # and false-alarms on every fresh hermes provision.

@@ -213,7 +213,7 @@ class HermesAgentAdapter(BaseAdapter):
             port = int(os.environ.get("MOLECULE_A2A_PLATFORM_PORT", "8645"))
             health_url = f"http://{host}:{port}/a2a/health"
             err_hint = (
-                "Check /var/log/hermes-gateway.log inside the container — "
+                "Check the workspace logs for the Hermes gateway — "
                 "the molecule-a2a platform stanza in ~/.hermes/config.yaml "
                 "should make hermes load the plugin and bind this port."
             )
@@ -222,7 +222,7 @@ class HermesAgentAdapter(BaseAdapter):
                 "HERMES_API_BASE", "http://127.0.0.1:8642/v1"
             ).rstrip("/")
             health_url = base.replace("/v1", "") + "/health"
-            err_hint = "Check /var/log/hermes-gateway.log inside the container."
+            err_hint = "Check the workspace logs for the Hermes gateway."
 
         # AsyncClient — sync httpx inside an async setup() can deadlock
         # against an aiohttp server sharing the same event loop (only
