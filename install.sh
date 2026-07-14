@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# install.sh — set up hermes-agent on a bare-host workspace (EC2 /
-# bare-metal / any OS-level install). Runs as the workspace's runtime
-# user (typically `ubuntu` on EC2) AFTER molecule-ai-workspace-runtime
-# has been pip-installed and this repo's *.py adapter files have been
-# copied into site-packages, BEFORE molecule-runtime is started.
+# install.sh — legacy setup for an explicitly self-managed bare host.
+# It runs as the workspace's runtime user after
+# molecule-ai-workspace-runtime and this repo's adapter files have been
+# installed, before molecule-runtime starts.
 #
-# This is the symmetric twin of start.sh. start.sh is the entrypoint
-# of the Docker image used for local dev (`docker compose up`).
-# install.sh is what the SaaS EC2 provisioner calls on the host.
+# Hosted workspaces use the published image and start.sh; the hosted
+# control plane does not call this script. Keep it only for self-managed
+# installations that deliberately select the bare-host path.
 #
 # Both do the same high-level work:
 #   1. Install the real hermes-agent from NousResearch/hermes-agent
@@ -15,12 +14,6 @@
 #   3. Seed ~/.hermes/config.yaml (default model + provider)
 #   4. Start `hermes gateway` in the background
 #   5. Wait until :8642 /health returns 200
-#
-# Architectural context: each workspace template ships both recipes
-# because the control plane picks different code paths depending on
-# backend. See internal/product/designs/workspace-backends.md for the
-# manifest-driven backend-selection design that subsumes this dual
-# setup.
 #
 # Idempotent: safe to re-run. Kills any prior gateway process for
 # this user before starting a fresh one.
@@ -36,7 +29,7 @@ echo "[install.sh] hermes bare-host setup starting (user=$USER, home=$HOME)"
 
 # --- System deps (idempotent) ---
 # hermes-agent installer pulls a Node 22 .tar.xz and builds some
-# Python deps from source. Ubuntu EC2 AMI ships without xz or gcc.
+# Python deps from source. Minimal Ubuntu hosts may omit xz or gcc.
 if ! command -v xz >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
   echo "[install.sh] installing system deps (xz-utils + build-essential)..."
   sudo apt-get update -qq
@@ -176,8 +169,8 @@ persist_gateway_api_key() {
 
 # --- Write hermes-agent .env ---
 # Every provider key the workspace's process env carries is forwarded.
-# CP's provisioner injects these from Secrets Manager + the per-tenant
-# shared secret bundle before this script runs.
+# The caller must provide these through the workspace/platform secret
+# surfaces before this script runs.
 ENV_FILE="$HERMES_HOME/.env"
 ENV_FILE_TMP="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
 trap 'if [ -n "${ENV_FILE_TMP:-}" ]; then rm -f "${ENV_FILE_TMP}"; fi' EXIT
