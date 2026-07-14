@@ -45,6 +45,13 @@ def test_retired_ecr_lifecycle_helper_is_absent():
     assert not (ROOT / "scripts" / "ensure-ecr-lifecycle.sh").exists()
 
 
+def test_architecture_describes_image_default_plugin_transport():
+    architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+
+    assert "8645 (image default)" in architecture
+    assert "8645 (opt-in)" not in architecture
+
+
 def test_publish_workflow_exposes_digest_when_promote_reads_it():
     workflow = (ROOT / ".gitea/workflows/publish-image.yml").read_text()
 

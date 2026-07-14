@@ -16,7 +16,7 @@ molecule-runtime / A2A                    :8000
       v
 HermesAgentProxyExecutor
       |
-      +--> Hermes plugin transport        127.0.0.1:8645 (opt-in)
+      +--> Hermes plugin transport        127.0.0.1:8645 (image default)
       |
       +--> chat-completions fallback      127.0.0.1:8642
                                                    ^
@@ -25,7 +25,9 @@ HermesAgentProxyExecutor
 ```
 
 Only the A2A runtime is platform-facing. The Hermes and MCP surfaces are
-loopback services inside the workspace.
+loopback services inside the workspace. The image sets
+`MOLECULE_A2A_PLATFORM_ENABLED=true`; explicitly disabling that flag selects
+the chat-completions fallback on port 8642.
 
 ## Boot sequence
 
