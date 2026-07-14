@@ -275,8 +275,10 @@ async def test_setup_drives_plugin_pipeline(monkeypatch, tmp_path):
 
     monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
     monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "true")
-    # Kernel-off memory target: append_to_memory writes under configs.
-    monkeypatch.delenv("MOLECULE_MAILBOX_KERNEL", raising=False)
+    # Kernel opt-out memory target: append_to_memory writes under configs.
+    # (The mailbox kernel is native default-ON since runtime PR#288 — unset
+    # no longer means off; only the explicit "0" opt-out does. hermes#223.)
+    monkeypatch.setenv("MOLECULE_MAILBOX_KERNEL", "0")
 
     configs = tmp_path / "configs"
     plugin = configs / "plugins" / "probe-plugin"

@@ -71,6 +71,15 @@ fi
 # host-root-reach assertion. Mirrors claude-code entrypoint.sh (12dd604).
 if [ "$(id -u)" = "0" ]; then
   chown -R agent:agent /configs 2>/dev/null || true
+  # /workspace is the DURABLE volume (mailbox kernel state: inbox cursor,
+  # delegation tombstones, goal-state, task ledger, memory — plus chat
+  # uploads). Docker ships named volumes root:755; the provisioner contract
+  # (workspace-server provisioner.go: "the entrypoint starts as root, chowns
+  # /configs and /workspace, then drops to agent") was only half-implemented
+  # here — /configs was chowned, /workspace was NOT, so every uid-1000 kernel
+  # write failed (durability guard: UNWRITABLE; idle-digest providers
+  # PermissionError; goal_set silently unable to persist). core#4295.
+  chown -R agent:agent /workspace 2>/dev/null || true
 fi
 
 HERMES_HOME="/tmp/.hermes"
