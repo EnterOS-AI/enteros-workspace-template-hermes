@@ -59,10 +59,10 @@ RUN set -eux; \
     id agent
 
 # --- Install molecule_runtime (bridge + A2A server) ---
-# RUNTIME_VERSION is forwarded from molecule-ci's reusable publish
+# RUNTIME_VERSION is forwarded from this repository's publish-image
 # workflow as a docker build-arg. Cascade-triggered builds set it to
-# the exact runtime version PyPI just published. Including it as an
-# ARG changes the cache key for the pip install layer below — without
+# the exact version just published to the internal Gitea package registry.
+# Including it as an ARG changes the cache key for the pip install layer below — without
 # this, identical Dockerfile + identical requirements.txt would let
 # docker reuse the cached layer with the previous version baked in
 # (the cache trap that bit us 5x on 2026-04-27).

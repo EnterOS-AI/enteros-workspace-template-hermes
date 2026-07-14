@@ -39,7 +39,10 @@ RETIRED_RUNTIME_GUIDANCE = {
     r"operator[- ]host": "the retired operator-host access model",
     r"Gitea 1\.22": "the retired Gitea server-version guidance",
     r"PyPI (publish|abuse)": "the retired public-PyPI release blocker",
+    r"runtime version PyPI just published": "the retired public-PyPI runtime description",
     r"github\.com/HongmingWang-Rabbit": "the suspended personal fork route",
+    r"molecule-ci's reusable publish": "the old reusable-publish description",
+    r"\.github/ci\.yml": "the retired GitHub Actions workflow path",
 }
 
 

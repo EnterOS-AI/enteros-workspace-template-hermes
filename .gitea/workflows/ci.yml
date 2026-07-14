@@ -577,11 +577,8 @@ jobs:
           echo "::notice::All required CI jobs passed (static=$static, runtime=$runtime, t4=$t4, conformance=$conformance, shell=$shell)"
 
   shell-tests:
-    # Shell-level unit tests for scripts/*.sh. Pre-existing
-    # test-derive-provider.sh + test-install-prefix-strip.sh weren't
-    # wired to CI before; landing the new test-load-workspace-config.sh
-    # fix opportunistically closes that gap. Runs in <5s on a fresh
-    # runner. Preserved verbatim from .github/ci.yml.
+    # Shell-level unit tests for scripts/*.sh. Keep every helper test wired
+    # into CI; the suite completes in under five seconds on a fresh runner.
     name: Shell unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 3
