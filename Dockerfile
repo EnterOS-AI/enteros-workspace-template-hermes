@@ -114,7 +114,7 @@ RUN chmod +x /usr/local/bin/start.sh
 # provisioner sets GIT_ASKPASS to that path. Script body contains no
 # hostnames or vendor literals; the deployer decides which remote the
 # credentials apply to by virtue of populating those env vars.
-COPY scripts/git-askpass.sh /usr/local/bin/molecule-askpass
+COPY scripts/molecule-askpass /usr/local/bin/molecule-askpass
 RUN chmod +x /usr/local/bin/molecule-askpass
 
 # --- Install the real Nous Research hermes-agent as the agent user ---
