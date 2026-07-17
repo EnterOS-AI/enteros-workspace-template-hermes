@@ -340,7 +340,7 @@ jobs:
           push_with_retry() {
             local ref="$1" attempt output
             for attempt in 1 2 3; do
-              if output="$(docker push "${ref}" 2>&1)"; then
+              if output="$(timeout 480 docker push "${ref}" 2>&1)"; then
                 printf '%s\n' "${output}"
                 return 0
               fi
