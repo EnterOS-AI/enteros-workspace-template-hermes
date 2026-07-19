@@ -93,6 +93,18 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 HERMES_HOME="/tmp/.hermes"
+# Persist hermes state across container RECREATES (plugin installs and
+# platform restarts recreate the container): every process resolves the state
+# dir as ~/.hermes with HOME=/tmp (gateway, hermes CLI, the runtime's config
+# render), so rather than re-plumb HOME everywhere, /tmp/.hermes becomes a
+# SYMLINK onto the persisted /configs volume. Without this the session store
+# (state.db, sessions/) died with the old container and the agent woke
+# amnesiac -- "session history is empty" (2026-07-19, lost the lark-install
+# task mid-conversation; executor.py's history re-attach comment tracks the
+# same gap as "separate task: move HERMES_HOME to a workspace volume").
+install -d -o agent -g agent /configs/.hermes
+rm -rf /tmp/.hermes 2>/dev/null || true
+ln -sfn /configs/.hermes /tmp/.hermes
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
 # Log files live under HERMES_HOME (agent-owned via `install -d -o agent`
@@ -124,6 +136,24 @@ fi
 # below land inside an agent-owned dir. MUST happen before any gateway
 # log-file or MCP-log-file `install` calls.
 install -d -o agent -g agent "$HERMES_HOME"
+
+# --- Persona -> SOUL.md graft -------------------------------------------------
+# The platform delivers the workspace persona to /configs (the concierge's
+# composed config grafts it at prompts/concierge.md; plain workspaces use
+# system-prompt.md). The hermes DAEMON reads its identity from
+# ${HERMES_HOME}/SOUL.md and knows nothing about prompt_files -- without this
+# graft it boots on the stock Hermes soul and answers as "Hermes", not its
+# role (the 2026-07-19 "I'm Hermes" concierge-identity incident). The
+# daemon's _ensure_default_soul_md only seeds SOUL.md when ABSENT, so our
+# pre-start install wins; re-installing on every boot keeps a persona update
+# effective after restart.
+for persona in /configs/prompts/concierge.md /configs/system-prompt.md; do
+  if [ -s "$persona" ]; then
+    install -m 644 -o agent -g agent "$persona" "${HERMES_HOME}/SOUL.md"
+    echo "[start.sh] grafted persona ${persona} -> ${HERMES_HOME}/SOUL.md"
+    break
+  fi
+done
 
 # --- Install log files atomically (race-free) ---
 # Regression fix re-applied 2026-05-15: a previous build (image
