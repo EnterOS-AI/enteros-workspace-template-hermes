@@ -168,6 +168,92 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+
+_SESSIONS_DIR = os.path.join("/tmp/.hermes", "sessions")
+_TOOL_TRACE_MAX_STEPS = 40
+_TOOL_TRACE_INPUT_MAX = 200
+
+
+def _session_jsonl_snapshot() -> dict[str, int]:
+    """Byte-offset snapshot of every session .jsonl file, taken BEFORE a turn
+    dispatches. The gateway owns session state; the executor only ever READS
+    the delta after the reply arrives, so tool calls made during the turn can
+    be surfaced as the canvas tool_trace chain (parity with claude-code)."""
+    sizes: dict[str, int] = {}
+    try:
+        for name in os.listdir(_SESSIONS_DIR):
+            if not name.endswith(".jsonl"):
+                continue
+            p = os.path.join(_SESSIONS_DIR, name)
+            try:
+                sizes[p] = os.path.getsize(p)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return sizes
+
+
+def _tool_trace_from_session_delta(before: dict[str, int]) -> list[dict[str, str]]:
+    """Parse assistant tool_calls out of the session-file bytes written since
+    ``before`` and map them to the platform tool_trace shape
+    ([{"tool": name, "input": truncated-args}]). Best-effort: any parse
+    problem yields a shorter (or empty) trace, never an exception."""
+    trace: list[dict[str, str]] = []
+    try:
+        for name in os.listdir(_SESSIONS_DIR):
+            if not name.endswith(".jsonl"):
+                continue
+            p = os.path.join(_SESSIONS_DIR, name)
+            start = before.get(p, 0)
+            try:
+                if os.path.getsize(p) <= start:
+                    continue
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(start)
+                    delta = fh.read()
+            except OSError:
+                continue
+            for line in delta.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("role") != "assistant":
+                    continue
+                for tc in rec.get("tool_calls") or []:
+                    fn = (tc or {}).get("function") or {}
+                    tool = str(fn.get("name") or "").strip()
+                    if not tool:
+                        continue
+                    args = fn.get("arguments")
+                    entry: dict[str, str] = {"tool": tool}
+                    if args:
+                        entry["input"] = str(args)[:_TOOL_TRACE_INPUT_MAX]
+                    trace.append(entry)
+                    if len(trace) >= _TOOL_TRACE_MAX_STEPS:
+                        return trace
+    except Exception:  # noqa: BLE001 — presentation only, never break a reply
+        return trace
+    return trace
+
+
+def _reply_message_with_tool_trace(text: str, trace: list[dict[str, str]]):
+    """new_text_message + metadata.tool_trace when the turn used tools. The
+    platform extracts result.metadata.tool_trace from the serialized reply
+    (a2a_proxy_helpers.extractToolTrace) and the canvas renders the chain."""
+    msg = new_text_message(text)
+    if trace:
+        try:
+            msg.metadata.update({"tool_trace": trace})
+        except Exception:  # noqa: BLE001 — metadata is optional decoration
+            pass
+    return msg
+
+
 class HermesAgentProxyExecutor(AgentExecutor):
     """Forwards every A2A turn to hermes-agent."""
 
@@ -392,6 +478,11 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if self._shared_secret:
             headers[SECRET_HEADER] = self._shared_secret
 
+        # Tool-trace capture (canvas chain parity with claude-code): snapshot
+        # the session files before dispatch; the post-reply delta holds the
+        # turn's assistant tool_calls.
+        session_snapshot = _session_jsonl_snapshot()
+
         inbound_url = (
             f"http://{self._plugin_host}:{self._plugin_port}/a2a/inbound"
         )
@@ -427,7 +518,11 @@ class HermesAgentProxyExecutor(AgentExecutor):
         finally:
             self._pending.pop(message_id, None)
 
-        await event_queue.enqueue_event(new_text_message(text))
+        await event_queue.enqueue_event(
+            _reply_message_with_tool_trace(
+                text, _tool_trace_from_session_delta(session_snapshot)
+            )
+        )
 
     async def _handle_reply(self, request: "web.Request") -> "web.Response":
         if self._shared_secret:
