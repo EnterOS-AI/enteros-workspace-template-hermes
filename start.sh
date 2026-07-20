@@ -595,7 +595,14 @@ fi
 # binary lookup only needs read.
 # Use bash -c (not -lc) since we no longer want the login-shell HOME-driven
 # defaults; we're explicitly setting PATH + HOME inline.
-nohup gosu agent env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+# BUSY_INPUT_MODE=queue: a message that arrives while a turn is running
+# (the first-boot greeting, a long tool chain) QUEUES and cascades as the
+# next turn instead of the default interrupt -- which aborted the running
+# turn and sent the caller the "Interrupting current task..." ack AS THEIR
+# ANSWER (the staging greeting e2e failure, 2026-07-20). Platform chat
+# wants strict turn ordering; the canvas Stop button cancels via the task
+# API, so no interrupt-by-chat capability is lost.
+nohup gosu agent env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     bash -c "cd /tmp && hermes gateway" \
     >>"$LOG_FILE" 2>&1 &
 GATEWAY_PID=$!
