@@ -42,6 +42,40 @@ def test_pr_image_build_pins_and_verifies_exact_runtime(job_name: str) -> None:
         assert "template-test" not in script
 
 
+def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
+    steps = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["t4-conformance"]["steps"]
+    build_script = next(
+        step["run"] for step in steps if "docker build" in step.get("run", "")
+    )
+    probe_script = next(
+        step["run"]
+        for step in steps
+        if "docker run --rm" in step.get("run", "")
+        and "capless-liveness" in step.get("run", "")
+    )
+
+    assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
+        "docker build"
+    )
+    assert build_script.index("KEEP_T4_IMAGE=1") > build_script.index(
+        '"$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION"'
+    )
+    assert probe_script.index("trap '") < probe_script.index("docker run --rm")
+
+
+def test_checkout_credentials_never_persist() -> None:
+    jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
+    checkouts = [
+        step
+        for job in jobs.values()
+        for step in job.get("steps", [])
+        if str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+
+    assert checkouts
+    assert all(step.get("with", {}).get("persist-credentials") is False for step in checkouts)
+
+
 def test_required_conformance_job_runs_runtime_image_contract() -> None:
     jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
     steps = jobs["conformance"]["steps"]

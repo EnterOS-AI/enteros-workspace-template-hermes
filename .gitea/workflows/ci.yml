@@ -76,6 +76,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       # Canonical validator script lives in molecule-ci, fetched fresh on
       # every run. Anonymous fetch of the public molecule-ci repo — no
       # token needed; no actions/checkout cross-repo idiosyncrasies.
@@ -229,6 +231,8 @@ jobs:
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Skip executable validation for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::dependency installation, adapter import, and Docker execution are disabled for external forks"
@@ -326,6 +330,8 @@ jobs:
     # protected context always reaches a terminal state.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Skip privileged conformance for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::privileged T4 validation is disabled for external forks"
@@ -366,6 +372,13 @@ jobs:
           fi
           EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          KEEP_T4_IMAGE=0
+          cleanup_t4_build() {
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_t4_build EXIT
           docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
           ACTUAL_RUNTIME_VERSION="$(
             docker run --rm --entrypoint python3 "$T4_TAG" \
@@ -375,6 +388,7 @@ jobs:
             echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
             exit 1
           fi
+          KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
         if: github.event.pull_request.head.repo.fork != true
         run: |
@@ -394,6 +408,7 @@ jobs:
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           T4_PROBE="t4probe-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           CAPLESS_PROBE="capless-liveness-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          trap 'docker rm -f "$CAPLESS_PROBE" "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
 
           echo "=== capability-independent child liveness under the local workspace profile ==="
           docker rm -f "$CAPLESS_PROBE" >/dev/null 2>&1 || true
@@ -435,7 +450,7 @@ jobs:
           # probe). This is cleanup of our own debris, NOT a gate bypass —
           # no `|| true` on the real assertions below; failure still fails.
           docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
-          CID=$(docker run -d \
+          docker run -d \
             --name "$T4_PROBE" \
             --network host \
             --privileged \
@@ -443,8 +458,7 @@ jobs:
             -v /:/host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --entrypoint /bin/sh \
-            "$T4_TAG" -c 'sleep 600')
-          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
+            "$T4_TAG" -c 'sleep 600' >/dev/null
 
           echo "=== (b) token agent-ownership: assert the REAL start.sh boot path execs molecule-runtime as uid 1000 ==="
           # ROOT-CAUSE-ACCURATE assertion (RFC internal#456 §10, Hermes
@@ -651,6 +665,8 @@ jobs:
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Skip executable tests for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::repository shell tests are disabled for external forks"
@@ -701,6 +717,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Skip executable conformance for external forks
         if: github.event.pull_request.head.repo.fork == true
         run: echo "::notice::adapter imports and repository conformance tests are disabled for external forks"
