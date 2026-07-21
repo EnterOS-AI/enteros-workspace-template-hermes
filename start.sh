@@ -105,6 +105,20 @@ HERMES_HOME="/tmp/.hermes"
 install -d -o agent -g agent /configs/.hermes
 rm -rf /tmp/.hermes 2>/dev/null || true
 ln -sfn /configs/.hermes /tmp/.hermes
+# A container (re)start is ALWAYS a platform-orchestrated restart from the
+# gateway's point of view (docker stop/recreate — plugin installs, admin
+# restarts, host reboots), never a hermes-internal crash. Upstream's marker
+# for exactly this class ("hermes update", "gateway restart") makes startup
+# SKIP suspend_recently_active(); without it, a reprovision that lands
+# mid-turn suspends the session and the FIRST post-boot message force-resets
+# it (end_reason=session_reset) — the agent wakes amnesiac and drops the
+# task it promised to resume (2026-07-21, lark-install flow lost again
+# even WITH the /configs symlink persisting the transcripts). The gateway
+# consumes (unlinks) the marker on startup, so an in-container gateway
+# crash-respawn still gets the normal suspension treatment, and the
+# stuck-loop guard (.restart_failure_counts, 3+ restarts while active)
+# runs unconditionally either way — real crash loops still get wiped.
+install -o agent -g agent /dev/null /tmp/.hermes/.clean_shutdown
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
 # Log files live under HERMES_HOME (agent-owned via `install -d -o agent`
