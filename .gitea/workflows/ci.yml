@@ -229,27 +229,34 @@ jobs:
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Skip executable validation for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::dependency installation, adapter import, and Docker execution are disabled for external forks"
       - name: Fetch molecule-ci canonical scripts
+        if: github.event.pull_request.head.repo.fork != true
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: requirements.txt
-      - run: pip install pyyaml jsonschema -q
+      - if: github.event.pull_request.head.repo.fork != true
+        run: pip install pyyaml jsonschema -q
       # Install the template's runtime dependencies so the validator's
       # check_adapter_runtime_load() can import adapter.py the same way
       # the workspace container does at boot. Without this, a
       # syntactically-valid adapter that ImportErrors on a missing
       # transitive dep would build clean and crash on first user prompt.
-      - if: hashFiles('requirements.txt') != ''
+      - if: github.event.pull_request.head.repo.fork != true && hashFiles('requirements.txt') != ''
         run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
-      - if: hashFiles('requirements.txt') == ''
+      - if: github.event.pull_request.head.repo.fork != true && hashFiles('requirements.txt') == ''
         run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
-      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - if: github.event.pull_request.head.repo.fork != true
+        run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: Docker build smoke test
-        if: hashFiles('Dockerfile') != ''
+        if: github.event.pull_request.head.repo.fork != true && hashFiles('Dockerfile') != ''
         run: |
+          set -euo pipefail
           # Graceful skip when the runner's job-container can't reach the
           # Docker daemon (e.g. /var/run/docker.sock not mounted into the
           # act job container, or the in-container uid not in the docker
@@ -260,7 +267,21 @@ jobs:
             echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
             exit 0
           fi
-          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t template-test . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 template-test \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the EXACT
@@ -299,9 +320,14 @@ jobs:
     # protected context always reaches a terminal state.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Skip privileged conformance for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::privileged T4 validation is disabled for external forks"
       - name: Build the runtime image
         id: build
+        if: github.event.pull_request.head.repo.fork != true
         run: |
+          set -euo pipefail
           if ! docker info >/dev/null 2>&1; then
             echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
             exit 1
@@ -328,9 +354,23 @@ jobs:
           # Deterministic function of run-id/attempt — recomputed
           # identically in the next step (no cross-step $GITHUB_ENV
           # round-trip, which can be fragile under act_runner).
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$T4_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
+        if: github.event.pull_request.head.repo.fork != true
         run: |
           set -euo pipefail
           # EXACT flags from controlplane userdata_containerized.go
@@ -605,6 +645,9 @@ jobs:
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Skip executable tests for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::repository shell tests are disabled for external forks"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -612,14 +655,22 @@ jobs:
       # In production it's transitive via molecule-ai-workspace-runtime;
       # in this minimal CI env we install it explicitly so the YAML path
       # is exercised instead of the script's silent ImportError fallback.
-      - run: pip install -q pyyaml
-      - run: bash scripts/test-derive-provider.sh
-      - run: bash scripts/test-derive-platform-llm.sh
-      - run: bash scripts/test-install-prefix-strip.sh
-      - run: bash scripts/test-load-workspace-config.sh
-      - run: bash scripts/test-default-model-selection.sh
-      - run: bash scripts/test-mcp-configs-dir.sh
-      - run: bash scripts/test-process-liveness.sh
+      - if: github.event.pull_request.head.repo.fork != true
+        run: pip install -q pyyaml
+      - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-derive-provider.sh
+      - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-derive-platform-llm.sh
+      - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-install-prefix-strip.sh
+      - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-load-workspace-config.sh
+      - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-default-model-selection.sh
+      - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-mcp-configs-dir.sh
+      - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-process-liveness.sh
 
   # --- ADR-004 §4 adapter-socket conformance (audit finding CI2) ---
   # This repo SHIPS tests/test_conformance.py — a ~5-line subclass of the
@@ -644,6 +695,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Skip executable conformance for external forks
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "::notice::adapter imports and repository conformance tests are disabled for external forks"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -653,7 +707,7 @@ jobs:
       # --extra-index-url for the private Gitea dist (hermetic dep policy —
       # no global PIP_INDEX_URL; see the env: block), never routing public
       # tooling at the private index.
-      - if: hashFiles('requirements.txt') != ''
+      - if: github.event.pull_request.head.repo.fork != true && hashFiles('requirements.txt') != ''
         run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
       # requirements-dev.txt pins pytest + pytest-asyncio and the molecule-ai-sdk
       # (molecule_plugin) that ships the AdapterConformance battery that
@@ -661,8 +715,10 @@ jobs:
       # immutable commit there, so
       # the private-index --extra-index-url is applied for its own private
       # transitive deps.
-      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements-dev.txt
+      - if: github.event.pull_request.head.repo.fork != true
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements-dev.txt
       - name: Run adapter and private-runtime contracts
+        if: github.event.pull_request.head.repo.fork != true
         run: >-
           python3 -m pytest
           tests/test_conformance.py
