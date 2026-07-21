@@ -32,6 +32,27 @@ def test_pr_image_build_pins_and_verifies_exact_runtime(job_name: str) -> None:
     assert "importlib.metadata import version" in script
     assert 'version("molecules-workspace-runtime")' in script
     assert '"$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION"' in script
+    if job_name == "validate-runtime":
+        assert (
+            'SMOKE_TAG="molecule-ai-workspace-hermes-smoke-'
+            '${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in script
+        )
+        assert '-t "$SMOKE_TAG"' in script
+        assert 'docker run --rm --entrypoint python3 "$SMOKE_TAG"' in script
+        assert "template-test" not in script
+
+
+def test_required_conformance_job_runs_runtime_image_contract() -> None:
+    jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
+    steps = jobs["conformance"]["steps"]
+    scripts = [
+        step.get("run", "")
+        for step in steps
+        if step.get("name") == "Run adapter and private-runtime contracts"
+    ]
+
+    assert len(scripts) == 1
+    assert "tests/test_ci_runtime_image_pin.py" in scripts[0]
 
 
 @pytest.mark.parametrize(
