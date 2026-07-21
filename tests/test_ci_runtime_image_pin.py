@@ -86,6 +86,38 @@ def test_t4_fetches_exact_molecule_ci_and_generates_attestation() -> None:
     assert "Authorization" not in script
 
 
+def test_t4_seals_reviewed_tools_and_attestation_at_each_execution_boundary() -> None:
+    fetch = _named_step(
+        "t4-conformance", "Fetch immutable molecule-ci MCP proof tools"
+    )["run"]
+    build = _named_step("t4-conformance", "Build the runtime image")["run"]
+    verify = _named_step("t4-conformance", "Verify management MCP in the final image")[
+        "run"
+    ]
+    git_seal = (
+        'git -C "$CI_ROOT" diff --quiet --no-ext-diff --no-textconv '
+        '"$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py '
+        "scripts/mcp_built_image_e2e.py"
+    )
+    attestation_check = 'sha256sum --check "$MCP_ATTESTATION_SHA256"'
+    checker = 'python3 "$CI_ROOT/scripts/mcp_pin_lockstep.py"'
+
+    assert fetch.count(git_seal) == 1
+    assert build.count(git_seal) == 1
+    assert verify.count(git_seal) == 1
+    assert build.count(attestation_check) == 1
+    assert verify.count(attestation_check) == 1
+    assert fetch.index(git_seal) < fetch.index(checker)
+    assert fetch.index('mv "$ATTESTATION_TMP" "$ATTESTATION"') < fetch.index(
+        'sha256sum "$ATTESTATION" > "$MCP_ATTESTATION_SHA256"'
+    )
+    assert build.index(git_seal) < build.index(attestation_check)
+    assert build.index(attestation_check) < build.index("load_attestation")
+    assert verify.index(git_seal) < verify.index("docker cp")
+    assert verify.index("docker cp") < verify.index(attestation_check)
+    assert verify.index(attestation_check) < verify.index("docker start")
+
+
 def test_t4_runs_hardened_final_image_mcp_e2e_before_privileged_probe() -> None:
     jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
     steps = jobs["t4-conformance"]["steps"]
@@ -151,7 +183,10 @@ def test_t4_build_verifier_and_privileged_probe_share_one_image() -> None:
     ]
     assert 'docker rm -f "$MCP_VERIFY_CONTAINER"' in cleanup_body
     assert 'rm -rf -- "$CI_ROOT"' in verifier_script
-    assert 'rm -f -- "$ATTESTATION" "$MCP_E2E_LOG"' in verifier_script
+    assert (
+        'rm -f -- "$ATTESTATION" "$MCP_ATTESTATION_SHA256" "$MCP_E2E_LOG"'
+        in verifier_script
+    )
     assert verifier_script.index("trap cleanup_mcp_e2e EXIT") < verifier_script.index(
         "docker create --interactive --name"
     )
