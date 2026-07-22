@@ -286,6 +286,11 @@ class HermesAgentProxyExecutor(AgentExecutor):
         )
 
         self._pending: Dict[str, asyncio.Future] = {}
+        # (message_id, sha256(content)) -> monotonic ts of delivery. Lets
+        # _handle_reply tell a RETRY duplicate (same id, same content —
+        # drop) from a genuinely new late reply (same id, new content —
+        # relay via /notify). See _handle_reply's orphan branch.
+        self._delivered: Dict[tuple, float] = {}
         self._reply_runner: Optional["web.AppRunner"] = None
         self._reply_site: Optional["web.TCPSite"] = None
         self._started: bool = False
@@ -548,17 +553,123 @@ class HermesAgentProxyExecutor(AgentExecutor):
 
         future = self._pending.get(reply_to)
         if future is None:
-            # Late or duplicate delivery — the original execute() either
-            # already timed out or never registered. Acknowledge so the
-            # plugin doesn't retry forever.
-            logger.warning(
-                "hermes plugin: reply for unknown message_id=%s", reply_to
+            # Late delivery — the original execute() already resolved or
+            # timed out. This is NOT always a duplicate: the gateway's
+            # busy-interrupt flow answers the pending future with the
+            # "⚡ Interrupting current task" ack, then delivers the REAL
+            # reply seconds later under the same reply_to. Dropping such
+            # orphans loses the agent's answer forever (2026-07-22: canvas
+            # stuck on the interrupt ack while the actual 2176-char reply
+            # was discarded as "unknown message_id"). Relay genuinely new
+            # content to the canvas via the platform's /notify
+            # (AgentMessageWriter SSOT); drop only exact retry duplicates.
+            if self._already_delivered(reply_to, content):
+                logger.info(
+                    "hermes plugin: duplicate reply for message_id=%s — dropped",
+                    reply_to,
+                )
+                return web.json_response({"ok": True, "stale": True})
+            relayed = await self._relay_orphan_reply(reply_to, content)
+            return web.json_response(
+                {"ok": True, "stale": True, "relayed": relayed}
             )
-            return web.json_response({"ok": True, "stale": True})
 
         if not future.done():
             future.set_result(content)
+        # Mark even when the future was already resolved by a racing
+        # request: a post-pop retry of this same content must dedupe in
+        # the orphan branch, not relay a duplicate bubble.
+        self._mark_delivered(reply_to, content)
         return web.json_response({"ok": True})
+
+    # Retry-dedup bookkeeping for _handle_reply. TTL bounds memory AND
+    # matches the adapter's retry horizon; the hard cap is a belt against
+    # pathological id churn.
+    _DELIVERED_TTL = 900.0
+    _DELIVERED_MAX = 512
+
+    @staticmethod
+    def _content_key(message_id: str, content: str) -> tuple:
+        import hashlib
+
+        digest = hashlib.sha256(
+            content.encode("utf-8", errors="replace")
+        ).hexdigest()
+        return (str(message_id), digest)
+
+    def _mark_delivered(self, message_id: str, content: str) -> None:
+        import time
+
+        now = time.monotonic()
+        self._delivered[self._content_key(message_id, content)] = now
+        if len(self._delivered) > self._DELIVERED_MAX:
+            cutoff = now - self._DELIVERED_TTL
+            for k, ts in list(self._delivered.items()):
+                if ts < cutoff:
+                    self._delivered.pop(k, None)
+            while len(self._delivered) > self._DELIVERED_MAX:
+                self._delivered.pop(next(iter(self._delivered)), None)
+
+    def _already_delivered(self, message_id: str, content: str) -> bool:
+        import time
+
+        ts = self._delivered.get(self._content_key(message_id, content))
+        return ts is not None and (time.monotonic() - ts) < self._DELIVERED_TTL
+
+    async def _relay_orphan_reply(self, reply_to: str, content: str) -> bool:
+        """Push a late gateway reply to the canvas chat via /notify.
+
+        Uses the platform's sanctioned agent→user path (AgentMessageWriter:
+        broadcast + durable activity row) so the message both renders live
+        and survives reload. Never raises — a relay failure must not break
+        the reply endpoint; the plugin already got its 200.
+        """
+        if not content.strip():
+            return False
+        workspace_id = (
+            os.environ.get("MOLECULE_WORKSPACE_ID")
+            or os.environ.get("WORKSPACE_ID", "")
+        ).strip()
+        base = (os.environ.get("PLATFORM_URL") or "").strip().rstrip("/")
+        if not workspace_id or not base:
+            logger.warning(
+                "hermes plugin: late reply for message_id=%s NOT relayed — "
+                "PLATFORM_URL/MOLECULE_WORKSPACE_ID unset",
+                reply_to,
+            )
+            return False
+        headers: Dict[str, str] = {}
+        try:
+            from molecule_runtime.platform_auth import auth_headers
+
+            headers = dict(auth_headers() or {})
+        except Exception:
+            pass
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{base}/workspaces/{workspace_id}/notify",
+                    json={"message": content},
+                    headers=headers,
+                )
+            ok = 200 <= resp.status_code < 300
+            log = logger.info if ok else logger.warning
+            log(
+                "hermes plugin: late reply for message_id=%s relayed via "
+                "/notify (status=%s)",
+                reply_to,
+                resp.status_code,
+            )
+            if ok:
+                self._mark_delivered(reply_to, content)
+            return ok
+        except Exception as exc:
+            logger.warning(
+                "hermes plugin: late-reply relay for message_id=%s failed: %s",
+                reply_to,
+                exc,
+            )
+            return False
 
     @staticmethod
     def _derive_chat_id(context: RequestContext) -> str:
