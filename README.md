@@ -58,6 +58,22 @@ claim a different home-directory mount is the active persistence contract.
 The current file contains `template_schema_version: 1`; change it only with a
 corresponding platform contract change and validation.
 
+## Upstream freshness
+
+The effective hermes engine is the **stock upstream wheel**, pinned as
+`ARG HERMES_VERSION` in the Dockerfile. The Molecule A2A integration lives
+entirely in the [`hermes-platform-molecule-a2a`](https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a)
+plugin, which registers through upstream's `ctx.register_platform(...)`
+socket (NousResearch #17751). There is **no patched fork** — the interim
+`molecule-ai/hermes-agent` fork was retired on 2026-07-22 (#294) once the
+plugin migrated to the upstream API.
+
+A daily bot (`.gitea/workflows/upstream-sync.yml`, 06:17 UTC + manual
+dispatch) checks PyPI for a newer `hermes-agent` release and opens a bump
+PR against the pin. Bump PRs go through the normal per-PR CI (image build,
+prebake self-check, adapter-socket conformance) — the bot only surfaces
+work, it never gates or lands anything.
+
 ## Development and delivery
 
 See [`runbooks/local-dev-setup.md`](runbooks/local-dev-setup.md) for commands
