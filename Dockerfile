@@ -136,33 +136,29 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # Two refs are installed into the same venv that the upstream installer
 # created above:
 #
-#   1. The Molecule-maintained hermes-agent fork carrying the proposed
-#      `register_platform_adapter` patch series (NousResearch/hermes-agent
-#      PR #18775). Installed --force-reinstall over the upstream wheel so
-#      `hermes_cli/plugins.py` exposes PluginContext.register_platform_adapter
-#      and `gateway/run.py` honors plugin_platforms. Same deps as upstream
-#      (the patch is pure-Python additions), so no resolver impact.
-#   2. The Molecule A2A platform plugin itself, auto-discovered via
-#      hermes's `hermes_agent.plugins` entry-point group.
-#
-# Until upstream PR #18775 merges, the fork is the only place the patch
-# exists. Once merged + released, the fork install can be dropped and the
-# plugin will load against the official wheel unchanged.
-#
-# The maintained fork lives at git.moleculesai.app/molecule-ai/hermes-agent.
-# PINNED BY SHA (2026-07-22): the ARG used to float on the branch name, so a
-# fork update did NOT change this repo's HEAD — and the local image cache
-# (keyed on this repo's HEAD sha) kept serving the stale build. The daily
-# upstream-sync workflow merges NousResearch main into the fork branch and
-# opens a bump PR here with the new sha; upgrades are explicit, reviewable
-# commits that also trigger the rebuild.
-ARG HERMES_FORK_REF=18e4849e759a246daa5ccb6bacc9e2f856bb38a2
+#   1. Stock UPSTREAM hermes-agent, version-pinned from PyPI. FORK RETIRED
+#      (2026-07-22): the molecule-ai/hermes-agent fork existed only to carry
+#      the `register_platform_adapter` socket from the era before upstream
+#      had one. Upstream shipped a superior socket in #17751 (merged
+#      2026-04-30: `ctx.register_platform(...)` + open Platform enum +
+#      gateway/platform_registry.py), our PR #18775 was closed as superseded
+#      (2026-05-03), and the A2A plugin has been dual-mode since May — it
+#      PREFERS the upstream API and only fell back to the fork's. The fork
+#      then rotted (0.10-era base, unmergeable vs upstream main by July)
+#      while stock hermes moved on. Pin the official wheel instead; the
+#      daily upstream-sync workflow watches PyPI and opens bump PRs here.
+#      Force-reinstall over whatever the installer grabbed so the pin — not
+#      the installer's floating resolution — decides the effective version.
+#   2. The Molecule A2A platform plugin, auto-discovered via hermes's
+#      `hermes_agent.plugins` entry-point group (registers through
+#      ctx.register_platform, #17751).
+ARG HERMES_VERSION=0.19.0
 ARG HERMES_PLATFORM_MOLECULE_A2A_REF=24f4300a566eaa4af51e94c5e54f34af0978e508
 # The hermes installer uses uv to create the venv and doesn't seed pip
 # into it. Bootstrap pip first via ensurepip, then install both wheels.
 RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && \
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir --force-reinstall \
-      "git+https://git.moleculesai.app/molecule-ai/hermes-agent.git@${HERMES_FORK_REF}#egg=hermes-agent" && \
+      "hermes-agent==${HERMES_VERSION}" && \
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir \
       "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
 
