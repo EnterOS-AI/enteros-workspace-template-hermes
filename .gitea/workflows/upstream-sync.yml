@@ -187,9 +187,14 @@ jobs:
               "content": base64.b64encode(body_md.encode()).decode(),
               "branch": "main", "new_branch": branch,
           }
+          # Gitea contents API: POST creates a NEW file, PUT (with sha)
+          # updates an existing one. Using PUT for a new file 403s
+          # (2026-07-22 third live run).
           if st == 200:
               payload["sha"] = meta["sha"]
-          st, _ = req("PUT", f"/repos/{repo}/contents/UPSTREAM_CONFLICT.md", payload)
+              st, _ = req("PUT", f"/repos/{repo}/contents/UPSTREAM_CONFLICT.md", payload)
+          else:
+              st, _ = req("POST", f"/repos/{repo}/contents/UPSTREAM_CONFLICT.md", payload)
           if st not in (200, 201):
               print(f"::warning::could not create conflict-flag branch (status {st}) — conflict still needs a human rebase")
               sys.exit(0)
