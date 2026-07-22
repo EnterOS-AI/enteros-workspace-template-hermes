@@ -17,9 +17,11 @@ name: upstream-sync
 # humans/agents gate the merge, same contract as the runtime propagate bot.
 #
 # Failure modes handled:
-#   * Merge conflict fork<-upstream: push nothing; ensure a single open issue
-#     on molecule-ai/hermes-agent flags it for a human rebase. Exit green —
-#     a conflict is work-to-do, not an infra failure.
+#   * Merge conflict fork<-upstream: push nothing; keep a single open
+#     conflict-flag PR on THIS repo (UPSTREAM_CONFLICT.md branch) for a
+#     human rebase, auto-closed on the next clean sync. Exit green —
+#     a conflict is work-to-do, not an infra failure. (Issues API is
+#     outside the bot token's scopes; PRs are its proven contract.)
 #   * Absent INFISICAL_CI_* bootstrap: report-only degrade.
 #
 # AUTH: RUNTIME_BOT_TOKEN (/shared/runtime-bot) — the bot credential that
@@ -111,34 +113,100 @@ jobs:
           else
             git merge --abort || true
             echo "FORK_SHA=$BEFORE" >> "$GITHUB_ENV"
-            echo "::warning::upstream merge CONFLICTS — flagging via issue; fork stays at $BEFORE"
-            # Issue flagging is best-effort: a token-scope or API hiccup here
-            # must not fail the job (2026-07-22 first live run: the dedup
-            # query crashed on non-JSON and painted the run red even though
-            # the conflict itself was handled correctly).
-            TITLE="upstream-sync: merge conflict fork <- NousResearch main"
-            OPEN=$(curl -fsS "${API}/repos/${FORK}/issues?state=open&type=issues" \
-              -H "Authorization: token ${BOT_TOKEN}" \
-              | python3 -c 'import sys,json;print(sum(1 for i in json.load(sys.stdin) if i.get("title","").startswith("upstream-sync: merge conflict")))' 2>/dev/null \
-              || echo "unknown")
-            # pipefail can append a second line when curl fails after python
-            # already printed — keep only the last (authoritative) line.
-            OPEN=$(printf '%s\n' "${OPEN}" | tail -1)
-            if [ "${OPEN}" = "0" ]; then
-              if curl -fsS -X POST "${API}/repos/${FORK}/issues" \
-                -H "Authorization: token ${BOT_TOKEN}" -H 'Content-Type: application/json' \
-                -d "{\"title\":\"${TITLE}\",\"body\":\"Daily upstream-sync could not cleanly merge https://github.com/NousResearch/hermes-agent main into ${BRANCH}. A human rebase of the patch series is needed; the template stays pinned to the last good sha until then.\"}" \
-                -o /dev/null; then
-                echo "conflict issue opened"
-              else
-                echo "::warning::could not open conflict issue (token scope / API error) — conflict still needs a human rebase"
-              fi
-            elif [ "${OPEN}" = "unknown" ]; then
-              echo "::warning::could not query existing issues (token scope / API error) — skipping issue creation to avoid duplicates; conflict still needs a human rebase"
-            else
-              echo "conflict issue already open — not duplicating"
-            fi
+            echo "::warning::upstream merge CONFLICTS — flagging via conflict PR; fork stays at $BEFORE"
+            # Conflict signal = a flag PR on THIS repo (2026-07-22 second
+            # live run: the bot token can open PRs here — that is the
+            # propagate-bot contract — but its scopes do NOT cover the
+            # issues API, so issue-based flagging silently degrades). The
+            # flag PR adds UPSTREAM_CONFLICT.md on a fixed branch; the next
+            # CLEAN merge auto-closes it. All best-effort: any API error is
+            # a warning, never a red run.
+            echo "CONFLICT_FLAG=1" >> "$GITHUB_ENV"
           fi
+
+      - name: Flag or clear the conflict PR on this repo
+        env:
+          BOT_TOKEN: ${{ env.BOT_TOKEN }}
+          CONFLICT_FLAG: ${{ env.CONFLICT_FLAG }}
+          API: ${{ env.GITHUB_SERVER_URL }}/api/v1
+          REPO: molecule-ai/molecule-ai-workspace-template-hermes
+        run: |
+          set -uo pipefail
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "report-only — skipping conflict-flag handling"; exit 0
+          fi
+          python3 <<'PYFLAG'
+          import base64, json, os, sys, urllib.request
+
+          api = os.environ["API"]; repo = os.environ["REPO"]
+          tok = os.environ["BOT_TOKEN"]
+          conflicted = os.environ.get("CONFLICT_FLAG") == "1"
+          branch = "sync/upstream-conflict"
+
+          def req(method, path, body=None):
+              r = urllib.request.Request(
+                  f"{api}{path}", method=method,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={"Authorization": f"token {tok}",
+                           "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(r) as resp:
+                      return resp.status, json.load(resp)
+              except urllib.error.HTTPError as e:
+                  return e.code, {}
+              except Exception:
+                  return 0, {}
+
+          st, prs = req("GET", f"/repos/{repo}/pulls?state=open")
+          flag = next((p for p in (prs if isinstance(prs, list) else [])
+                       if p.get("head", {}).get("ref") == branch), None)
+
+          if not conflicted:
+              if flag:
+                  st, _ = req("PATCH", f"/repos/{repo}/pulls/{flag['number']}",
+                              {"state": "closed"})
+                  print(f"conflict cleared — closed flag PR #{flag['number']} (status {st})")
+                  req("DELETE", f"/repos/{repo}/branches/{branch}")
+              else:
+                  print("no conflict, no flag PR — nothing to do")
+              sys.exit(0)
+
+          if flag:
+              print(f"conflict flag PR already open (#{flag['number']}) — not duplicating")
+              sys.exit(0)
+
+          body_md = ("# Upstream merge conflict\n\nDaily upstream-sync could not "
+                     "cleanly merge NousResearch/hermes-agent main into the fork "
+                     "patch branch feat/platform-adapter-plugins. A human rebase "
+                     "of the patch series is needed; HERMES_FORK_REF stays at the "
+                     "last good sha until then. This PR auto-closes on the next "
+                     "clean sync.\n")
+          st, meta = req("GET", f"/repos/{repo}/contents/UPSTREAM_CONFLICT.md?ref=main")
+          payload = {
+              "message": "chore(sync): flag upstream merge conflict (auto)",
+              "content": base64.b64encode(body_md.encode()).decode(),
+              "branch": "main", "new_branch": branch,
+          }
+          if st == 200:
+              payload["sha"] = meta["sha"]
+          st, _ = req("PUT", f"/repos/{repo}/contents/UPSTREAM_CONFLICT.md", payload)
+          if st not in (200, 201):
+              print(f"::warning::could not create conflict-flag branch (status {st}) — conflict still needs a human rebase")
+              sys.exit(0)
+          st, pr = req("POST", f"/repos/{repo}/pulls", {
+              "title": "upstream-sync: fork merge conflict — human rebase needed",
+              "head": branch, "base": "main",
+              "body": ("NousResearch main no longer merges cleanly into "
+                       "feat/platform-adapter-plugins. Rebase the patch series "
+                       "(or land upstream #18775 and retire the fork). "
+                       "Auto-closes on the next clean sync. DO NOT MERGE — "
+                       "close after the rebase instead."),
+          })
+          if st in (200, 201):
+              print(f"opened conflict-flag PR #{pr.get('number')}")
+          else:
+              print(f"::warning::could not open conflict-flag PR (status {st}) — conflict still needs a human rebase")
+          PYFLAG
 
       - name: Bump HERMES_FORK_REF here if the Dockerfile pin is stale
         env:
