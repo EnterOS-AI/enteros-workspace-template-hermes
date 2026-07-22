@@ -1,0 +1,199 @@
+name: upstream-sync
+
+# Daily hermes freshness bot (2026-07-22, principal directive: "keep at least
+# once a day sync so everything is up to date").
+#
+# The EFFECTIVE hermes version in this image is the molecule-ai/hermes-agent
+# fork branch feat/platform-adapter-plugins (force-reinstalled over the
+# upstream installer's wheel — see the Dockerfile). Upstream freshness
+# therefore means: merge NousResearch/hermes-agent main into the fork branch
+# daily, then bump the sha-pinned HERMES_FORK_REF ARG here via a reviewable
+# PR. Once upstream PR #18775 (register_platform_adapter) merges, the fork —
+# and this sync — can be retired per the Dockerfile's own note.
+#
+# NOT a scheduled CI gate: molecule-core's zero-cron ratchet forbids
+# timer-driven TEST runs; this job runs no tests and gates nothing — bump PRs
+# go through the normal per-PR CI (image build + prebake self-check), and
+# humans/agents gate the merge, same contract as the runtime propagate bot.
+#
+# Failure modes handled:
+#   * Merge conflict fork<-upstream: push nothing; ensure a single open issue
+#     on molecule-ai/hermes-agent flags it for a human rebase. Exit green —
+#     a conflict is work-to-do, not an infra failure.
+#   * Absent INFISICAL_CI_* bootstrap: report-only degrade.
+#
+# AUTH: RUNTIME_BOT_TOKEN (/shared/runtime-bot) — the bot credential that
+# already opens bump PRs on template repos. Pushes to the fork use a
+# per-invocation http.extraheader so the token never lands in a clone URL.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+env:
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into fork; bump HERMES_FORK_REF on drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Fetch RUNTIME_BOT_TOKEN from Infisical SSOT
+        env:
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -z "${INFISICAL_CI_CLIENT_ID:-}" ] || [ -z "${INFISICAL_CI_CLIENT_SECRET:-}" ] || [ -z "${INFISICAL_PROJECT_ID:-}" ]; then
+            echo "::warning::INFISICAL_CI_* bootstrap creds absent; sync degrades to report-only."
+            exit 0
+          fi
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);v=d.get("accessToken");print(v if isinstance(v,str) and v else "")')
+          if [ -z "${TOK}" ]; then
+            echo "::error::Infisical universal-auth login failed with creds present — real infra fault." >&2
+            exit 1
+          fi
+          BOT=$(curl -fsS "$BASE/api/v3/secrets/raw/RUNTIME_BOT_TOKEN?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=%2Fshared%2Fruntime-bot" \
+            -H "Authorization: Bearer $TOK" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);v=(d.get("secret") or {}).get("secretValue");print(v if isinstance(v,str) and v else "")')
+          if [ -z "${BOT}" ]; then
+            echo "::error::Infisical returned empty RUNTIME_BOT_TOKEN at /shared/runtime-bot — failing loudly." >&2
+            exit 1
+          fi
+          echo "::add-mask::$BOT"
+          echo "BOT_TOKEN=$BOT" >> "$GITHUB_ENV"
+
+      - name: Merge NousResearch main into the fork patch branch
+        env:
+          BOT_TOKEN: ${{ env.BOT_TOKEN }}
+          API: ${{ env.GITHUB_SERVER_URL }}/api/v1
+          FORK: molecule-ai/hermes-agent
+          BRANCH: feat/platform-adapter-plugins
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "::warning::report-only (no BOT_TOKEN): skipping fork merge."
+            exit 0
+          fi
+          git clone --branch "$BRANCH" "${GITHUB_SERVER_URL}/${FORK}.git" fork
+          cd fork
+          git config user.name "molecule-runtime-release-bot"
+          git config user.email "runtime-bot@moleculesai.app"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          BEFORE=$(git rev-parse HEAD)
+          if git merge --no-edit upstream/main; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$AFTER" = "$BEFORE" ]; then
+              echo "fork already contains upstream main — no merge commit"
+            else
+              git -c http.extraheader="AUTHORIZATION: token ${BOT_TOKEN}" \
+                push origin "$BRANCH"
+              echo "fork updated: $BEFORE -> $AFTER"
+            fi
+            echo "FORK_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          else
+            git merge --abort || true
+            echo "FORK_SHA=$BEFORE" >> "$GITHUB_ENV"
+            echo "::warning::upstream merge CONFLICTS — flagging via issue; fork stays at $BEFORE"
+            TITLE="upstream-sync: merge conflict fork <- NousResearch main"
+            OPEN=$(curl -fsS "${API}/repos/${FORK}/issues?state=open&type=issues" \
+              -H "Authorization: token ${BOT_TOKEN}" \
+              | python3 -c 'import sys,json;print(sum(1 for i in json.load(sys.stdin) if i.get("title","").startswith("upstream-sync: merge conflict")))')
+            if [ "${OPEN}" = "0" ]; then
+              curl -fsS -X POST "${API}/repos/${FORK}/issues" \
+                -H "Authorization: token ${BOT_TOKEN}" -H 'Content-Type: application/json' \
+                -d "{\"title\":\"${TITLE}\",\"body\":\"Daily upstream-sync could not cleanly merge https://github.com/NousResearch/hermes-agent main into ${BRANCH}. A human rebase of the patch series is needed; the template stays pinned to the last good sha until then.\"}" \
+                -o /dev/null
+              echo "conflict issue opened"
+            else
+              echo "conflict issue already open — not duplicating"
+            fi
+          fi
+
+      - name: Bump HERMES_FORK_REF here if the Dockerfile pin is stale
+        env:
+          BOT_TOKEN: ${{ env.BOT_TOKEN }}
+          FORK_SHA: ${{ env.FORK_SHA }}
+          API: ${{ env.GITHUB_SERVER_URL }}/api/v1
+          REPO: molecule-ai/molecule-ai-workspace-template-hermes
+        run: |
+          set -euo pipefail
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${FORK_SHA:-}" ]; then
+            echo "nothing to bump (report-only or merge step skipped)"
+            exit 0
+          fi
+          CURRENT=$(sed -n 's/^ARG HERMES_FORK_REF=//p' Dockerfile | head -1)
+          echo "fork=$FORK_SHA pinned=$CURRENT"
+          if [ "$FORK_SHA" = "$CURRENT" ]; then
+            echo "pin is current — nothing to do"; exit 0
+          fi
+          python3 - "$FORK_SHA" "$CURRENT" <<'PYEOF'
+          import base64, json, os, sys, urllib.request
+
+          new, current = sys.argv[1], sys.argv[2]
+          api = os.environ["API"]; repo = os.environ["REPO"]
+          tok = os.environ["BOT_TOKEN"]
+          branch = f"sync/hermes-fork-{new[:12]}"
+
+          def req(method, path, body=None):
+              r = urllib.request.Request(
+                  f"{api}{path}", method=method,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={"Authorization": f"token {tok}",
+                           "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(r) as resp:
+                      return resp.status, json.load(resp)
+              except urllib.error.HTTPError as e:
+                  return e.code, {}
+
+          st, _ = req("GET", f"/repos/{repo}/branches/{branch}")
+          if st == 200:
+              print(f"branch {branch} already exists — skipping"); sys.exit(0)
+          st, prs = req("GET", f"/repos/{repo}/pulls?state=open")
+          for p in (prs if isinstance(prs, list) else []):
+              if p.get("head", {}).get("ref", "").startswith("sync/hermes-fork-"):
+                  print("bump PR already open — skipping"); sys.exit(0)
+
+          st, meta = req("GET", f"/repos/{repo}/contents/Dockerfile?ref=main")
+          assert st == 200, f"contents GET {st}"
+          text = base64.b64decode(meta["content"]).decode()
+          needle = f"ARG HERMES_FORK_REF={current}"
+          assert text.count(needle) == 1, "pin line not found exactly once"
+          text = text.replace(needle, f"ARG HERMES_FORK_REF={new}")
+
+          st, _ = req("PUT", f"/repos/{repo}/contents/Dockerfile", {
+              "message": f"chore(sync): bump hermes fork {current[:12]} -> {new[:12]} (daily upstream sync)",
+              "content": base64.b64encode(text.encode()).decode(),
+              "sha": meta["sha"], "branch": "main", "new_branch": branch,
+          })
+          assert st in (200, 201), f"contents PUT {st}"
+
+          st, pr = req("POST", f"/repos/{repo}/pulls", {
+              "title": f"chore(sync): bump hermes fork -> {new[:12]}",
+              "head": branch, "base": "main",
+              "body": ("Automated daily upstream sync: NousResearch main "
+                       "merged into the fork patch branch; this bumps the "
+                       f"sha-pinned HERMES_FORK_REF to {new}. Per-PR CI "
+                       "(image build + prebake self-check) gates the merge."),
+          })
+          assert st in (200, 201), f"pulls POST {st}"
+          print(f"opened bump PR #{pr.get('number')} for fork {new[:12]}")
+          PYEOF
