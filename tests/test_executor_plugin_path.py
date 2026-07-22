@@ -646,7 +646,11 @@ async def test_reply_for_unknown_message_id_acks_stale(monkeypatch):
             ) as r:
                 assert r.status == 200
                 body = await r.json()
-                assert body == {"ok": True, "stale": True}
+                # relayed=False: no PLATFORM_URL configured here, so the
+                # orphan-relay path (late-reply loss fix) reports it
+                # could not forward — but still acks stale so the plugin
+                # doesn't retry forever.
+                assert body == {"ok": True, "stale": True, "relayed": False}
     finally:
         await ex.stop()
 
@@ -1884,3 +1888,114 @@ def test_derive_peer_identity_handles_partial_metadata():
     msg.metadata = {"peer_id": "ws-X"}
     ctx.message = msg
     assert HermesAgentProxyExecutor._derive_peer_identity(ctx) == ("ws-X", "")
+
+
+# ---- orphan-reply relay (late replies must reach the canvas) --------
+
+
+@pytest.mark.asyncio
+async def test_orphan_reply_relays_via_notify(monkeypatch):
+    """A reply whose pending future is gone (busy-interrupt ack consumed
+    it, or execute() timed out) must be relayed to the platform's
+    /notify — not silently dropped."""
+    notify_received: List[Dict[str, Any]] = []
+    notify_port = _free_port()
+
+    async def fake_notify(request: web.Request) -> web.Response:
+        notify_received.append(await request.json())
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post(
+        "/workspaces/ws-orphan/notify", fake_notify
+    )
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", notify_port)
+    await site.start()
+
+    cb_port = _free_port()
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+        MOLECULE_WORKSPACE_ID="ws-orphan",
+        PLATFORM_URL=f"http://127.0.0.1:{notify_port}",
+    )
+    await ex.start()
+    try:
+        async with ClientSession() as s:
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-late", "content": "the real answer"},
+            ) as r:
+                body = await r.json()
+        assert body["ok"] is True
+        assert body.get("relayed") is True
+        assert notify_received == [{"message": "the real answer"}]
+    finally:
+        await ex.stop()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_orphan_retry_duplicate_is_dropped(monkeypatch):
+    """An exact retry (same reply_to, same content) of a reply that
+    already resolved the pending future must NOT relay — only genuinely
+    new content does."""
+    notify_received: List[Dict[str, Any]] = []
+    notify_port = _free_port()
+
+    async def fake_notify(request: web.Request) -> web.Response:
+        notify_received.append(await request.json())
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/workspaces/ws-dup/notify", fake_notify)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", notify_port)
+    await site.start()
+
+    cb_port = _free_port()
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+        MOLECULE_WORKSPACE_ID="ws-dup",
+        PLATFORM_URL=f"http://127.0.0.1:{notify_port}",
+    )
+    await ex.start()
+    try:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        ex._pending["msg-ack"] = fut
+        async with ClientSession() as s:
+            # First delivery resolves the pending future (e.g. the ack).
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-ack", "content": "interrupt ack"},
+            ) as r:
+                assert (await r.json())["ok"] is True
+            assert fut.result() == "interrupt ack"
+            ex._pending.pop("msg-ack", None)  # execute() consumed it
+
+            # Retry of the SAME content after the pop: dedupe, no relay.
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-ack", "content": "interrupt ack"},
+            ) as r:
+                body = await r.json()
+            assert body.get("relayed") is None
+            assert notify_received == []
+
+            # NEW content under the same reply_to (the real late reply):
+            # must relay.
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-ack", "content": "the real answer"},
+            ) as r:
+                body = await r.json()
+            assert body.get("relayed") is True
+            assert notify_received == [{"message": "the real answer"}]
+    finally:
+        await ex.stop()
+        await runner.cleanup()
