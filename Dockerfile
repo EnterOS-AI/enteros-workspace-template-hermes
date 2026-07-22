@@ -150,7 +150,13 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # plugin will load against the official wheel unchanged.
 #
 # The maintained fork lives at git.moleculesai.app/molecule-ai/hermes-agent.
-ARG HERMES_FORK_REF=feat/platform-adapter-plugins
+# PINNED BY SHA (2026-07-22): the ARG used to float on the branch name, so a
+# fork update did NOT change this repo's HEAD — and the local image cache
+# (keyed on this repo's HEAD sha) kept serving the stale build. The daily
+# upstream-sync workflow merges NousResearch main into the fork branch and
+# opens a bump PR here with the new sha; upgrades are explicit, reviewable
+# commits that also trigger the rebuild.
+ARG HERMES_FORK_REF=18e4849e759a246daa5ccb6bacc9e2f856bb38a2
 ARG HERMES_PLATFORM_MOLECULE_A2A_REF=24f4300a566eaa4af51e94c5e54f34af0978e508
 # The hermes installer uses uv to create the venv and doesn't seed pip
 # into it. Bootstrap pip first via ensurepip, then install both wheels.
