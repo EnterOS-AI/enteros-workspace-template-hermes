@@ -112,16 +112,29 @@ jobs:
             git merge --abort || true
             echo "FORK_SHA=$BEFORE" >> "$GITHUB_ENV"
             echo "::warning::upstream merge CONFLICTS — flagging via issue; fork stays at $BEFORE"
+            # Issue flagging is best-effort: a token-scope or API hiccup here
+            # must not fail the job (2026-07-22 first live run: the dedup
+            # query crashed on non-JSON and painted the run red even though
+            # the conflict itself was handled correctly).
             TITLE="upstream-sync: merge conflict fork <- NousResearch main"
             OPEN=$(curl -fsS "${API}/repos/${FORK}/issues?state=open&type=issues" \
               -H "Authorization: token ${BOT_TOKEN}" \
-              | python3 -c 'import sys,json;print(sum(1 for i in json.load(sys.stdin) if i.get("title","").startswith("upstream-sync: merge conflict")))')
+              | python3 -c 'import sys,json;print(sum(1 for i in json.load(sys.stdin) if i.get("title","").startswith("upstream-sync: merge conflict")))' 2>/dev/null \
+              || echo "unknown")
+            # pipefail can append a second line when curl fails after python
+            # already printed — keep only the last (authoritative) line.
+            OPEN=$(printf '%s\n' "${OPEN}" | tail -1)
             if [ "${OPEN}" = "0" ]; then
-              curl -fsS -X POST "${API}/repos/${FORK}/issues" \
+              if curl -fsS -X POST "${API}/repos/${FORK}/issues" \
                 -H "Authorization: token ${BOT_TOKEN}" -H 'Content-Type: application/json' \
                 -d "{\"title\":\"${TITLE}\",\"body\":\"Daily upstream-sync could not cleanly merge https://github.com/NousResearch/hermes-agent main into ${BRANCH}. A human rebase of the patch series is needed; the template stays pinned to the last good sha until then.\"}" \
-                -o /dev/null
-              echo "conflict issue opened"
+                -o /dev/null; then
+                echo "conflict issue opened"
+              else
+                echo "::warning::could not open conflict issue (token scope / API error) — conflict still needs a human rebase"
+              fi
+            elif [ "${OPEN}" = "unknown" ]; then
+              echo "::warning::could not query existing issues (token scope / API error) — skipping issue creation to avoid duplicates; conflict still needs a human rebase"
             else
               echo "conflict issue already open — not duplicating"
             fi
