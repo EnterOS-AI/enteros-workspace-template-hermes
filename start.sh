@@ -678,8 +678,52 @@ echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWA
 mcp_block_hash() {
   sed -n '/^mcp_servers:/,/^[a-z_]/p' "$HERMES_CONFIG" 2>/dev/null | md5sum | cut -d' ' -f1
 }
+# Hardening (review wf_7cb5003d #4/#8/#9): SIGTERM triggers hermes's
+# graceful drain, so an in-flight turn (first-boot greeting, an early
+# user message) finishes and replies BEFORE exit — give it a 90s drain
+# window, and only then SIGKILL (a >90s turn is lost; the executor's
+# 503-on-failed-relay path makes the plugin redeliver retried replies).
+# After relaunch, poll /health and retry the launch once on failure so
+# a slow-to-die old process can't strand the workspace gatewayless. The
+# watcher stays live for the whole window and restarts on EACH settled
+# change (max 3) — a slow second adaptor landing after the first
+# restart still gets picked up.
 (
+  restart_gateway_for_mcp() {
+    echo "[start.sh] mcp_servers changed post-launch (plugin adaptors) — restarting hermes gateway to pick them up (0.19 eager discovery)"
+    install -o agent -g agent /dev/null /tmp/.hermes/.clean_shutdown
+    kill "$CURRENT_GW_PID" 2>/dev/null || true
+    for _ in $(seq 1 90); do
+      process_is_running "$CURRENT_GW_PID" || break
+      sleep 1
+    done
+    if process_is_running "$CURRENT_GW_PID"; then
+      echo "[start.sh] gateway did not drain within 90s — SIGKILL (in-flight turn lost)" >&2
+      kill -9 "$CURRENT_GW_PID" 2>/dev/null || true
+      sleep 2
+    fi
+    for attempt in 1 2; do
+      nohup gosu agent env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"           bash -c "cd /tmp && hermes gateway"           >>"$LOG_FILE" 2>&1 &
+      CURRENT_GW_PID=$!
+      for _ in $(seq 1 60); do
+        curl -fsS "http://127.0.0.1:${API_SERVER_PORT:-8642}/health" >/dev/null 2>&1 && break
+        process_is_running "$CURRENT_GW_PID" || break
+        sleep 1
+      done
+      if curl -fsS "http://127.0.0.1:${API_SERVER_PORT:-8642}/health" >/dev/null 2>&1; then
+        echo "[start.sh] hermes gateway restarted (pid $CURRENT_GW_PID) with reconciled mcp_servers"
+        return 0
+      fi
+      echo "[start.sh] restarted gateway failed /health (attempt $attempt) — retrying" >&2
+      kill -9 "$CURRENT_GW_PID" 2>/dev/null || true
+      sleep 2
+    done
+    echo "[start.sh] gateway did not come back healthy after mcp reconcile — see $LOG_FILE" >&2
+    return 1
+  }
+  CURRENT_GW_PID=$GATEWAY_PID
   BASELINE=$(mcp_block_hash)
+  RESTARTS=0
   for _ in $(seq 1 60); do
     sleep 5
     CUR=$(mcp_block_hash)
@@ -691,18 +735,10 @@ mcp_block_hash() {
         [ "$NEXT" = "$CUR" ] && break
         CUR=$NEXT
       done
-      echo "[start.sh] mcp_servers changed post-launch (plugin adaptors) — restarting hermes gateway to pick them up (0.19 eager discovery)"
-      install -o agent -g agent /dev/null /tmp/.hermes/.clean_shutdown
-      kill "$GATEWAY_PID" 2>/dev/null || true
-      for _ in $(seq 1 20); do
-        process_is_running "$GATEWAY_PID" || break
-        sleep 1
-      done
-      nohup gosu agent env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-          bash -c "cd /tmp && hermes gateway" \
-          >>"$LOG_FILE" 2>&1 &
-      echo "[start.sh] hermes gateway restarted (pid $!) with reconciled mcp_servers"
-      break
+      restart_gateway_for_mcp || break
+      BASELINE=$(mcp_block_hash)
+      RESTARTS=$((RESTARTS + 1))
+      [ "$RESTARTS" -ge 3 ] && break
     fi
   done
 ) &

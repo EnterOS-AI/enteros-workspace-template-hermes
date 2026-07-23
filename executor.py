@@ -291,6 +291,12 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # drop) from a genuinely new late reply (same id, new content —
         # relay via /notify). See _handle_reply's orphan branch.
         self._delivered: Dict[tuple, float] = {}
+        # message_id -> ("user"|"peer", monotonic ts). Recorded at execute()
+        # registration so the orphan branch knows the turn's ORIGIN: only
+        # human canvas turns may relay to /notify — a late reply to a
+        # PEER-delegated turn on the user's canvas is an out-of-context
+        # bubble addressed to another agent (review wf_7cb5003d #5).
+        self._origin: Dict[str, tuple] = {}
         self._reply_runner: Optional["web.AppRunner"] = None
         self._reply_site: Optional["web.TCPSite"] = None
         self._started: bool = False
@@ -441,6 +447,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._pending[message_id] = future
+        self._record_origin(message_id, "peer" if peer_id else "user")
 
         # Belt-and-suspenders session continuity (task #385): the hermes
         # daemon owns session state natively, but its store at
@@ -552,41 +559,65 @@ class HermesAgentProxyExecutor(AgentExecutor):
             )
 
         future = self._pending.get(reply_to)
-        if future is None:
-            # Late delivery — the original execute() already resolved or
-            # timed out. This is NOT always a duplicate: the gateway's
-            # busy-interrupt flow answers the pending future with the
-            # "⚡ Interrupting current task" ack, then delivers the REAL
-            # reply seconds later under the same reply_to. Dropping such
-            # orphans loses the agent's answer forever (2026-07-22: canvas
-            # stuck on the interrupt ack while the actual 2176-char reply
-            # was discarded as "unknown message_id"). Relay genuinely new
-            # content to the canvas via the platform's /notify
-            # (AgentMessageWriter SSOT); drop only exact retry duplicates.
-            if self._already_delivered(reply_to, content):
-                logger.info(
-                    "hermes plugin: duplicate reply for message_id=%s — dropped",
-                    reply_to,
-                )
-                return web.json_response({"ok": True, "stale": True})
-            relayed = await self._relay_orphan_reply(reply_to, content)
-            return web.json_response(
-                {"ok": True, "stale": True, "relayed": relayed}
-            )
-
-        if not future.done():
+        if future is not None and not future.done():
             future.set_result(content)
-        # Mark even when the future was already resolved by a racing
-        # request: a post-pop retry of this same content must dedupe in
-        # the orphan branch, not relay a duplicate bubble.
+            self._mark_delivered(reply_to, content)
+            return web.json_response({"ok": True})
+
+        # Orphan path: no pending future, OR a present-but-done future (a
+        # racing earlier delivery — e.g. the busy-interrupt ack — already
+        # resolved it, so THIS content will never reach execute(); marking
+        # it delivered here would silently bury it, review wf_7cb5003d #2).
+        # The gateway's busy-interrupt flow answers the pending future with
+        # the "⚡ Interrupting current task" ack, then delivers the REAL
+        # reply seconds later under the same reply_to. Dropping such
+        # orphans loses the agent's answer forever (2026-07-22: canvas
+        # stuck on the interrupt ack while the actual 2176-char reply was
+        # discarded as "unknown message_id"). Relay genuinely new content
+        # to the canvas via the platform's /notify (AgentMessageWriter
+        # SSOT) — but ONLY for human canvas turns: a late reply to a
+        # PEER-delegated turn does not belong on the user's chat (#5);
+        # peers get the timeout signal and own their retries.
+        if self._already_delivered(reply_to, content):
+            logger.info(
+                "hermes plugin: duplicate reply for message_id=%s — dropped",
+                reply_to,
+            )
+            return web.json_response({"ok": True, "stale": True})
+        origin = self._origin_of(reply_to)
+        if origin != "user":
+            # "peer" — or unknown (executor restarted since registration;
+            # conservative pre-relay behavior: drop, matching the old
+            # uniform-drop contract for turns we cannot attribute).
+            logger.warning(
+                "hermes plugin: late reply for message_id=%s origin=%s — not relayed",
+                reply_to,
+                origin or "unknown",
+            )
+            return web.json_response({"ok": True, "stale": True})
+        # RESERVE the dedup slot BEFORE awaiting the relay so a concurrent
+        # duplicate delivery cannot double-post while the POST is in
+        # flight (#6); roll the reservation back on failure and answer
+        # 503 so the plugin's retry loop redelivers — a 200 here would
+        # make one transient platform blip a permanent reply loss (#3).
         self._mark_delivered(reply_to, content)
-        return web.json_response({"ok": True})
+        relayed = await self._relay_orphan_reply(reply_to, content)
+        if not relayed:
+            self._unmark_delivered(reply_to, content)
+            return web.json_response(
+                {"ok": False, "stale": True, "relayed": False},
+                status=503,
+            )
+        return web.json_response({"ok": True, "stale": True, "relayed": True})
 
     # Retry-dedup bookkeeping for _handle_reply. TTL bounds memory AND
-    # matches the adapter's retry horizon; the hard cap is a belt against
-    # pathological id churn.
-    _DELIVERED_TTL = 900.0
-    _DELIVERED_MAX = 512
+    # bounds the redelivery-dedup horizon: a retry arriving after expiry
+    # (or after cap eviction) relays again, so both bounds are sized well
+    # above any plausible adapter retry/redelivery window (review
+    # wf_7cb5003d #7) and the cap evicts OLDEST-BY-AGE, never a fresh
+    # entry that still guards an in-flight retry cycle.
+    _DELIVERED_TTL = 3600.0
+    _DELIVERED_MAX = 2048
 
     @staticmethod
     def _content_key(message_id: str, content: str) -> tuple:
@@ -602,13 +633,36 @@ class HermesAgentProxyExecutor(AgentExecutor):
 
         now = time.monotonic()
         self._delivered[self._content_key(message_id, content)] = now
-        if len(self._delivered) > self._DELIVERED_MAX:
-            cutoff = now - self._DELIVERED_TTL
-            for k, ts in list(self._delivered.items()):
-                if ts < cutoff:
-                    self._delivered.pop(k, None)
-            while len(self._delivered) > self._DELIVERED_MAX:
-                self._delivered.pop(next(iter(self._delivered)), None)
+        self._prune_bookkeeping(now)
+
+    def _unmark_delivered(self, message_id: str, content: str) -> None:
+        self._delivered.pop(self._content_key(message_id, content), None)
+
+    def _prune_bookkeeping(self, now: float) -> None:
+        cutoff = now - self._DELIVERED_TTL
+        for k, ts in list(self._delivered.items()):
+            if ts < cutoff:
+                self._delivered.pop(k, None)
+        while len(self._delivered) > self._DELIVERED_MAX:
+            oldest = min(self._delivered, key=self._delivered.get)
+            self._delivered.pop(oldest, None)
+        for m, (_, ts) in list(self._origin.items()):
+            if ts < cutoff:
+                self._origin.pop(m, None)
+        while len(self._origin) > self._DELIVERED_MAX:
+            oldest = min(self._origin, key=lambda m: self._origin[m][1])
+            self._origin.pop(oldest, None)
+
+    def _record_origin(self, message_id: str, origin: str) -> None:
+        import time
+
+        now = time.monotonic()
+        self._origin[str(message_id)] = (origin, now)
+        self._prune_bookkeeping(now)
+
+    def _origin_of(self, message_id: str) -> str:
+        entry = self._origin.get(str(message_id))
+        return entry[0] if entry else ""
 
     def _already_delivered(self, message_id: str, content: str) -> bool:
         import time
