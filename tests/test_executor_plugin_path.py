@@ -1923,6 +1923,7 @@ async def test_orphan_reply_relays_via_notify(monkeypatch):
     )
     await ex.start()
     try:
+        ex._record_origin("msg-late", "user")
         async with ClientSession() as s:
             async with s.post(
                 f"http://127.0.0.1:{cb_port}/a2a/reply",
@@ -1968,6 +1969,7 @@ async def test_orphan_retry_duplicate_is_dropped(monkeypatch):
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         ex._pending["msg-ack"] = fut
+        ex._record_origin("msg-ack", "user")
         async with ClientSession() as s:
             # First delivery resolves the pending future (e.g. the ack).
             async with s.post(
@@ -1996,6 +1998,151 @@ async def test_orphan_retry_duplicate_is_dropped(monkeypatch):
                 body = await r.json()
             assert body.get("relayed") is True
             assert notify_received == [{"message": "the real answer"}]
+    finally:
+        await ex.stop()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_orphan_reply_peer_origin_not_relayed(monkeypatch):
+    """A late reply to a PEER-delegated turn must NOT land on the human
+    user's canvas (review wf_7cb5003d #5) — and unknown origins
+    (executor restarted) fall back to the conservative drop."""
+    notify_received: List[Dict[str, Any]] = []
+    notify_port = _free_port()
+
+    async def fake_notify(request: web.Request) -> web.Response:
+        notify_received.append(await request.json())
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/workspaces/ws-peer/notify", fake_notify)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", notify_port)
+    await site.start()
+
+    cb_port = _free_port()
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+        MOLECULE_WORKSPACE_ID="ws-peer",
+        PLATFORM_URL=f"http://127.0.0.1:{notify_port}",
+    )
+    await ex.start()
+    try:
+        ex._record_origin("msg-peer", "peer")
+        async with ClientSession() as s:
+            for mid in ("msg-peer", "msg-unknown-origin"):
+                async with s.post(
+                    f"http://127.0.0.1:{cb_port}/a2a/reply",
+                    json={"reply_to": mid, "content": "peer answer"},
+                ) as r:
+                    body = await r.json()
+                assert r.status == 200
+                assert body.get("relayed") is None
+        assert notify_received == []
+    finally:
+        await ex.stop()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_orphan_relay_failure_returns_503_and_retry_succeeds(monkeypatch):
+    """A failed relay must answer non-2xx so the plugin redelivers
+    (review wf_7cb5003d #3), and the retry must relay (reservation
+    rolled back, #6)."""
+    calls: List[int] = []
+    notify_port = _free_port()
+
+    async def flaky_notify(request: web.Request) -> web.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            return web.json_response({"ok": False}, status=500)
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/workspaces/ws-flaky/notify", flaky_notify)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", notify_port)
+    await site.start()
+
+    cb_port = _free_port()
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+        MOLECULE_WORKSPACE_ID="ws-flaky",
+        PLATFORM_URL=f"http://127.0.0.1:{notify_port}",
+    )
+    await ex.start()
+    try:
+        ex._record_origin("msg-flaky", "user")
+        async with ClientSession() as s:
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-flaky", "content": "answer"},
+            ) as r:
+                assert r.status == 503
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-flaky", "content": "answer"},
+            ) as r:
+                body = await r.json()
+            assert r.status == 200 and body.get("relayed") is True
+        assert len(calls) == 2
+    finally:
+        await ex.stop()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_done_future_race_treats_new_content_as_orphan(monkeypatch):
+    """New content arriving while the future is present-but-done (the
+    busy-interrupt ack race, review wf_7cb5003d #2) must take the orphan
+    relay path — not be marked delivered and buried."""
+    notify_received: List[Dict[str, Any]] = []
+    notify_port = _free_port()
+
+    async def fake_notify(request: web.Request) -> web.Response:
+        notify_received.append(await request.json())
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_post("/workspaces/ws-race/notify", fake_notify)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", notify_port)
+    await site.start()
+
+    cb_port = _free_port()
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+        MOLECULE_WORKSPACE_ID="ws-race",
+        PLATFORM_URL=f"http://127.0.0.1:{notify_port}",
+    )
+    await ex.start()
+    try:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        ex._pending["msg-race"] = fut
+        ex._record_origin("msg-race", "user")
+        async with ClientSession() as s:
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-race", "content": "interrupt ack"},
+            ) as r:
+                assert (await r.json())["ok"] is True
+            # future now done but NOT yet popped by execute() — the real
+            # reply arrives in that window.
+            async with s.post(
+                f"http://127.0.0.1:{cb_port}/a2a/reply",
+                json={"reply_to": "msg-race", "content": "the real answer"},
+            ) as r:
+                body = await r.json()
+            assert body.get("relayed") is True
+        assert notify_received == [{"message": "the real answer"}]
     finally:
         await ex.stop()
         await runner.cleanup()
