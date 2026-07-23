@@ -104,9 +104,21 @@ for _ in $(seq 1 "$MCPWATCH_TICKS"); do
       [ "$NEXT" = "$CUR" ] && break
       CUR=$NEXT
     done
-    restart_gateway_for_mcp || break
-    BASELINE=$(mcp_block_hash)
-    RESTARTS=$((RESTARTS + 1))
-    [ "$RESTARTS" -ge "$MCPWATCH_MAX_RESTARTS" ] && break
+    # Only restart if the SETTLED block genuinely DIFFERS from the baseline.
+    # An idempotent, non-atomic rewrite (e.g. the real runtime re-writing the
+    # config the `molecule-runtime-prepare` pre-step already materialized, or
+    # a mid-write truncate/append flicker) transiently changes the hash then
+    # settles back to identical content. Restarting on that would be a
+    # needless ~gateway-restart outage — and with pre-materialization the
+    # steady state is EXACTLY this idempotent rewrite, so this guard is what
+    # keeps the watcher dormant on a healthy boot.
+    if [ "$CUR" != "$BASELINE" ]; then
+      restart_gateway_for_mcp || break
+      RESTARTS=$((RESTARTS + 1))
+      [ "$RESTARTS" -ge "$MCPWATCH_MAX_RESTARTS" ] && break
+    fi
+    # Re-baseline to the settled value whether or not we restarted, so a
+    # subsequent genuine change is measured against current reality.
+    BASELINE="$CUR"
   fi
 done

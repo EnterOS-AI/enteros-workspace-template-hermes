@@ -611,6 +611,46 @@ if ! curl -fsS -X POST -H 'Content-Type: application/json' \
   exit 1
 fi
 
+# --- Pre-materialize the full MCP config BEFORE the gateway launches ---
+# hermes >= 0.19 discovers MCP servers EAGERLY at gateway startup. The runtime
+# writes the management/self MCP stanzas during its OWN boot-install +
+# adapter.setup(), which historically ran AFTER the gateway launched (the
+# gateway must be up before the runtime serves). So the gateway missed those
+# servers and needed a RESTART to pick them up — a ~90s unreachable boot
+# window on every fresh boot (core#4587: "hi" during boot -> connection
+# refused).
+#
+# `molecule-runtime-prepare` runs the SAME boot-install + adapter.setup() the
+# real serve runs, writing the complete mcp_servers block into config.yaml,
+# then exits WITHOUT registering/serving. Running it HERE — after the base
+# config is written (above), before the gateway launches (below) — lets the
+# gateway read a COMPLETE config on its FIRST boot, so the reconcile restart
+# never happens.
+#
+# BEST-EFFORT + FAIL-SAFE, by construction it can only ever REMOVE the restart,
+# never brick boot:
+#   * Capability-gated on the binary: a runtime wheel predating this feature
+#     simply lacks `molecule-runtime-prepare`, so we skip and fall back to the
+#     post-launch reconcile watcher (today's behavior, unchanged).
+#   * `timeout`-bounded so a hung prepare can never wedge boot.
+#   * A non-zero / timed-out result is logged and IGNORED — the reconcile
+#     watcher below stays as the safety net either way.
+# Run as the SAME unprivileged agent/env as the real `molecule-runtime` exec
+# (HOME=/tmp so config resolves to /tmp/.hermes -> /configs/.hermes) so the
+# pre-written block is byte-identical to what the real serve rewrites — the
+# hardened watcher then sees no genuine post-launch change and stays dormant.
+if command -v molecule-runtime-prepare >/dev/null 2>&1; then
+  echo "[start.sh] pre-materializing MCP config (molecule-runtime-prepare) before gateway launch"
+  if timeout 150 gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime-prepare >>"$LOG_FILE" 2>&1; then
+    echo "[start.sh] config pre-materialized — gateway will discover all MCP servers on first boot (no reconcile restart)"
+  else
+    _prep_rc=$?
+    echo "[start.sh] molecule-runtime-prepare did not complete (rc=${_prep_rc}); falling back to the post-launch reconcile watcher" >&2
+  fi
+else
+  echo "[start.sh] molecule-runtime-prepare not in this runtime wheel; using the post-launch reconcile watcher"
+fi
+
 # --- Start hermes gateway in the background ---
 # `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
 # /tmp so the lookup resolves to /tmp/.hermes/.env (writable; matches
