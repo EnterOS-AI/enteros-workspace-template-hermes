@@ -646,11 +646,10 @@ async def test_reply_for_unknown_message_id_acks_stale(monkeypatch):
             ) as r:
                 assert r.status == 200
                 body = await r.json()
-                # relayed=False: no PLATFORM_URL configured here, so the
-                # orphan-relay path (late-reply loss fix) reports it
-                # could not forward — but still acks stale so the plugin
-                # doesn't retry forever.
-                assert body == {"ok": True, "stale": True, "relayed": False}
+                # Unknown message_id has no recorded origin, so the
+                # origin gate (review wf_7cb5003d #5) drops it without a
+                # relay attempt — stale ack, no retry churn.
+                assert body == {"ok": True, "stale": True}
     finally:
         await ex.stop()
 
@@ -1164,7 +1163,11 @@ async def test_plugin_path_reply_handler_exception_path(monkeypatch):
             ) as r:
                 assert r.status == 200
                 body = await r.json()
-                assert body == {"ok": True}
+                # A present-but-DONE future is now the orphan path (review
+                # wf_7cb5003d #2): this content will never reach execute(),
+                # so it is stale — and with no recorded origin it is
+                # conservatively dropped, not relayed.
+                assert body == {"ok": True, "stale": True}
     finally:
         await ex.stop()
 
