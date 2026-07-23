@@ -500,6 +500,16 @@ fi
     # Operators can pin a custom URL via env if molecule-runtime is
     # extended to host /a2a/reply itself.
     DEFAULT_CALLBACK="http://${MOLECULE_A2A_CALLBACK_HOST:-127.0.0.1}:${MOLECULE_A2A_CALLBACK_PORT:-8646}/a2a/reply"
+    # hermes >= 0.19 makes EXTERNAL (entry-point) plugins opt-in: only
+    # names listed under plugins.enabled load; absent key = nothing
+    # loads, and the gateway logs NOTHING about the skipped plugin
+    # (first-boot hang 2026-07-23: molecule_a2a discovered but never
+    # loaded, :8645 never bound, adapter.setup() failed, boot's TOOL
+    # step waited forever). The name is the entry-point name from the
+    # plugin's pyproject (molecule_a2a), not the platform key.
+    echo "plugins:"
+    echo "  enabled:"
+    echo "    - molecule_a2a"
     echo "platforms:"
     echo "  molecule-a2a:"
     echo "    enabled: true"
