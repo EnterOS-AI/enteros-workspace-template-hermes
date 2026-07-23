@@ -153,7 +153,7 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 #      `hermes_agent.plugins` entry-point group (registers through
 #      ctx.register_platform, #17751).
 ARG HERMES_VERSION=0.19.0
-ARG HERMES_PLATFORM_MOLECULE_A2A_REF=24f4300a566eaa4af51e94c5e54f34af0978e508
+ARG HERMES_PLATFORM_MOLECULE_A2A_REF=c47338f979ac55e52ebbb1804903f500b38c105f
 # The hermes installer uses uv to create the venv and doesn't seed pip
 # into it. Bootstrap pip first via ensurepip, then install both wheels.
 RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && \
