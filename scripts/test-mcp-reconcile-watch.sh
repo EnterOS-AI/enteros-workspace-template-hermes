@@ -88,6 +88,20 @@ WATCH_PID=$!
 
 sleep 3  # let the watcher take its baseline
 
+# --- Change 0: an IDEMPOTENT rewrite (identical content) must NOT restart ---
+# This is the steady state once `molecule-runtime-prepare` pre-materializes the
+# config before launch: the real runtime later re-writes the SAME mcp_servers
+# block, and the watcher must stay dormant (a restart here would re-introduce
+# the very ~90s outage pre-materialization eliminates). Rewrite byte-identical
+# content and confirm no restart across several poll cycles.
+cp "$CONFIG" "$WORK/config.rewrite" && cat "$WORK/config.rewrite" > "$CONFIG"
+sleep 5
+if [ "$(wc -l < "$BOOTS")" -ne 1 ]; then
+  echo "FAIL: idempotent config rewrite triggered a needless gateway restart (boots=$(wc -l < "$BOOTS"))"
+  cat "$WORK/watch.log"; exit 1
+fi
+echo "OK: idempotent rewrite did NOT restart the gateway (watcher dormant)"
+
 # --- Change 1: adaptor appends a second MCP server ---
 cat >> "$CONFIG" <<EOF
   molecule-self:
