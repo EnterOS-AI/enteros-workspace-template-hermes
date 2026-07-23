@@ -656,6 +656,57 @@ fi
 
 echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWAY_PID})"
 
+# --- MCP reconcile watcher: hermes >= 0.19 discovers MCP servers EAGERLY ---
+# 0.10 connected mcp_servers lazily at the first agent turn, AFTER the
+# runtime's plugin adaptors (below, post-exec) appended their stanzas
+# (molecule-platform, molecule-self) to config.yaml. 0.19 snapshots the
+# config at gateway startup — the adaptor-added servers simply do not
+# exist yet, so the agent silently boots with ONLY the base 'molecule'
+# server (31 tools instead of ~91: no schedule tools, no org-management
+# surface — 2026-07-23, concierge "I don't have scheduling"). Nothing
+# fails, so nothing logs.
+#
+# Reconcile: watch the mcp_servers block; when a plugin adaptor changes
+# it, wait for it to settle, re-stamp the clean-shutdown marker (the
+# first gateway start consumed it — without a fresh stamp this SECOND
+# start would suspend the boot session), then restart the gateway ONCE.
+# The restarted gateway's eager discovery sees the complete block. The
+# executor's A2A retry loop and the enumerate-tools boot step both
+# tolerate the ~seconds of gateway downtime (they retry until healthy).
+# One-shot with a bounded watch window: if no adaptor ever writes (a
+# workspace with no MCP-bearing plugins), the watcher just exits.
+mcp_block_hash() {
+  sed -n '/^mcp_servers:/,/^[a-z_]/p' "$HERMES_CONFIG" 2>/dev/null | md5sum | cut -d' ' -f1
+}
+(
+  BASELINE=$(mcp_block_hash)
+  for _ in $(seq 1 60); do
+    sleep 5
+    CUR=$(mcp_block_hash)
+    if [ "$CUR" != "$BASELINE" ]; then
+      # Settle: adaptors may write several stanzas back-to-back.
+      while :; do
+        sleep 5
+        NEXT=$(mcp_block_hash)
+        [ "$NEXT" = "$CUR" ] && break
+        CUR=$NEXT
+      done
+      echo "[start.sh] mcp_servers changed post-launch (plugin adaptors) — restarting hermes gateway to pick them up (0.19 eager discovery)"
+      install -o agent -g agent /dev/null /tmp/.hermes/.clean_shutdown
+      kill "$GATEWAY_PID" 2>/dev/null || true
+      for _ in $(seq 1 20); do
+        process_is_running "$GATEWAY_PID" || break
+        sleep 1
+      done
+      nohup gosu agent env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+          bash -c "cd /tmp && hermes gateway" \
+          >>"$LOG_FILE" 2>&1 &
+      echo "[start.sh] hermes gateway restarted (pid $!) with reconciled mcp_servers"
+      break
+    fi
+  done
+) &
+
 # --- Smoke: confirm hermes sees the molecule MCP server in `mcp list` ---
 # Belt-and-braces check: even if config.yaml has mcp_servers.molecule
 # written above, a yaml-parse error or a hermes-side regression could
