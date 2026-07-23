@@ -103,7 +103,8 @@ COPY __init__.py .
 COPY executor.py .
 COPY scripts/ /app/scripts/
 COPY start.sh /usr/local/bin/start.sh
-RUN chmod +x /usr/local/bin/start.sh
+COPY scripts/mcp-reconcile-watch.sh /usr/local/bin/mcp-reconcile-watch.sh
+RUN chmod +x /usr/local/bin/start.sh /usr/local/bin/mcp-reconcile-watch.sh
 
 # Generic GIT_ASKPASS helper. Reads HTTPS Basic-Auth credentials from
 # env vars (GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD, with GITEA_USER /

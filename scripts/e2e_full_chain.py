@@ -164,6 +164,14 @@ async def _amain() -> int:
         f"  base_url: \"http://127.0.0.1:{llm_port}/v1\"\n"
         "  api_key: \"sk-stub-fullchain\"\n"
         "  api_mode: \"chat_completions\"\n"
+        # hermes >= 0.19: entry-point plugins are OPT-IN via
+        # plugins.enabled; without it the molecule_a2a plugin silently
+        # never loads and /a2a/health below fails — which is exactly the
+        # first 2026-07-23 boot hang this harness now guards (start.sh
+        # emits the same block).
+        "plugins:\n"
+        "  enabled:\n"
+        "    - molecule_a2a\n"
         "platforms:\n"
         "  molecule-a2a:\n"
         "    enabled: true\n"
@@ -217,6 +225,27 @@ async def _amain() -> int:
         assert len(queue.events) == 1, (
             f"expected 1 event, got {len(queue.events)}: {queue.events!r}"
         )
+
+        # SECOND message with an ACTIVE session (2026-07-23 regression
+        # guard): hermes 0.19's pairing/allowlist policy silently dropped
+        # shared-secret-authenticated platform messages once a session
+        # existed ("Dropping message from unauthorized user in active
+        # session") — the executor future then expired as a 600s timeout
+        # bubble on canvas. The adapter now declares
+        # authorization_is_upstream; this round-trip fails loudly if that
+        # contract regresses in a future hermes bump.
+        queue2 = _CapturingQueue()
+        await asyncio.wait_for(
+            executor.execute(
+                _ctx("second message", task_id="task-fullchain-2"), queue2
+            ),
+            timeout=60,
+        )
+        assert len(queue2.events) == 1, (
+            "second (active-session) message dropped — hermes authz "
+            f"policy regression? events: {queue2.events!r}"
+        )
+        print("OK: second active-session message round-tripped (authz upstream honored)")
         text = repr(queue.events[0])
         # Our stub echoes "echo[<user>]" — the user message is the
         # prompt the executor forwarded. The hermes pipeline may
