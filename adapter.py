@@ -200,6 +200,23 @@ class HermesAgentAdapter(BaseAdapter):
 
         import httpx
 
+        # PREPARE MODE (core#4587): `molecule-runtime-prepare` runs this
+        # setup() BEFORE start.sh launches the hermes gateway, so the gateway
+        # reads a COMPLETE mcp_servers config (just written by
+        # install_plugins_via_registry above) on its FIRST boot — eliminating
+        # the ~90s post-launch gateway RESTART that hermes >= 0.19's eager MCP
+        # discovery otherwise required. The gateway is INTENTIONALLY not up
+        # yet, so the /a2a/health reachability probe below is inapplicable —
+        # it would ALWAYS fail here. Skip it and return: the config is already
+        # materialized. The real `molecule-runtime` serve (which start.sh
+        # exec's AFTER the gateway is up) runs setup() again and DOES probe, so
+        # the "surface reachable" contract still holds for the serving path.
+        # start.sh sets this env ONLY on the prepare invocation, never on the
+        # real serve. (Mirrors the MOLECULE_SMOKE_MODE skip above, but AFTER
+        # the plugin pipeline — prepare's whole purpose is to run it.)
+        if os.environ.get("MOLECULE_RUNTIME_PREPARE_ONLY") == "1":
+            return
+
         # Default off — see executor.py module docstring. Workspace boot
         # was wedging on the plugin /a2a/health probe because the plugin
         # didn't bind :8645 inside the deployed image. Falls back to the
