@@ -641,7 +641,7 @@ fi
 # hardened watcher then sees no genuine post-launch change and stays dormant.
 if command -v molecule-runtime-prepare >/dev/null 2>&1; then
   echo "[start.sh] pre-materializing MCP config (molecule-runtime-prepare) before gateway launch"
-  if timeout 150 gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime-prepare >>"$LOG_FILE" 2>&1; then
+  if timeout 150 gosu agent env HOME=/tmp CONFIGS_DIR=/configs MOLECULE_RUNTIME_PREPARE_ONLY=1 molecule-runtime-prepare >>"$LOG_FILE" 2>&1; then
     echo "[start.sh] config pre-materialized — gateway will discover all MCP servers on first boot (no reconcile restart)"
   else
     _prep_rc=$?

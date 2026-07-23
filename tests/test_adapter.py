@@ -625,3 +625,39 @@ def test_mcp_launch_env_resolves_via_hermes_home_default_when_unset(monkeypatch,
 
     env = HermesAgentAdapter().mcp_launch_env(AdapterConfig(model="hermes-test"))
     assert env["PATH"].split(":")[0] == str(node_bin)
+
+
+# ---- setup() prepare-mode probe skip (core#4587) --------------------
+
+
+@pytest.mark.asyncio
+async def test_setup_skips_gateway_probe_in_prepare_mode(monkeypatch):
+    """`molecule-runtime-prepare` runs setup() BEFORE start.sh launches the
+    hermes gateway, to pre-materialize the MCP config so the gateway reads it
+    on its FIRST boot (no post-launch restart, core#4587). The /a2a/health
+    probe is then INAPPLICABLE — the gateway is intentionally not up — so it
+    must be skipped, or prepare would spuriously fail. Config-materializing
+    work still runs; only the probe is skipped. With MOLECULE_RUNTIME_PREPARE_ONLY=1
+    and NOTHING listening, setup() must return cleanly (a probe would raise)."""
+    monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "true")
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_PORT", str(_free_port()))  # nothing bound
+    monkeypatch.setenv("MOLECULE_RUNTIME_PREPARE_ONLY", "1")
+    cfg = AdapterConfig(model="hermes-test")
+    # No HTTP server anywhere: if the probe were attempted this raises.
+    await HermesAgentAdapter().setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_probes_and_raises_when_gateway_down_without_prepare(monkeypatch):
+    """Negative control for the prepare-skip: WITHOUT
+    MOLECULE_RUNTIME_PREPARE_ONLY, setup() DOES probe and raises when the
+    gateway surface is unreachable — proving the skip above is load-bearing,
+    not a tautology (both tests point at an unbound port)."""
+    monkeypatch.delenv("MOLECULE_SMOKE_MODE", raising=False)
+    monkeypatch.delenv("MOLECULE_RUNTIME_PREPARE_ONLY", raising=False)
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_ENABLED", "true")
+    monkeypatch.setenv("MOLECULE_A2A_PLATFORM_PORT", str(_free_port()))  # nothing bound
+    cfg = AdapterConfig(model="hermes-test")
+    with pytest.raises(RuntimeError, match="not reachable"):
+        await HermesAgentAdapter().setup(cfg)
