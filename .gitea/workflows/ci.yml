@@ -732,6 +732,7 @@ jobs:
           echo "t4-conformance:   $t4"
           echo "conformance:      $conformance"
           echo "shell-tests:      $shell"
+          echo "gateway-roundtrip:$roundtrip"
           if [ "$static" != "success" ]; then
             echo "::error::validate-static did not succeed: $static"
             exit 1
@@ -741,11 +742,24 @@ jobs:
             echo "::error::validate-runtime did not succeed: $runtime"
             exit 1
           fi
+          is_fork_pr="${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}"
+          # Gateway live round-trip — explicit hard gate here too (review
+          # wf_3a7b849d #13: this aggregate assigned $roundtrip but never
+          # checked it, so a future `if: always()` on validate would silently
+          # drop the gate from the historical required-check). `skipped` only
+          # on fork PRs (the job self-skips there, #12).
+          if [ "$roundtrip" != "success" ]; then
+            if [ "$roundtrip" = "skipped" ] && [ "$is_fork_pr" = "true" ]; then
+              echo "::notice::gateway-live-roundtrip skipped on fork PR — allowing validate to pass."
+            else
+              echo "::error::gateway-live-roundtrip did not succeed: $roundtrip"
+              exit 1
+            fi
+          fi
           # T4 conformance is a HARD gate on internal (non-fork) PRs
           # and main pushes. `skipped` is only acceptable on fork PRs.
           # Any other non-success fails the build: "verified" T4 requires
           # this live gate green, never inference.
-          is_fork_pr="${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}"
           if [ "$t4" != "success" ]; then
             if [ "$t4" = "skipped" ] && [ "$is_fork_pr" = "true" ]; then
               echo "::notice::t4-conformance skipped on fork PR — allowing aggregate to pass."
@@ -855,6 +869,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     needs: validate-static
+    # review wf_3a7b849d #12: skip the WHOLE job on fork PRs so it reports
+    # result="skipped" (not "success" from no-op'd steps) to the aggregates —
+    # otherwise all-required's `roundtrip == skipped` fork carve-out is
+    # unreachable and the check log falsely claims a fork's pinned round-trip
+    # was verified. Runs on internal PRs (fork=false) and pushes (no PR object).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -871,11 +891,19 @@ jobs:
           set -euo pipefail
           HERMES_VERSION=$(sed -n 's/^ARG HERMES_VERSION=//p' Dockerfile | head -1)
           A2A_REF=$(sed -n 's/^ARG HERMES_PLATFORM_MOLECULE_A2A_REF=//p' Dockerfile | head -1)
-          test -n "$HERMES_VERSION" && test -n "$A2A_REF"
-          echo "pinned hermes-agent==$HERMES_VERSION a2a-plugin@$A2A_REF"
+          # review wf_3a7b849d #6: pin the runtime to .runtime-version, the
+          # EXACT version the shipped image is built and asserted against
+          # (docker build --build-arg RUNTIME_VERSION + the importlib equality
+          # check). Installing it unpinned made this "pinned stack" gate resolve
+          # a DIFFERENT runtime than the deliverable — so a prepare-dependent
+          # break in the pinned 0.4.x could ship green, and an unrelated newer
+          # release could red every template PR.
+          RUNTIME_VERSION=$(tr -d '[:space:]' < .runtime-version)
+          test -n "$HERMES_VERSION" && test -n "$A2A_REF" && test -n "$RUNTIME_VERSION"
+          echo "pinned hermes-agent==$HERMES_VERSION a2a-plugin@$A2A_REF runtime==$RUNTIME_VERSION"
           pip install -q "hermes-agent==$HERMES_VERSION" aiohttp
           pip install -q "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${A2A_REF}#egg=hermes-platform-molecule-a2a"
-          pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
+          pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" "molecules-workspace-runtime==$RUNTIME_VERSION"
       - name: Run the full-chain round-trip against the pinned gateway
         if: github.event.pull_request.head.repo.fork != true
         run: |

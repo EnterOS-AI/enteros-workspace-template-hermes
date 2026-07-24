@@ -46,8 +46,22 @@ MCPWATCH_HEALTH_TICKS="${MCPWATCH_HEALTH_TICKS:-60}"
 MCPWATCH_MAX_RESTARTS="${MCPWATCH_MAX_RESTARTS:-3}"
 MCPWATCH_MARKER_OWNER="${MCPWATCH_MARKER_OWNER:-agent}"
 
+# Zombie-aware liveness (review wf_3a7b849d #2). The old inline watcher used
+# process_is_running (scripts/process-liveness.sh), which reads /proc State and
+# excludes Z (zombie) and X (dead). A bare `kill -0` returns TRUE for a zombie —
+# and the first gateway's zombie is never reaped (start.sh exec'd into
+# molecule-runtime, which reaps no inherited children), so a `kill -0` drain
+# loop would burn the whole 90s window against a long-dead process and then log
+# a spurious SIGKILL. Read the proc State directly (self-contained — the baked
+# watcher must not depend on sourcing another script). Unreadable status ->
+# treat as gone (the process left /proc). This also fixes the EPERM
+# conflation: `kill -0` on a live process we can't signal returns success; here
+# a live process's State is readable and non-Z regardless of signal perms.
 mcpwatch_pid_running() {
-  kill -0 "$1" 2>/dev/null
+  local pid=$1 state
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  state=$(awk '$1 == "State:" { print $2; exit }' "/proc/${pid}/status" 2>/dev/null) || return 1
+  [ -n "$state" ] && [ "$state" != "Z" ] && [ "$state" != "X" ]
 }
 
 mcp_block_hash() {
@@ -117,8 +131,14 @@ for _ in $(seq 1 "$MCPWATCH_TICKS"); do
       RESTARTS=$((RESTARTS + 1))
       [ "$RESTARTS" -ge "$MCPWATCH_MAX_RESTARTS" ] && break
     fi
-    # Re-baseline to the settled value whether or not we restarted, so a
-    # subsequent genuine change is measured against current reality.
-    BASELINE="$CUR"
+    # Re-baseline to the block hash READ NOW (review wf_3a7b849d #3), not the
+    # pre-restart settled $CUR. The restart window is long (up to ~150s: drain
+    # + health polls), and any adaptor write that lands during it is ALREADY
+    # read by the relaunched gateway's eager discovery — so baselining to $CUR
+    # would see that write as a fresh diff on the next poll and fire a second,
+    # gratuitous restart (killing the just-healthy gateway and burning a
+    # MAX_RESTARTS slot). Re-hashing here captures the current on-disk truth in
+    # both the restarted and the dormant idempotent-rewrite cases.
+    BASELINE=$(mcp_block_hash)
   fi
 done
