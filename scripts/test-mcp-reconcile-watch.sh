@@ -20,19 +20,28 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.clos
 PY
 )
 cleanup() {
-  pkill -f "fake_gateway_${FAKE_PORT}" 2>/dev/null || true
   [ -n "${WATCH_PID:-}" ] && kill "$WATCH_PID" 2>/dev/null || true
+  pkill -f "fake_gateway_${FAKE_PORT}" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-cat > "$WORK/fake_gateway.py" <<PY
+cat > "$WORK/fake_gateway.py" <<'PY'
 import http.server, sys, os
-# argv[1]=port argv[2]=launch-count file — each boot appends its pid so the
-# test can count restarts and address the CURRENT process.
+# argv[1]=port argv[2]=launch-count file argv[3]=match tag (kept in argv so
+# `pkill -f <tag>` and cleanup can actually match a live process — a trailing
+# "# tag" in the launch string is stripped as a bash comment before exec, so
+# review wf_3a7b849d #9: the tag MUST be a real argv element).
 port = int(sys.argv[1])
+# Record marker presence AT STARTUP (review wf_3a7b849d #10): the relaunched
+# gateway proves the clean-shutdown marker was stamped BEFORE it started (the
+# ordering that matters — a marker that appears only after relaunch would
+# leave the real gateway suspending the boot session). Boot #1 has no marker
+# env, so it records 0; the watcher-relaunched boot inherits MCPWATCH_MARKER.
+m = os.environ.get("MCPWATCH_MARKER", "")
+seen = 1 if (m and os.path.exists(m)) else 0
 with open(sys.argv[2], "a") as f:
-    f.write(str(os.getpid()) + "\n")
+    f.write("%d marker=%d\n" % (os.getpid(), seen))
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
@@ -58,7 +67,10 @@ mcp_servers:
 EOF
 
 BOOTS="$WORK/boots.txt"
-LAUNCH="exec python3 $WORK/fake_gateway.py $FAKE_PORT $BOOTS # fake_gateway_${FAKE_PORT}"
+TAG="fake_gateway_${FAKE_PORT}"
+# The tag is a REAL argv element (argv[3]), so pkill -f "$TAG" and the boots
+# marker=<0|1> record both work (review wf_3a7b849d #9/#10).
+LAUNCH="exec python3 $WORK/fake_gateway.py $FAKE_PORT $BOOTS $TAG"
 
 # Boot #1 (stands in for start.sh's original gateway launch).
 bash -c "$LAUNCH" >>"$WORK/gw.log" 2>&1 &
@@ -119,11 +131,17 @@ if [ "$BOOT_COUNT" -lt 2 ]; then
 fi
 echo "OK: change 1 restarted the gateway (boots=$BOOT_COUNT)"
 
-if [ ! -f "$MARKER" ]; then
-  echo "FAIL: clean-shutdown marker was not re-stamped before the restart"
-  cat "$WORK/watch.log"; exit 1
+# ORDERING, not just existence (review wf_3a7b849d #10): the RELAUNCHED gateway
+# (boot line 2) must have recorded marker=1, proving the marker was stamped
+# BEFORE the replacement started — a marker that only appears afterward would
+# let the real hermes gateway suspend the boot session instead of resuming it.
+# Checking `-f "$MARKER"` alone would pass even if a future refactor moved the
+# stamp to after the relaunch.
+if [ "$(sed -n '2p' "$BOOTS" | grep -c 'marker=1')" -ne 1 ]; then
+  echo "FAIL: relaunched gateway did NOT see the clean-shutdown marker at startup"
+  echo "boots: $(cat "$BOOTS")"; cat "$WORK/watch.log"; exit 1
 fi
-echo "OK: clean-shutdown marker re-stamped"
+echo "OK: clean-shutdown marker was stamped BEFORE the relaunch (resume, not suspend)"
 
 OLD_GW1_DEAD=1
 kill -0 "$GW1" 2>/dev/null && OLD_GW1_DEAD=0
@@ -133,8 +151,17 @@ if [ "$OLD_GW1_DEAD" -ne 1 ]; then
 fi
 echo "OK: original gateway was terminated"
 
-curl -fsS "http://127.0.0.1:$FAKE_PORT/health" >/dev/null || {
-  echo "FAIL: relaunched gateway not healthy"; cat "$WORK/watch.log"; exit 1; }
+# Bounded retry, not a single racing curl (review wf_3a7b849d #11): the boots
+# line is appended BEFORE HTTPServer binds, so a lone curl right after can hit
+# connection-refused and red the hard-gated lane on an unrelated PR.
+_healthy=0
+for _ in $(seq 1 40); do
+  curl -fsS "http://127.0.0.1:$FAKE_PORT/health" >/dev/null 2>&1 && { _healthy=1; break; }
+  sleep 0.25
+done
+if [ "$_healthy" -ne 1 ]; then
+  echo "FAIL: relaunched gateway not healthy"; cat "$WORK/watch.log"; exit 1
+fi
 echo "OK: relaunched gateway healthy"
 
 # --- Change 2: a SLOW second adaptor writes after the first restart ---
