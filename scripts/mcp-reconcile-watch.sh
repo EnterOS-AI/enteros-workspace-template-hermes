@@ -7,7 +7,10 @@
 # no schedule tools, no org-management surface; 2026-07-23 concierge
 # "I don't have scheduling"). Nothing fails, so nothing logs.
 #
-# This watcher polls the mcp_servers block; when a plugin adaptor changes
+# This watcher polls the PARSED mcp_servers mapping (a STRUCTURAL compare,
+# not a raw-byte one — formatting / quoting / key-order churn from an
+# idempotent yaml rewrite is invisible; only a real server add / remove /
+# spec-change counts, RFC rule 5); when a plugin adaptor changes
 # it, waits for the writes to settle, re-stamps the clean-shutdown marker
 # (so the restarted gateway resumes the boot session instead of
 # suspending it), gracefully drains the old gateway (SIGTERM lets an
@@ -64,8 +67,33 @@ mcpwatch_pid_running() {
   [ -n "$state" ] && [ "$state" != "Z" ] && [ "$state" != "X" ]
 }
 
+# Structural fingerprint of the PARSED mcp_servers mapping (RFC rule 5).
+# The old raw-byte hash (a sed of the /^mcp_servers:/ block piped to md5sum)
+# fired on any COSMETIC delta — safe_dump re-quoting a url, reordering keys,
+# whitespace — which is exactly what an idempotent runtime rewrite produces,
+# so the watcher restarted the gateway (killing the concierge greeting) for a
+# semantically-unchanged config. Parse the yaml and hash a canonical
+# (sorted-key, whitespace-free) json of ONLY mcp_servers instead: formatting /
+# quoting / key-order churn is invisible, but a genuine server add / remove /
+# spec-change still moves the fingerprint and triggers the reconcile restart.
+# Unreadable / malformed / pyyaml-less -> a stable empty fingerprint (fail-safe:
+# never a spurious restart; python3 + pyyaml are always present in the runtime
+# image — molecule_runtime imports yaml).
 mcp_block_hash() {
-  sed -n '/^mcp_servers:/,/^[a-z_]/p' "$MCPWATCH_CONFIG" 2>/dev/null | md5sum | cut -d' ' -f1
+  python3 -c '
+import sys, json, hashlib
+try:
+    import yaml
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    servers = data.get("mcp_servers") if isinstance(data, dict) else {}
+    if not isinstance(servers, dict):
+        servers = {}
+    canon = json.dumps(servers, sort_keys=True, separators=(",", ":"))
+except Exception:
+    canon = ""
+sys.stdout.write(hashlib.md5(canon.encode("utf-8")).hexdigest())
+' "$MCPWATCH_CONFIG" 2>/dev/null
 }
 
 restart_gateway_for_mcp() {
