@@ -542,9 +542,21 @@ fi
   # server started below. Class-A canvas regression — without this
   # block hermes is platform-blind even though every other plumbing
   # layer is correct.
-  echo "mcp_servers:"
-  echo "  molecule:"
-  echo "    url: \"http://127.0.0.1:${MOLECULE_MCP_PORT:-9100}/mcp\""
+  # Seed the base `molecule` MCP server through the SAME serializer
+  # molecule-runtime-prepare / adapter.py use (yaml.safe_dump, sort_keys=
+  # False) so this block is BYTE-IDENTICAL to what the runtime later
+  # rewrites (RFC rule 5). Hand-formatted YAML here — the old
+  # `echo "    url: \"...\""` emitted a QUOTED url, but safe_dump emits it
+  # UNQUOTED (`url: http://...`) — round-trips to DIFFERENT bytes; the
+  # reconcile watcher used to md5-diff that cosmetic delta and restart the
+  # gateway, killing the concierge greeting. We KEEP seeding it (rather than
+  # deferring entirely to runtime-prepare) because a runtime wheel WITHOUT
+  # molecule-runtime-prepare falls back to the post-launch watcher and would
+  # otherwise reach the mandatory `hermes mcp list` smoke below with NO
+  # mcp_servers.molecule -> boot refused. pyyaml is always present
+  # (molecule_runtime depends on it; adapter.py imports yaml); python3 is
+  # already used below for the MCP server.
+  MOLECULE_MCP_PORT="${MOLECULE_MCP_PORT:-9100}" python3 -c 'import os, sys, yaml; sys.stdout.write(yaml.safe_dump({"mcp_servers": {"molecule": {"url": "http://127.0.0.1:%s/mcp" % os.environ["MOLECULE_MCP_PORT"]}}}, sort_keys=False))'
 } >"$HERMES_CONFIG"
 chown agent:agent "$HERMES_CONFIG"
 

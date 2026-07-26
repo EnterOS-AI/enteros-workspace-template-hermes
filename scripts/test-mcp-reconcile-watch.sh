@@ -52,8 +52,9 @@ PY
 
 # mcp_servers LAST so appended stanzas extend the block — modeling the
 # runtime adaptors, which rewrite the whole yaml and keep the block
-# contiguous (the watcher hashes /^mcp_servers:/ through the next
-# top-level key).
+# contiguous (the watcher parses the yaml and fingerprints the mcp_servers
+# mapping STRUCTURALLY — RFC rule 5 — so quoting / key-order / whitespace
+# churn is invisible and only a real add/remove/spec-change fires).
 CONFIG="$WORK/config.yaml"
 cat > "$CONFIG" <<EOF
 model:
@@ -113,6 +114,32 @@ if [ "$(wc -l < "$BOOTS")" -ne 1 ]; then
   cat "$WORK/watch.log"; exit 1
 fi
 echo "OK: idempotent rewrite did NOT restart the gateway (watcher dormant)"
+
+# --- Change 0b: a SEMANTICALLY-equal but BYTE-DIFFERENT rewrite must NOT
+# restart (RFC rule 5, the structural-compare proof) ---
+# This is the ACTUAL steady state: start.sh's heredoc seed and adapter.py's
+# yaml.safe_dump render the SAME `molecule` server with DIFFERENT bytes (quoted
+# vs unquoted url, key order, whitespace). The old raw-byte md5 hash saw that
+# cosmetic delta as a change and restarted the gateway — killing the concierge
+# greeting. The parsed/structural fingerprint must treat it as identical. Here
+# we re-quote the url and reorder keys while keeping the parse identical; a
+# restart on this would be the rule-5 regression.
+cat > "$CONFIG" <<EOF
+platforms:
+  molecule-a2a:
+    enabled: true
+model:
+  default: test
+mcp_servers:
+  molecule:
+    url: "http://127.0.0.1:9100/mcp"
+EOF
+sleep 5
+if [ "$(wc -l < "$BOOTS")" -ne 1 ]; then
+  echo "FAIL: semantically-equal (re-quoted/reordered) rewrite triggered a needless gateway restart (boots=$(wc -l < "$BOOTS")) — structural compare regressed to raw bytes"
+  cat "$WORK/watch.log"; exit 1
+fi
+echo "OK: semantically-equal byte-different rewrite did NOT restart (structural compare holds)"
 
 # --- Change 1: adaptor appends a second MCP server ---
 cat >> "$CONFIG" <<EOF

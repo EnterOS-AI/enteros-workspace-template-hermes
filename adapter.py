@@ -305,9 +305,14 @@ class HermesAgentAdapter(BaseAdapter):
         self, config: AdapterConfig, name: str, spec: dict
     ) -> None:
         """ADR-004 socket — additively merge ``name -> spec`` into hermes' native
-        ``~/.hermes/config.yaml`` ``mcp_servers`` map. Idempotent; preserves the
-        rest of the file (the ``model`` block, the a2a ``molecule`` url sidecar,
-        any other server or hand-written key).
+        ``~/.hermes/config.yaml`` ``mcp_servers`` map. Idempotent at the FILE
+        level (RFC rule 5): a call that would not change the parsed ``mcp_servers``
+        mapping returns WITHOUT rewriting the file, so a semantically-unchanged
+        register is a true no-op and never churns bytes the gateway
+        config-watcher would md5-diff into a spurious restart (which kills the
+        in-flight concierge greeting). Preserves the rest of the file (the
+        ``model`` block, the a2a ``molecule`` url sidecar, any other server or
+        hand-written key).
 
         FAITHFUL copy of the engine's ``render_hermes_config`` — writes the stdio
         descriptor (``{command, args?, env?}``) verbatim under
@@ -346,6 +351,20 @@ class HermesAgentAdapter(BaseAdapter):
         servers = data.get(self._HERMES_MCP_KEY)
         if not isinstance(servers, dict):
             servers = {}
+
+        # Idempotency guard (RFC rule 5): if this exact ``name -> spec`` is
+        # ALREADY materialized, the re-serialize below would be a SEMANTIC
+        # no-op that only churns bytes — ``yaml.safe_dump`` re-quoting a
+        # heredoc-seeded url, reordering keys, normalizing whitespace. The
+        # gateway's config watcher md5-compares ``mcp_servers`` and restarts
+        # on any byte delta, so a spurious rewrite here costs a ~gateway
+        # restart that kills the in-flight concierge greeting. Return WITHOUT
+        # writing when nothing actually changed; write only on a genuine
+        # add / spec-change. (``==`` on the parsed dicts is a structural
+        # compare — yaml formatting and key order are irrelevant.)
+        if servers.get(name) == spec:
+            return
+
         servers[name] = spec
         data[self._HERMES_MCP_KEY] = servers
 
