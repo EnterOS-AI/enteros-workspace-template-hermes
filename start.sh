@@ -13,6 +13,12 @@ set -euo pipefail
 # shellcheck source=scripts/process-liveness.sh
 . /app/scripts/process-liveness.sh
 
+# shellcheck source=scripts/log-mirror.sh
+# mirror_log_to_stdout(): tee a file-only log (gateway.log, molecule-mcp-server.log)
+# to PID1 stdout so `docker logs` / Dozzle can see it. See the helper header for the
+# full rationale (it never touches the producers' own >>"$LOG" redirect).
+. /app/scripts/log-mirror.sh
+
 # Source persistent workspace secrets BEFORE anything else that might need them.
 # /configs is volume-mounted from the host so this survives container restart.
 if [ -f /configs/secrets.d/load.sh ]; then
@@ -186,6 +192,16 @@ done
 # that creates the file with the final perms in one shot — and located
 # logs inside HERMES_HOME (agent-owned). Re-applying that fix here.
 install -m 644 -o agent -g agent /dev/null "$LOG_FILE"
+
+# --- Mirror the gateway log to the container stdout (Dozzle visibility) ---
+# `hermes gateway` is launched detached below with `>>"$LOG_FILE" 2>&1 &`, so
+# its logs land in a FILE and never reach `docker logs` / Dozzle. Start the
+# stdout mirror NOW (right after the file exists, before the pre-materialize
+# step and the gateway both append to it) so nothing is missed. Safe by
+# construction: it only reads the file and never touches the gateway's own
+# redirect, so the reconcile watcher (reads config.yaml) and the boot
+# `tail -40/-80 "$LOG_FILE"` error dumps are unaffected. See log-mirror.sh.
+mirror_log_to_stdout "$LOG_FILE"
 
 # --- Write hermes-agent's .env ---
 # API_SERVER_ENABLED must be true and the bearer must match. Every
@@ -573,6 +589,11 @@ chown agent:agent "$HERMES_CONFIG"
 # (Permission denied on the >> redirect from the root parent shell).
 MCP_LOG="${HERMES_HOME}/molecule-mcp-server.log"
 install -m 644 -o agent -g agent /dev/null "$MCP_LOG"
+# Mirror the MCP server's file-only log to the container stdout (Dozzle). The
+# server is launched detached below with `>>"$MCP_LOG" 2>&1 &`; the boot
+# readiness smoke's `tail -40 "$MCP_LOG"` dumps and any file reader keep
+# working — the mirror only follows the file. See log-mirror.sh.
+mirror_log_to_stdout "$MCP_LOG"
 # CONFIGS_DIR=/configs is REQUIRED here, not optional: the `env HOME=/tmp`
 # form REPLACES the inherited environment, so even though /configs is now
 # agent-owned (chowned above), configs_dir.resolve()'s second branch
