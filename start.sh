@@ -167,10 +167,17 @@ install -d -o agent -g agent "$HERMES_HOME"
 # daemon's _ensure_default_soul_md only seeds SOUL.md when ABSENT, so our
 # pre-start install wins; re-installing on every boot keeps a persona update
 # effective after restart.
+#
+# The persona that matched also identifies the workspace KIND: only a
+# platform-managed concierge is delivered prompts/concierge.md (plain
+# workspaces get system-prompt.md). IS_CONCIERGE is consumed by the
+# tool-search block in the config.yaml seed below.
+IS_CONCIERGE=0
 for persona in /configs/prompts/concierge.md /configs/system-prompt.md; do
   if [ -s "$persona" ]; then
     install -m 644 -o agent -g agent "$persona" "${HERMES_HOME}/SOUL.md"
     echo "[start.sh] grafted persona ${persona} -> ${HERMES_HOME}/SOUL.md"
+    [ "$persona" = "/configs/prompts/concierge.md" ] && IS_CONCIERGE=1
     break
   fi
 done
@@ -500,6 +507,38 @@ fi
   #   codex_responses   → /v1/responses + encrypted_content (o1 only)
   if [ -n "${HERMES_CUSTOM_API_MODE:-}" ]; then
     echo "  api_mode: \"${HERMES_CUSTOM_API_MODE}\""
+  fi
+  # --- Tool search (progressive disclosure) — OFF for the concierge ---
+  # hermes' tiered disclosure (tools/tool_search.py) replaces every
+  # MCP/plugin tool in the model-facing tools array with three bridge tools
+  # (tool_search / tool_describe / tool_call) and defers the real schemas.
+  # `should_activate()` fires whenever AT LEAST ONE deferrable tool exists —
+  # threshold_pct / listing_max_tokens only bound how much of the catalog is
+  # LISTED, they do NOT gate activation. (Measured: threshold_pct=100 +
+  # listing_max_tokens=60000 — both clamp ceilings — still yields
+  # `activated=True tier=1 deferred_count=96`.) So a budget knob cannot fix
+  # this; only `enabled: off` can.
+  #
+  # Why that matters here: the concierge carries the management MCP
+  # (mcp_servers.molecule-platform, MOLECULE_MCP_MODE=management) — 54
+  # platform verbs inside a ~110-tool surface. Deferred tools are stripped
+  # from `agent.tools`, and agent_init.py derives
+  # `agent.valid_tool_names` from exactly that stripped set — yet their
+  # REAL names stay advertised in the tool_search bridge description's
+  # catalog listing. The model reads a real name off that listing, calls it
+  # directly, conversation_loop.py's plain set-membership check misses, and
+  # after 3 strikes the turn dies with "Model generated invalid tool call:
+  # mcp__molecule_platform__list_orgs". The strike budget is burned on
+  # orientation calls and provision_workspace is never reached — which is
+  # what makes staging-tenant-cd / e2e-smoke nondeterministic.
+  #
+  # Scoped to the concierge ONLY (IS_CONCIERGE, set by the persona graft
+  # above). Ordinary workspaces keep the upstream default: they carry a
+  # smaller self-mode surface and are left exactly as they are today.
+  if [ "${IS_CONCIERGE}" = "1" ]; then
+    echo "tools:"
+    echo "  tool_search:"
+    echo "    enabled: \"off\""
   fi
   # --- Molecule A2A platform plugin ---
   # Loaded into hermes via the hermes_agent.plugins entry point baked
