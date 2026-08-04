@@ -1039,4 +1039,5 @@ jobs:
           tests/test_plugin_installer_cutover.py
           tests/test_ci_runtime_image_pin.py
           tests/test_ci_molecule_ci_fetch.py
+          tests/test_toolsearch_concierge_scope.py
           -v
