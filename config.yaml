@@ -328,14 +328,35 @@ runtime_config:
     # env); start.sh routes these through the platform proxy's OpenAI-compat
     # surface (scripts/derive-platform-llm.sh). Model ids match the proven
     # proxy smoke (molecule-controlplane/scripts/e2e-llm-kimi-smoke.sh).
-    - id: moonshot/kimi-k2.6
-      name: Kimi K2.6 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: moonshot/kimi-k2.5
-      name: Kimi K2.5 (Molecule platform)
-      provider: platform
-      required_env: []
+    #
+    # 2026-08-04 — PLATFORM MENU NARROWED TO MINIMAX-ONLY (operator directive).
+    # WITHDRAWN, COMMENTED NOT DELETED — restore by uncommenting once the
+    # vendor account is funded and the operator lifts the directive.
+    # The platform's Moonshot vendor account
+    # (org-bd1467ed2be74ef3a0bfa43941abf167) is SUSPENDED for non-payment:
+    # every moonshot/* platform call returns HTTP 429
+    # exceeded_current_quota_error in ~200ms, 100% of the time. A paying client
+    # burned 2,451 failed calls over 16h while every health signal read green —
+    # and because these ids stayed user-selectable, a customer could provision a
+    # permanently DEAD workspace. Kimi was hermes's historical native platform
+    # family; it is now dead on the platform key, so the shared minimax family
+    # (minimax/MiniMax-M2.7 / -highspeed / -M3, listed below) is the whole
+    # platform menu here.
+    # Mirrors the registry SSOT: molecule-ai-sdk#203
+    # (contracts/llm-registry/llm-registry.yaml) + molecule-controlplane#2850
+    # (internal/providers/providers.yaml runtimes.hermes platform arm). A
+    # withdrawn id now fails DeriveProvider CLOSED -> 422
+    # UNREGISTERED_MODEL_FOR_RUNTIME at workspace-create, which is the intent.
+    # NOTE — the BYOK `kimi-coding/kimi-k2` entry below is UNAFFECTED: it bills
+    # the tenant's own KIMI_API_KEY, not the suspended platform account.
+    # - id: moonshot/kimi-k2.6
+    #   name: Kimi K2.6 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: moonshot/kimi-k2.5
+    #   name: Kimi K2.5 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
 
     # ── Kimi / Moonshot ───────────────────────────────────────────────
     - id: kimi-coding/kimi-k2
