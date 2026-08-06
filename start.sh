@@ -167,13 +167,92 @@ install -d -o agent -g agent "$HERMES_HOME"
 # daemon's _ensure_default_soul_md only seeds SOUL.md when ABSENT, so our
 # pre-start install wins; re-installing on every boot keeps a persona update
 # effective after restart.
+#
+# The loop below has an ELSE branch for a reason. Before 2026-08-05 it had
+# none: when NEITHER file was delivered it fell off the end silently, leaving
+# whatever SOUL.md was already on the persisted volume and printing nothing
+# that distinguishes that boot from a healthy one. That is the exact silent
+# degradation that put a third-party identity in front of a customer
+# (enteros-ws-test2-… boots with no /configs/prompts/ at all, on the same image
+# as a workspace that has one). It must not FAIL the boot — a workspace that
+# cannot boot is worse than one with a generic persona — but it must be LOUD.
+persona_grafted=0
 for persona in /configs/prompts/concierge.md /configs/system-prompt.md; do
   if [ -s "$persona" ]; then
     install -m 644 -o agent -g agent "$persona" "${HERMES_HOME}/SOUL.md"
     echo "[start.sh] grafted persona ${persona} -> ${HERMES_HOME}/SOUL.md"
+    persona_grafted=1
     break
   fi
 done
+if [ "$persona_grafted" = 0 ]; then
+  echo "[start.sh] ERROR no workspace persona was delivered: neither" \
+       "/configs/prompts/concierge.md nor /configs/system-prompt.md exists" \
+       "(or both are empty). ${HERMES_HOME}/SOUL.md keeps whatever identity" \
+       "was already on the volume, so this workspace will introduce itself" \
+       "with a generic/stock identity instead of its role. Boot CONTINUES;" \
+       "this is a delivery defect in the control plane's config relay, not a" \
+       "reason to fail the container." >&2
+fi
+
+# --- Neutralize the upstream vendor self-identification -----------------------
+# The vendored upstream builds its system prompt in agent/system_prompt.py and,
+# with NO config knob and NO condition, appends
+# agent/prompt_builder.py::HERMES_AGENT_HELP_GUIDANCE to the STABLE tier right
+# after the identity block:
+#
+#     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+#     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+#
+# That constant reads "You run on Hermes Agent (by Nous Research) … the
+# documentation at https://hermes-agent.nousresearch.com/docs is your
+# authoritative reference …", so every workspace on this template tells its
+# customer it is a third party's product — measured identically on a container
+# WITH the concierge persona delivered and one WITHOUT, on the same image, which
+# is what proves the persona file is not the cause.
+#
+# WHY HERE AND NOT IN THE Dockerfile. start.sh is COPY'd into the image
+# (see Dockerfile), so a start.sh patch is NOT cheaper than a build-time patch
+# on the "already-built images" axis — both need a rebuild + runtime release +
+# template-pin promote. The reasons this seam wins are different ones:
+#   1. TESTABILITY. This repo's tests execute real blocks out of start.sh and
+#      real scripts out of scripts/ (see tests/); nothing in the suite builds an
+#      image, so a `RUN sed` in the Dockerfile could only ever be guarded by
+#      eyeballing. The helper invoked below is executed verbatim by
+#      tests/test_vendor_branding_neutralized.py.
+#   2. RE-APPLICATION. It runs on every container START, so it survives a
+#      `docker restart`, a container recreate, and any runtime path that
+#      refreshes ~/.hermes/hermes-agent after the image was built.
+#   3. LOCALITY. start.sh already owns workspace identity assembly (the persona
+#      graft directly above); keeping both in one file means one place to read.
+# The helper is idempotent, so (2) does not accumulate edits.
+#
+# It rewrites EVERY copy of agent/prompt_builder.py under the hermes root (the
+# image ships two non-identical copies: the installer's checkout tree and the
+# venv site-packages wheel) and then RE-IMPORTS the module the way the gateway
+# does to prove the value the gateway will see actually changed. Patching a copy
+# nothing imports is a vacuous fix.
+#
+# Non-fatal by construction: a bad byline is not worth a dead workspace. A
+# failure is logged loudly and CI catches the same condition
+# (tests/test_vendor_branding_neutralized.py) before it reaches a customer.
+HERMES_UPSTREAM_ROOT="${HERMES_UPSTREAM_ROOT:-/home/agent/.hermes/hermes-agent}"
+if [ -d "$HERMES_UPSTREAM_ROOT" ]; then
+  if python3 /app/scripts/neutralize-vendor-branding.py \
+       --hermes-root "$HERMES_UPSTREAM_ROOT"; then
+    echo "[start.sh] upstream vendor self-identification neutralized"
+  else
+    echo "[start.sh] ERROR scripts/neutralize-vendor-branding.py failed (rc=$?)." \
+         "The upstream HERMES_AGENT_HELP_GUIDANCE / DEFAULT_AGENT_IDENTITY" \
+         "constants are still in the system prompt, so this agent will tell" \
+         "users it runs on Nous Research's Hermes Agent product and point them" \
+         "at nousresearch.com docs. Boot CONTINUES." >&2
+  fi
+else
+  echo "[start.sh] ERROR upstream install ${HERMES_UPSTREAM_ROOT} not found;" \
+       "vendor self-identification NOT neutralized — the agent will tell users" \
+       "it runs on Nous Research's Hermes Agent product. Boot CONTINUES." >&2
+fi
 
 # --- Install log files atomically (race-free) ---
 # Regression fix re-applied 2026-05-15: a previous build (image
