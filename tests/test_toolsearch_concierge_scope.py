@@ -1,36 +1,56 @@
-"""start.sh must disable hermes tool-search for the CONCIERGE ONLY.
+"""start.sh must disable hermes tool-search for EVERY workspace.
 
 Why this test exists
 --------------------
 hermes' tiered disclosure (``tools/tool_search.py``) strips every MCP/plugin
 tool out of the model-facing tools array and replaces them with the
 ``tool_search`` / ``tool_describe`` / ``tool_call`` bridge. ``agent_init.py``
-then derives ``agent.valid_tool_names`` from that *stripped* array — while the
-bridge description keeps advertising the deferred tools' REAL names. The model
-reads a real name off that listing, calls it directly, the plain
-set-membership check in ``conversation_loop.py`` misses, and the turn dies with
-``Model generated invalid tool call: mcp__molecule_platform__list_orgs``.
+then derives ``agent.valid_tool_names`` from that *stripped* array (0.19.0:
+``agent_init.py`` ``valid_tool_names = {t["function"]["name"] for t in
+agent.tools}``) — while the bridge description keeps advertising the deferred
+tools' REAL names. The model reads a real name off that listing, calls it
+directly, the plain set-membership check in ``conversation_loop.py`` misses,
+and after three strikes the turn dies with
+``Model generated invalid tool call: <a real, registered tool id>``.
 
-For the concierge (which carries the ~110-tool management MCP surface) that is
-fatal: the strike budget is spent on orientation calls and
-``provision_workspace`` is never reached.
+WHY THIS IS NO LONGER SCOPED TO THE CONCIERGE (2026-08-06)
+----------------------------------------------------------
+The first cut of this fix emitted the stanza only when
+``/configs/prompts/concierge.md`` had been delivered (``IS_CONCIERGE``). That
+made a FATAL runtime capability — whether the agent can call any MCP tool at
+all — depend on an asset the control plane does not guarantee. molecule-core
+``87de7be0c`` documents a hermes concierge that reached production with
+``/configs/prompts/`` absent while ``/configs/config.yaml`` still declared
+``prompt_files: [prompts/concierge.md]``; on such a box ``IS_CONCIERGE`` is 0,
+the stanza is never written, and the concierge's whole 92-tool surface is
+deferred behind the bridge. Measured live on two containers running the SAME
+image, differing only in that file:
 
+  * persona delivered  -> ``tools:`` present, no ``tool_search activated`` line,
+    ``mcp__molecule__send_message_to_user`` dispatches;
+  * persona absent     -> no ``tools:`` key,
+    ``tool_search activated (tier 1): 18 core/visible tools kept, 92 deferred``.
+
+That state is what makes ``staging-tenant-cd / e2e-smoke`` nondeterministic:
+the concierge answers a real ``provision_workspace`` A2A turn with
+``Model generated invalid tool call: mcp__molecule__get_workspace_info`` — a
+REAL id from the ``molecule`` sidecar's 32 registered tools — and burns the
+strike budget before reaching ``provision_workspace``.
+
+Ordinary workspaces are exposed to the identical hazard: a live worker logs
+``tool_search activated (tier 1): 18 core/visible tools kept, 38 deferred``.
 ``should_activate()`` fires on the mere EXISTENCE of a deferrable tool —
 ``threshold_pct`` / ``listing_max_tokens`` bound only how much of the catalog
 gets LISTED, not whether it defers. So no budget knob can fix this; only
-``tools.tool_search.enabled: "off"`` can.
+``tools.tool_search.enabled: "off"`` can, and it must not be conditional on
+anything the delivery path can fail to produce.
 
-This test asserts BOTH halves of the contract by executing the real
-config.yaml seed block out of ``start.sh`` and parsing what it renders:
-
-  1. a concierge (``/configs/prompts/concierge.md`` delivered) gets
-     ``tools.tool_search.enabled == "off"``;
-  2. an ordinary workspace does NOT get a ``tools`` key at all — it keeps the
-     upstream default and is untouched by this change.
-
-It executes the block extracted verbatim from ``start.sh`` rather than
-re-stating the YAML, so a future edit that drops or un-scopes the stanza fails
-here instead of silently shipping.
+This test asserts the contract by executing the real config.yaml seed block out
+of ``start.sh`` and parsing what it renders, for BOTH persona states, plus a
+source-level ratchet that the stanza is not re-gated. It executes the block
+extracted verbatim from ``start.sh`` rather than re-stating the YAML, so a
+future edit that drops or re-scopes the stanza fails here instead of silently
+shipping.
 """
 
 from __future__ import annotations
@@ -107,22 +127,48 @@ def test_concierge_gets_tool_search_off(tmp_path):
     )
 
 
-def test_ordinary_workspace_is_untouched(tmp_path):
-    """Scope guard: non-concierge workspaces keep the upstream default."""
-    cfg = _render(tmp_path, is_concierge=False)
-    assert _tool_search(cfg) is None, (
-        "ordinary workspaces must not be given a tools.tool_search override — "
-        f"got {cfg.get('tools')!r}"
+def test_workspace_without_the_concierge_persona_still_gets_tool_search_off(tmp_path):
+    """The regression: a box where /configs/prompts/concierge.md never arrived.
+
+    This is the observed staging-tenant-cd / e2e-smoke failure. A concierge whose
+    persona asset was not delivered used to render NO ``tools`` key, hermes
+    deferred its whole MCP surface, and the A2A provision_workspace turn died on
+    ``Model generated invalid tool call: mcp__molecule__get_workspace_info`` —
+    a real, registered id from the ``molecule`` sidecar. An ordinary worker is in
+    the same position (38 deferred tools measured live). Deferral must never be
+    reachable, whatever the asset channel did or did not deliver.
+    """
+    ts = _tool_search(_render(tmp_path, is_concierge=False))
+    assert isinstance(ts, dict), (
+        "a workspace WITHOUT /configs/prompts/concierge.md still renders no "
+        "tools.tool_search override — hermes will defer its MCP surface and "
+        "reject the very tool ids it advertises"
+    )
+    assert str(ts.get("enabled")).strip().lower() in ("off", "false", "0", "no"), (
+        f"tools.tool_search.enabled={ts.get('enabled')!r} does not disable deferral; "
+        "hermes falls back to 'auto' for unrecognised values"
     )
 
 
-def test_concierge_flag_is_derived_from_the_persona_graft():
-    """IS_CONCIERGE must key on the concierge persona, not a hand-set default."""
+def test_tool_search_off_is_not_gated_on_a_delivered_asset():
+    """Source ratchet: the stanza must not be re-scoped behind IS_CONCIERGE.
+
+    Re-introducing the persona-file gate is the exact mutation this test exists
+    to kill — it is how the fatal state was reachable in the first place.
+    """
     src = START_SH.read_text(encoding="utf-8")
-    assert "IS_CONCIERGE=0" in src, "IS_CONCIERGE must default to 0 (fail-closed)"
-    assert re.search(
-        r'\[ "\$persona" = "/configs/prompts/concierge\.md" \].*IS_CONCIERGE=1', src
-    ), "IS_CONCIERGE must be set from the /configs/prompts/concierge.md persona graft"
+    # Comments may (and do) explain the retired gate — only EXECUTABLE lines
+    # matter, so strip whole-line comments before looking.
+    code = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    offenders = [ln for ln in code if "IS_CONCIERGE" in ln]
+    assert not offenders, (
+        "start.sh still references IS_CONCIERGE in executable code — tool-search "
+        "deferral must not be gated on /configs/prompts/concierge.md (or any "
+        f"other delivered asset); the control plane does not guarantee it: {offenders}"
+    )
+    assert re.search(r"^\s*echo \"tools:\"", src, re.M), (
+        "the tools/tool_search stanza is missing from the config.yaml seed"
+    )
 
 
 @pytest.mark.parametrize("is_concierge", [True, False])
