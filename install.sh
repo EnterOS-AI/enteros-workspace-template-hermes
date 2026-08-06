@@ -301,6 +301,15 @@ if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERME
   echo "[install.sh] bridged OPENAI_API_KEY -> custom provider @ ${HERMES_CUSTOM_BASE_URL} (api_mode=chat_completions)"
 fi
 
+# --- MiniMax bridge (SSOT: scripts/derive-minimax-bridge.sh) ---
+# Sourced, not inlined, so install.sh and start.sh cannot drift.
+MINIMAX_BRIDGE_SCRIPT="$(dirname "$0")/scripts/derive-minimax-bridge.sh"
+[ -f "$MINIMAX_BRIDGE_SCRIPT" ] || MINIMAX_BRIDGE_SCRIPT="/app/scripts/derive-minimax-bridge.sh"
+if [ -f "$MINIMAX_BRIDGE_SCRIPT" ]; then
+  # shellcheck source=scripts/derive-minimax-bridge.sh
+  MOLECULE_BRIDGE_CALLER=install.sh . "$MINIMAX_BRIDGE_SCRIPT"
+fi
+
 # Defense-in-depth: when the resolved provider is platform (derive-platform-llm.sh
 # set MOLECULE_PLATFORM_LLM_ACTIVE=1), refuse a HERMES_CUSTOM_BASE_URL that isn't
 # the injected platform proxy base. Keyed on provider==platform, not a
