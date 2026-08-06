@@ -167,17 +167,10 @@ install -d -o agent -g agent "$HERMES_HOME"
 # daemon's _ensure_default_soul_md only seeds SOUL.md when ABSENT, so our
 # pre-start install wins; re-installing on every boot keeps a persona update
 # effective after restart.
-#
-# The persona that matched also identifies the workspace KIND: only a
-# platform-managed concierge is delivered prompts/concierge.md (plain
-# workspaces get system-prompt.md). IS_CONCIERGE is consumed by the
-# tool-search block in the config.yaml seed below.
-IS_CONCIERGE=0
 for persona in /configs/prompts/concierge.md /configs/system-prompt.md; do
   if [ -s "$persona" ]; then
     install -m 644 -o agent -g agent "$persona" "${HERMES_HOME}/SOUL.md"
     echo "[start.sh] grafted persona ${persona} -> ${HERMES_HOME}/SOUL.md"
-    [ "$persona" = "/configs/prompts/concierge.md" ] && IS_CONCIERGE=1
     break
   fi
 done
@@ -508,7 +501,7 @@ fi
   if [ -n "${HERMES_CUSTOM_API_MODE:-}" ]; then
     echo "  api_mode: \"${HERMES_CUSTOM_API_MODE}\""
   fi
-  # --- Tool search (progressive disclosure) — OFF for the concierge ---
+  # --- Tool search (progressive disclosure) — OFF for EVERY workspace ---
   # hermes' tiered disclosure (tools/tool_search.py) replaces every
   # MCP/plugin tool in the model-facing tools array with three bridge tools
   # (tool_search / tool_describe / tool_call) and defers the real schemas.
@@ -532,14 +525,31 @@ fi
   # orientation calls and provision_workspace is never reached — which is
   # what makes staging-tenant-cd / e2e-smoke nondeterministic.
   #
-  # Scoped to the concierge ONLY (IS_CONCIERGE, set by the persona graft
-  # above). Ordinary workspaces keep the upstream default: they carry a
-  # smaller self-mode surface and are left exactly as they are today.
-  if [ "${IS_CONCIERGE}" = "1" ]; then
-    echo "tools:"
-    echo "  tool_search:"
-    echo "    enabled: \"off\""
-  fi
+  # UNCONDITIONAL (2026-08-06). This block used to be gated on IS_CONCIERGE,
+  # derived from whether /configs/prompts/concierge.md had been delivered. That
+  # made a fatal runtime capability — whether the agent can call ANY MCP tool —
+  # depend on an asset the control plane does not guarantee: molecule-core
+  # 87de7be0c documents a live hermes concierge whose /configs/prompts/ did not
+  # exist while /configs/config.yaml still declared
+  # `prompt_files: [prompts/concierge.md]`. On such a box the gate read 0, this
+  # stanza was never written, and the concierge's entire 92-tool surface was
+  # deferred: its A2A provision_workspace turn answered
+  # "Model generated invalid tool call: mcp__molecule__get_workspace_info" —
+  # a REAL id out of the `molecule` sidecar's 32 registered tools — four turns
+  # running, and staging-tenant-cd / e2e-smoke went RED. Measured on two live
+  # containers on the SAME image differing only in that file: persona present →
+  # no `tool_search activated` line; persona absent → "tool_search activated
+  # (tier 1): 18 core/visible tools kept, 92 deferred".
+  #
+  # Ordinary workspaces are exposed to the identical hazard (a live worker logs
+  # "18 core/visible tools kept, 38 deferred" — its `molecule` sidecar tools are
+  # deferred while the runtime's system prompt still documents them), so the
+  # scope carve-out bought nothing and cost determinism. The price of always-on
+  # eager disclosure is ~4.9k prompt tokens on a worker and ~13k on a concierge,
+  # against the 204,800-token window the fleet model reports.
+  echo "tools:"
+  echo "  tool_search:"
+  echo "    enabled: \"off\""
   # --- Molecule A2A platform plugin ---
   # Loaded into hermes via the hermes_agent.plugins entry point baked
   # into the image (see Dockerfile). When enabled, hermes opens a
