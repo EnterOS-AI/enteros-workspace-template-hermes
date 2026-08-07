@@ -976,6 +976,8 @@ jobs:
       - if: github.event.pull_request.head.repo.fork != true
         run: bash scripts/test-mcp-configs-dir.sh
       - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-nonroot-boot.sh
+      - if: github.event.pull_request.head.repo.fork != true
         run: bash scripts/test-process-liveness.sh
       - if: github.event.pull_request.head.repo.fork != true
         run: bash scripts/test-mcp-reconcile-watch.sh
