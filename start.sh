@@ -26,6 +26,58 @@ if [ -f /configs/secrets.d/load.sh ]; then
   . /configs/secrets.d/load.sh
 fi
 
+# --- PRIVILEGE DROP, CONDITIONAL ON ACTUALLY HAVING PRIVILEGE -------------
+#
+# This image's contract is "start as root, chown the volumes, drop to agent",
+# and every launch below therefore went through a bare `gosu agent`. That is
+# correct on docker, where the provisioner runs the container as root with
+# CAP_SETUID/CAP_SETGID deliberately retained. It is FATAL on Kubernetes, and
+# it is fatal in a way that does not look like a permissions problem.
+#
+# MEASURED 2026-08-07 against the live k3s fleet. Every tenant namespace
+# enforces Pod Security Admission `restricted`, which REQUIRES runAsNonRoot
+# and FORBIDS adding SETUID/SETGID. The pod therefore starts as uid 1000 —
+# already the agent user — and gosu still needs CAP_SETGID for the
+# setgroups()/setgid() it performs before exec, so it dies with
+#
+#   error: failed switching to "agent": operation not permitted
+#
+# start.sh then prints "MCP server exited before /mcp came up" and the
+# container CrashLoopBackOffs. Reproduced on this exact image with a control,
+# so it is the CAPABILITY and not the identity:
+#
+#   docker run --user 1000:1000 --cap-drop ALL   ... gosu agent id
+#     -> error: failed switching to "agent": operation not permitted
+#   docker run --cap-add SETUID --cap-add SETGID ... gosu agent id
+#     -> uid=1000(agent) gid=1000(agent)
+#
+# So resolve the privilege-drop prefix ONCE, from whether we actually hold the
+# privilege, and use it everywhere instead of a bare `gosu agent`.
+#
+# WHY A PREFIX AND NOT THE SIBLINGS' `exec gosu agent "$0" "$@"` RE-EXEC.
+# claude-code and openclaw both wrap their whole root section in `id -u == 0`
+# and re-exec themselves. hermes cannot copy that shape without changing what
+# runs as root today: several launches below are documented as depending on
+# the ROOT parent shell opening their `>>` log redirect BEFORE gosu execs (see
+# the nohup notes further down), and docker is where every paying tenant runs.
+# A prefix keeps the root path byte-identical — as root ${AS_AGENT} expands to
+# exactly `gosu agent` — and changes only the path that is currently a crash.
+#
+# Non-root is not a weakening of the boundary: we ARE uid 1000 already, so
+# running the command directly lands in precisely the context gosu was being
+# asked to produce. The two chowns below stay guarded on `id -u` = 0 because
+# those genuinely need root, and are genuinely unnecessary when the volume
+# already arrives agent-owned (on k8s the pod's fsGroup does that).
+#
+# Deliberately resolved ABOVE the smoke-mode branch: that branch execs a gosu
+# of its own and would otherwise be the one boot path this fix does not cover.
+if [ "$(id -u)" = "0" ]; then
+  AS_AGENT="gosu agent"
+else
+  AS_AGENT=""
+  echo "[start.sh] uid $(id -u) is not root: the privilege drop is a no-op here, launching directly"
+fi
+
 # Boot-smoke contract (molecule-core#2275): the publish-image gate
 # invokes the runtime with stub creds and no network so it can
 # exercise lazy imports inside executor.execute(). The hermes
@@ -36,7 +88,8 @@ fi
 # production boots are unaffected.
 if [ "${MOLECULE_SMOKE_MODE:-0}" = "1" ]; then
   echo "[start.sh] MOLECULE_SMOKE_MODE=1 — skipping hermes gateway spawn"
-  exec gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
+  # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+  exec ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
 fi
 
 # --- Make /configs agent-owned (fleet contract) ---
@@ -742,7 +795,8 @@ mirror_log_to_stdout "$MCP_LOG"
 # the MCP server's token resolution deterministic and self-documenting:
 # it takes configs_dir.resolve()'s FIRST (explicit-override) branch and
 # can never silently fall back to /tmp/.molecule-workspace again.
-nohup gosu agent env HOME=/tmp CONFIGS_DIR=/configs \
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+nohup ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs \
     python3 -m molecule_runtime.a2a_mcp_server --transport http --port 9100 \
     >>"$MCP_LOG" 2>&1 &
 MCP_PID=$!
@@ -813,7 +867,8 @@ fi
 # hardened watcher then sees no genuine post-launch change and stays dormant.
 if command -v molecule-runtime-prepare >/dev/null 2>&1; then
   echo "[start.sh] pre-materializing MCP config (molecule-runtime-prepare) before gateway launch"
-  if timeout 150 gosu agent env HOME=/tmp CONFIGS_DIR=/configs MOLECULE_RUNTIME_PREPARE_ONLY=1 molecule-runtime-prepare >>"$LOG_FILE" 2>&1; then
+  # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+  if timeout 150 ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs MOLECULE_RUNTIME_PREPARE_ONLY=1 molecule-runtime-prepare >>"$LOG_FILE" 2>&1; then
     echo "[start.sh] config pre-materialized — gateway will discover all MCP servers on first boot (no reconcile restart)"
   else
     _prep_rc=$?
@@ -838,7 +893,8 @@ fi
 # ANSWER (the staging greeting e2e failure, 2026-07-20). Platform chat
 # wants strict turn ordering; the canvas Stop button cancels via the task
 # API, so no interrupt-by-chat capability is lost.
-nohup gosu agent env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+nohup ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     bash -c "cd /tmp && hermes gateway" \
     >>"$LOG_FILE" 2>&1 &
 GATEWAY_PID=$!
@@ -874,7 +930,7 @@ echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWA
 # (scripts/test-mcp-reconcile-watch.sh) and exercised per-PR. Full
 # rationale lives in that script's header. Backgrounded; survives the
 # exec of molecule-runtime below.
-MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LAUNCH_CMD="exec gosu agent env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash -c 'cd /tmp && hermes gateway'" MCPWATCH_HEALTH_URL="http://127.0.0.1:${API_SERVER_PORT:-8642}/health" MCPWATCH_LOG_FILE="$LOG_FILE" MCPWATCH_MARKER="/tmp/.hermes/.clean_shutdown"   bash /usr/local/bin/mcp-reconcile-watch.sh &
+MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LAUNCH_CMD="exec ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash -c 'cd /tmp && hermes gateway'" MCPWATCH_HEALTH_URL="http://127.0.0.1:${API_SERVER_PORT:-8642}/health" MCPWATCH_LOG_FILE="$LOG_FILE" MCPWATCH_MARKER="/tmp/.hermes/.clean_shutdown"   bash /usr/local/bin/mcp-reconcile-watch.sh &
 
 # --- Smoke: confirm hermes sees the molecule MCP server in `mcp list` ---
 # Belt-and-braces check: even if config.yaml has mcp_servers.molecule
@@ -884,7 +940,8 @@ MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LA
 # Soft-fail (log + continue): if the smoke step itself errors (busy CLI,
 # transient stdin issue), we don't want to refuse boot — but a config
 # without `molecule` in it IS a real failure, so we exit non-zero on that.
-MCP_LIST_OUT=$(gosu agent env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+MCP_LIST_OUT=$(${AS_AGENT} env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     timeout 10 hermes mcp list 2>&1 || true)
 if echo "$MCP_LIST_OUT" | grep -q "^[[:space:]]*molecule[[:space:]]"; then
   echo "[start.sh] hermes mcp list shows 'molecule' wired"
@@ -918,4 +975,5 @@ fi
 # installation before adapter setup. Runtime 0.4 rejects unsafe dot/path install
 # names and contains every resolved destination under /configs/plugins. Keep
 # plugin installation out of this privileged boot script.
-exec gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+exec ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime

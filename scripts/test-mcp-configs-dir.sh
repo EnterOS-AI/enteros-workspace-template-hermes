@@ -79,20 +79,29 @@ else
   bad "the /configs chown is not guarded by a root (id -u == 0) check"
 fi
 
+# NOTE ON THE `${AS_AGENT}` LITERAL BELOW. These patterns used to name
+#      `gosu agent` directly. start.sh no longer contains a bare `gosu agent`
+#      anywhere: the privilege drop is resolved once into AS_AGENT, because a
+#      bare gosu needs CAP_SETGID and every tenant Namespace on k8s enforces
+#      PSA `restricted`, which forbids it — the workspace pod CrashLoopBackOffs
+#      on "failed switching to agent: operation not permitted". Pinning the new
+#      literal keeps these assertions exactly as strict as they were; see
+#      scripts/test-nonroot-boot.sh for the guard on the prefix itself.
+#
 # 4. The a2a_mcp_server launch line must carry CONFIGS_DIR=/configs.
 #    We extract the launch line(s) and assert CONFIGS_DIR=/configs
 #    appears on the same `env ...` invocation. The pre-fix line was:
-#       nohup gosu agent env HOME=/tmp \
+#       nohup ${AS_AGENT} env HOME=/tmp \
 #           python3 -m molecule_runtime.a2a_mcp_server --transport http --port 9100
 #    which this check fails on (no CONFIGS_DIR).
-MCP_ENV_LINE="$(grep -nE 'gosu agent env .*HOME=/tmp' "${START_SH}" \
+MCP_ENV_LINE="$(grep -nE '\$\{AS_AGENT\} env .*HOME=/tmp' "${START_SH}" \
                 | grep -B0 -E 'CONFIGS_DIR=/configs' || true)"
 # grep above only keeps env lines that ALSO contain CONFIGS_DIR=/configs.
 # Additionally require that an a2a_mcp_server launch exists right after
 # such a line (within 2 lines) so we're asserting on the MCP server's
 # env, not some unrelated gosu invocation.
 if awk '
-    /gosu agent env .*HOME=\/tmp.*CONFIGS_DIR=\/configs/ { armed=NR }
+    /\$\{AS_AGENT\} env .*HOME=\/tmp.*CONFIGS_DIR=\/configs/ { armed=NR }
     armed && NR>armed && NR<=armed+2 && /a2a_mcp_server --transport http --port 9100/ { found=1 }
     END { exit(found?0:1) }
   ' "${START_SH}"; then
@@ -102,17 +111,17 @@ else
 fi
 
 # 5. Belt-and-braces: make sure we didn't accidentally leave a
-#    CONFIGS_DIR-less `gosu agent env HOME=/tmp` immediately followed by
+#    CONFIGS_DIR-less `${AS_AGENT} env HOME=/tmp` immediately followed by
 #    the a2a_mcp_server launch (the exact pre-fix shape). This is the
 #    direct "fails on old code" assertion.
 if awk '
-    /gosu agent env HOME=\/tmp[[:space:]]*\\$/ && $0 !~ /CONFIGS_DIR/ { armed=NR }
+    /\$\{AS_AGENT\} env HOME=\/tmp[[:space:]]*\\$/ && $0 !~ /CONFIGS_DIR/ { armed=NR }
     armed && NR==armed+1 && /a2a_mcp_server --transport http --port 9100/ { bad=1 }
     END { exit(bad?1:0) }
   ' "${START_SH}"; then
-  ok "no CONFIGS_DIR-less 'gosu agent env HOME=/tmp' immediately precedes the a2a_mcp_server launch (pre-fix shape is gone)"
+  ok "no CONFIGS_DIR-less '\${AS_AGENT} env HOME=/tmp' immediately precedes the a2a_mcp_server launch (pre-fix shape is gone)"
 else
-  bad "found the pre-fix shape: a CONFIGS_DIR-less 'gosu agent env HOME=/tmp \\' line directly before the a2a_mcp_server launch"
+  bad "found the pre-fix shape: a CONFIGS_DIR-less '\${AS_AGENT} env HOME=/tmp \\' line directly before the a2a_mcp_server launch"
 fi
 
 echo
