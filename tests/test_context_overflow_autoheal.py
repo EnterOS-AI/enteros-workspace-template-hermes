@@ -68,6 +68,43 @@ def test_classifier_rejects_non_overflow(text):
     assert ex._is_context_overflow(text) is False
 
 
+# Pinned LITERALLY, not read from the module under test: a parametrize over
+# ex._CONTEXT_OVERFLOW_PATTERNS deletes its own case when a pattern is
+# deleted, so the suite stays green through exactly the regression it is
+# meant to catch (verified — it did).
+_REQUIRED_PHRASES = [
+    "cannot compress further",
+    "context length exceeded",
+    "max compression attempts",
+    "request payload too large",
+]
+
+
+def test_no_required_phrase_was_dropped():
+    """The pattern tuple must still carry every phrase we rely on."""
+    missing = [p for p in _REQUIRED_PHRASES
+               if p not in ex._CONTEXT_OVERFLOW_PATTERNS]
+    assert not missing, f"overflow patterns dropped: {missing}"
+
+
+@pytest.mark.parametrize("pattern", _REQUIRED_PHRASES)
+def test_every_pattern_is_load_bearing(pattern):
+    """Each pattern must independently classify its own branch's wording.
+
+    The real hermes strings overlap — "Context length exceeded (N tokens).
+    Cannot compress further." matches two patterns at once — so asserting
+    only on whole strings lets a pattern be deleted with every test still
+    green (verified: removing "cannot compress further" broke nothing).
+    This pins each pattern individually, so dropping any one fails here.
+
+    Each phrase guards a DIFFERENT upstream branch in
+    agent/conversation_loop.py (the 413 pair, the compression-attempt
+    ceiling, the terminal minimum-tier branch); their wordings can change
+    independently, so the redundancy is deliberate and must be preserved.
+    """
+    assert ex._is_context_overflow(f"hermes turn failed: {pattern}") is True
+
+
 def test_patterns_are_multiword_phrases():
     """Guard the 'deliberately NARROW' property.
 
