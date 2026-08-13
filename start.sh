@@ -693,6 +693,28 @@ fi
   echo "tools:"
   echo "  tool_search:"
   echo "    enabled: \"off\""
+  # --- Unattended-session approvals (issue #370) ---
+  # hermes gates the destructive session commands (/new, /reset, /clear,
+  # /undo) behind an interactive confirm — `approvals.
+  # destructive_slash_confirm`, default TRUE. That default assumes a human
+  # is watching the chat. A scheduled workspace has nobody to press the
+  # button, so `/new` parks on a confirm prompt and the session is never
+  # reset.
+  #
+  # That is the difference between a recoverable workspace and a dead one.
+  # When a hermes session exceeds the context window and compaction gives
+  # up, EVERY later turn dies on the same oversized transcript; `/new` is
+  # the only thing that clears it. Leaving the confirm on means the one
+  # recovery path is unreachable without an operator typing /approve by
+  # hand — which is exactly how workspace 90139d37 stayed dead from
+  # 2026-08-04 to 08-12 (see #370, and the auto-heal in executor.py that
+  # sends /new on overflow).
+  #
+  # Scope: this only removes the CONFIRM step, not the command. The
+  # destructive commands were always reachable; they just required a
+  # second interactive turn that an unattended lane cannot produce.
+  echo "approvals:"
+  echo "  destructive_slash_confirm: false"
   # --- Molecule A2A platform plugin ---
   # Loaded into hermes via the hermes_agent.plugins entry point baked
   # into the image (see Dockerfile). When enabled, hermes opens a

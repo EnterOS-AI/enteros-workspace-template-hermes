@@ -30,6 +30,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo util-linux docker.io \
     && rm -rf /var/lib/apt/lists/*
 
+# --- GitHub CLI (issue #371) ---
+# `gh` is a RUNTIME DEPENDENCY of this image, not a convenience. The
+# seo-agent workspace class is built entirely on it: its SETUP.md runs
+# `gh auth refresh` / `gh auth token`, its agent-policies call `gh api`,
+# and the tenant's scheduled tick prompt is written around
+# `gh pr list` / `gh pr create` / `gh pr merge`. Without it the agent
+# cannot produce its primary output (shipping PRs to a Next.js site) —
+# confirmed live on workspace 90139d37, where `gh pr list` returned
+# "command not found" and an 11-minute tick left zero git side effects.
+#
+# It fails SILENTLY: the `command not found` is swallowed inside the
+# agent turn, so the workspace stays status=online / wedged=false /
+# error_rate=0 and the operator-visible symptom is the agent reporting
+# "queue empty" — which reads as no work available, not no tooling.
+#
+# Installed from the official cli.github.com apt repo (keyring + source
+# list), in its own layer so the base package layer above stays cached.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/* && \
+    gh --version
+
 # Non-root agent user — UNCHANGED. hermes-agent writes its state into
 # ~/.hermes so mounting /home/agent as a persistent volume keeps skills
 # + memory across workspace restarts. The agent runs as uid-1000; the

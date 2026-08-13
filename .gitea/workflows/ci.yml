@@ -1042,4 +1042,6 @@ jobs:
           tests/test_ci_runtime_image_pin.py
           tests/test_ci_molecule_ci_fetch.py
           tests/test_toolsearch_concierge_scope.py
+          tests/test_github_cli_present.py
+          tests/test_context_overflow_autoheal.py
           -v

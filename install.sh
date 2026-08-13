@@ -37,6 +37,24 @@ if ! command -v xz >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
     curl ca-certificates git xz-utils build-essential
 fi
 
+# --- GitHub CLI (issue #371) ---
+# Runtime dependency, not a convenience: the seo-agent workspace class
+# ships via `gh pr create` / `gh pr merge` and authenticates with
+# `gh auth token`. Kept in step with the Dockerfile so the bare-host
+# path and the image agree — a workspace that works in one and not the
+# other is the drift this guards against. Idempotent: skipped when gh
+# is already on PATH.
+if ! command -v gh >/dev/null 2>&1; then
+  echo "[install.sh] installing GitHub CLI (gh)..."
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | sudo tee /usr/share/keyrings/githubcli-archive-keyring.gpg >/dev/null
+  sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gh
+fi
+
 # --- Install hermes-agent (only if not already present) ---
 # Installer places `hermes` at ~/.local/bin/hermes (symlink to
 # ~/.hermes/hermes-agent/venv/bin/hermes). --skip-setup avoids the
