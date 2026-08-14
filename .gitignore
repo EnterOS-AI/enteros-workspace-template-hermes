@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Upstream hermes source pulled off a pod for reading (see PR #372 review).
+# Never commit it: it is unreferenced, drifts from the pinned wheel, and gives
+# anyone grepping for runtime code a second, dead hit.
+.fork_gateway_run.py
