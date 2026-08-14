@@ -173,6 +173,54 @@ _SESSIONS_DIR = os.path.join("/tmp/.hermes", "sessions")
 _TOOL_TRACE_MAX_STEPS = 40
 _TOOL_TRACE_INPUT_MAX = 200
 
+# --- Context-overflow auto-heal (issue #370) -------------------------------
+# When a hermes session grows past the model's context window and compaction
+# cannot shrink it further, the turn returns one of the strings below and the
+# session stays on disk. Every later turn resumes the same oversized
+# transcript and dies identically — the workspace is dead until someone
+# clears the session by hand.
+#
+# hermes DOES ship its own remedy: gateway/run.py `_handle_message_with_agent`
+# skips transcript persistence on a context-overflow failure and calls
+# `reset_session()` (upstream #9893/#10063/#35809). Measured on the live
+# molecule-a2a lane, that path does not fire: workspace 90139d37 logged 50
+# "Cannot compress further" turns between 2026-08-12 and 08-13 while its
+# state.db recorded only 2 sessions with end_reason='session_reset', BOTH of
+# them operator-typed /new. The session opened 12:33Z was still current at
+# 20:30Z with its token count climbing ~1.7k per failed tick. So the heal
+# below is OUR lane's, and it does not assume upstream's ever runs.
+#
+# The reset itself is delegated to hermes's own /new command rather than
+# reaching into its storage: /new evicts the cached agent, tears down tool
+# resources, interrupts in-flight delegations and rotates the session in one
+# supported operation. `state.db` — not the .jsonl snapshots this module
+# reads for tool traces — is the canonical transcript store, so deleting
+# files here would heal nothing.
+#
+# Patterns are deliberately NARROW: each is a multi-word phrase hermes emits
+# on a genuine overflow. A bare "token"/"exceeded" would also match rate-limit
+# and auth errors, and discarding a healthy session on a 429 would lose real
+# conversation history.
+_CONTEXT_OVERFLOW_PATTERNS = (
+    "cannot compress further",          # "…(182,430 tokens). Cannot compress further."
+    "context length exceeded",          # agent.conversation_loop terminal branch
+    "max compression attempts",         # compression-attempt ceiling branch
+    "request payload too large",        # the 413 sibling of the same dead end
+)
+
+
+def _is_context_overflow(text: str | None) -> bool:
+    """True when a hermes reply is the terminal context-overflow failure.
+
+    Matched case-insensitively against the reply text, which is all the
+    plugin callback delivers (`/a2a/reply` carries `content`, not the
+    gateway's structured `compression_exhausted` flag).
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(p in lowered for p in _CONTEXT_OVERFLOW_PATTERNS)
+
 
 def _session_jsonl_snapshot() -> dict[str, int]:
     """Byte-offset snapshot of every session .jsonl file, taken BEFORE a turn
@@ -437,12 +485,142 @@ class HermesAgentProxyExecutor(AgentExecutor):
         prompt: str,
         history: list[dict[str, Any]] | None = None,
     ) -> None:
-        message_id = uuid.uuid4().hex
         chat_id = self._derive_chat_id(context)
         peer_id, peer_name = self._derive_peer_identity(context)
         callback_url = (
             f"http://{self._callback_host}:{self._callback_port}{_DEFAULT_CALLBACK_PATH}"
         )
+
+        # Tool-trace capture (canvas chain parity with claude-code): snapshot
+        # the session files before dispatch; the post-reply delta holds the
+        # turn's assistant tool_calls.
+        session_snapshot = _session_jsonl_snapshot()
+
+        text = await self._dispatch_and_wait(
+            content=prompt,
+            chat_id=chat_id,
+            peer_id=peer_id,
+            peer_name=peer_name,
+            callback_url=callback_url,
+            history=history,
+            event_queue=event_queue,
+        )
+        if text is None:
+            return  # the failure message was already enqueued
+
+        # --- Context-overflow auto-heal (issue #370) ---
+        # The session is permanently too large to process; resuming it makes
+        # every future turn fail identically. Clear it via hermes's own /new
+        # and replay this turn ONCE on the fresh session.
+        #
+        # Bounded to a single attempt: a second overflow on an empty session
+        # means THIS prompt is itself oversized, which no reset can fix, so
+        # the overflow text is delivered rather than looping.
+        if _is_context_overflow(text):
+            logger.error(
+                "auto-heal: hermes context overflow on chat_id=%s — resetting "
+                "the session and retrying once. reply=%s",
+                chat_id,
+                text[:200],
+            )
+            if await self._reset_hermes_session(
+                chat_id=chat_id,
+                peer_id=peer_id,
+                peer_name=peer_name,
+                callback_url=callback_url,
+            ):
+                # Re-seed from the caller-supplied history: the fresh session
+                # has no transcript, so without this the retry starts amnesiac.
+                retry = await self._dispatch_and_wait(
+                    content=prompt,
+                    chat_id=chat_id,
+                    peer_id=peer_id,
+                    peer_name=peer_name,
+                    callback_url=callback_url,
+                    history=history,
+                    event_queue=event_queue,
+                )
+                if retry is None:
+                    return
+                if _is_context_overflow(retry):
+                    logger.error(
+                        "auto-heal: still overflowing on a FRESH session for "
+                        "chat_id=%s — the prompt itself exceeds the window",
+                        chat_id,
+                    )
+                text = retry
+
+        await event_queue.enqueue_event(
+            _reply_message_with_tool_trace(
+                text, _tool_trace_from_session_delta(session_snapshot)
+            )
+        )
+
+    async def _reset_hermes_session(
+        self,
+        *,
+        chat_id: str,
+        peer_id: str,
+        peer_name: str | None,
+        callback_url: str,
+    ) -> bool:
+        """Clear this chat's hermes session by sending the `/new` command.
+
+        `/new` is hermes's own supported reset: it evicts the cached agent,
+        tears down tool resources, interrupts in-flight delegations and
+        rotates the session id. It is gated behind an interactive confirm
+        unless `approvals.destructive_slash_confirm` is false — start.sh
+        writes that key for exactly this reason (an unattended workspace has
+        nobody to confirm). Returns True when the reset reply came back.
+        """
+        reply = await self._dispatch_and_wait(
+            content="/new",
+            chat_id=chat_id,
+            peer_id=peer_id,
+            peer_name=peer_name,
+            callback_url=callback_url,
+            history=None,
+            event_queue=None,
+        )
+        if reply is None:
+            logger.error("auto-heal: /new dispatch failed for chat_id=%s", chat_id)
+            return False
+        # A confirm prompt instead of a reset means the approvals gate is
+        # still on: the session was NOT cleared, so retrying would replay the
+        # same oversized transcript. Say so loudly rather than silently
+        # burning the retry.
+        if _is_context_overflow(reply):
+            logger.error(
+                "auto-heal: /new itself returned an overflow reply for "
+                "chat_id=%s — session not cleared",
+                chat_id,
+            )
+            return False
+        logger.info(
+            "auto-heal: hermes session reset for chat_id=%s (reply=%s)",
+            chat_id,
+            reply[:120],
+        )
+        return True
+
+    async def _dispatch_and_wait(
+        self,
+        *,
+        content: str,
+        chat_id: str,
+        peer_id: str,
+        peer_name: str | None,
+        callback_url: str,
+        history: list[dict[str, Any]] | None,
+        event_queue: EventQueue | None,
+    ) -> str | None:
+        """POST one message into the hermes plugin and await its reply.
+
+        Returns the reply text, or None when the turn failed. On failure a
+        user-facing message is enqueued when ``event_queue`` is provided;
+        internal dispatches (the `/new` reset) pass None and are silent.
+        """
+        message_id = uuid.uuid4().hex
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
@@ -468,7 +646,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
             "chat_id": chat_id,
             "peer_id": peer_id,
             "peer_name": peer_name,
-            "content": prompt,
+            "content": content,
             "message_id": message_id,
             "callback_url": callback_url,
         }
@@ -490,11 +668,6 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if self._shared_secret:
             headers[SECRET_HEADER] = self._shared_secret
 
-        # Tool-trace capture (canvas chain parity with claude-code): snapshot
-        # the session files before dispatch; the post-reply delta holds the
-        # turn's assistant tool_calls.
-        session_snapshot = _session_jsonl_snapshot()
-
         inbound_url = (
             f"http://{self._plugin_host}:{self._plugin_port}/a2a/inbound"
         )
@@ -505,36 +678,33 @@ class HermesAgentProxyExecutor(AgentExecutor):
         except httpx.HTTPError as exc:
             self._pending.pop(message_id, None)
             logger.exception("hermes plugin POST failed")
-            await event_queue.enqueue_event(
-                new_text_message(f"[hermes plugin POST error] {exc!s}")
-            )
-            return
+            if event_queue is not None:
+                await event_queue.enqueue_event(
+                    new_text_message(f"[hermes plugin POST error] {exc!s}")
+                )
+            return None
 
         try:
-            text = await asyncio.wait_for(future, timeout=_PLUGIN_REPLY_TIMEOUT)
+            return await asyncio.wait_for(future, timeout=_PLUGIN_REPLY_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error(
                 "hermes plugin: reply timeout for message_id=%s", message_id
             )
-            await event_queue.enqueue_event(
-                new_text_message(
-                    f"[hermes plugin reply timeout after {_PLUGIN_REPLY_TIMEOUT:.0f}s]"
+            if event_queue is not None:
+                await event_queue.enqueue_event(
+                    new_text_message(
+                        f"[hermes plugin reply timeout after {_PLUGIN_REPLY_TIMEOUT:.0f}s]"
+                    )
                 )
-            )
-            return
+            return None
         except Exception as exc:
-            await event_queue.enqueue_event(
-                new_text_message(f"[hermes plugin error] {exc!s}")
-            )
-            return
+            if event_queue is not None:
+                await event_queue.enqueue_event(
+                    new_text_message(f"[hermes plugin error] {exc!s}")
+                )
+            return None
         finally:
             self._pending.pop(message_id, None)
-
-        await event_queue.enqueue_event(
-            _reply_message_with_tool_trace(
-                text, _tool_trace_from_session_delta(session_snapshot)
-            )
-        )
 
     async def _handle_reply(self, request: "web.Request") -> "web.Response":
         if self._shared_secret:
