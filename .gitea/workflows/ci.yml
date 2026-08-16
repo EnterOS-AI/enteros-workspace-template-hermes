@@ -1044,4 +1044,5 @@ jobs:
           tests/test_toolsearch_concierge_scope.py
           tests/test_github_cli_present.py
           tests/test_context_overflow_autoheal.py
+          tests/test_cron_approval_mode.py
           -v
