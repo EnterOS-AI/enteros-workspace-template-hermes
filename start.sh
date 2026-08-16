@@ -715,6 +715,48 @@ fi
   # second interactive turn that an unattended lane cannot produce.
   echo "approvals:"
   echo "  destructive_slash_confirm: false"
+  # --- Scheduled-turn code execution (molecule-core#5194) ---
+  # Same unattended-lane problem as #370 above, one policy key over. On a
+  # cron-delivered turn hermes does NOT raise an approval and wait — it hard
+  # DENIES. `tools/approval.py` (0.19.0, lines 2501-2511 and the two call
+  # sites at 2712 / 3239):
+  #
+  #     mode = str(cfg_get(config, "approvals", "cron_mode", default="deny"))...
+  #     if mode in {"approve", "off", "allow", "yes"}: return "approve"
+  #     return "deny"
+  #
+  # We have never written `cron_mode`, so the built-in `deny` applied to every
+  # scheduled workspace the fleet has ever run. The agent is told "the user has
+  # NOT consented... Do NOT retry" and the turn ends having executed nothing.
+  # An agent whose entire job is scheduled work can think and cannot act.
+  #
+  # It is worse than a no-op: the blocked turn never completes, so the runtime
+  # lease goes idle and the watchdog cancels + re-queues every ~30s forever
+  # ("lease went idle — no tool activity for 1563.3s (TTL 900.0s)"), at WARNING,
+  # inside the container. Nothing surfaces. Deployment stays 1/1, plugins
+  # installed, schedules armed — indistinguishable from an agent with nothing
+  # to do. Measured on prod tenant `minori`, ws c7937b21, 2026-08-16.
+  #
+  # THE DEFAULT IS UNCHANGED. Absent the env var this writes `deny`, which is
+  # exactly what the built-in already does. What changes is that the policy
+  # becomes EXPRESSIBLE: an operator running a genuinely unattended scheduled
+  # agent sets HERMES_CRON_APPROVAL_MODE=allow on that workspace. Letting cron
+  # turns run code with no human in the loop is a real security decision, so it
+  # stays opt-in and per-workspace rather than becoming a fleet-wide default.
+  #
+  # Unrecognised values fail CLOSED to deny (the `mode in {...}` test above), so
+  # a typo yields a silently inert agent rather than an unintended grant. Warn
+  # loudly here, because that failure is otherwise invisible for a week.
+  _CRON_MODE="${HERMES_CRON_APPROVAL_MODE:-deny}"
+  case "$(printf '%s' "$_CRON_MODE" | tr '[:upper:]' '[:lower:]')" in
+    approve|off|allow|yes|deny) : ;;
+    *)
+      echo "[start.sh] WARNING: HERMES_CRON_APPROVAL_MODE='${_CRON_MODE}' is not one" >&2
+      echo "[start.sh]   of approve|off|allow|yes|deny. hermes fails closed to DENY," >&2
+      echo "[start.sh]   so scheduled turns will silently execute nothing." >&2
+      ;;
+  esac
+  echo "  cron_mode: \"${_CRON_MODE}\""
   # --- Molecule A2A platform plugin ---
   # Loaded into hermes via the hermes_agent.plugins entry point baked
   # into the image (see Dockerfile). When enabled, hermes opens a
