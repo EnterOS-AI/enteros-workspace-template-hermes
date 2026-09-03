@@ -151,10 +151,70 @@ RUN chmod +x /usr/local/bin/molecule-askpass
 #   --skip-setup → no interactive wizard (curl|bash is non-tty anyway
 #                  but the installer treats this as "run anyway" by
 #                  default; passing it explicitly avoids surprises).
+#   --commit SHA → upstream's own first-class checkout pin (install.sh
+#                  `--commit`, validated as a hex SHA then `git checkout
+#                  --detach`). See HERMES_COMMIT below for WHY this is the
+#                  pin that matters.
+#   --force-commit → defensive, and worth understanding. install.sh SUPPRESSES
+#                  a `--commit` that would move an EXISTING install backwards
+#                  (so a stale desktop bootstrap binary cannot rewind a
+#                  current checkout): if the pin is an ancestor of HEAD it
+#                  logs "Ignoring --commit ...: the checkout is already
+#                  newer" and EXITS 0. Our pin IS an ancestor of main, so
+#                  that is the branch to worry about — an ignored pin looks
+#                  exactly like a successful one from the outside.
+#                  Observed on a clean build of this Dockerfile: the
+#                  installer takes the plain "Pinning checkout to commit ..."
+#                  path and reports "HEAD is now at 29112bef0 chore: release
+#                  v0.21.0", i.e. the suppressing branch is not reached and
+#                  --force-commit changes nothing there. It is passed anyway
+#                  because that outcome depends on clone shape and on whether
+#                  a checkout already exists, neither of which this Dockerfile
+#                  should have to reason about. The `rev-parse` assertion
+#                  below is what actually makes the pin trustworthy: it fails
+#                  the build if the checkout is not at HERMES_COMMIT, whatever
+#                  path the installer took to get there.
+#
+# THE PIN THAT ACTUALLY DECIDES WHAT RUNS (2026-09-03)
+# ----------------------------------------------------
+# ~/.local/bin/hermes is NOT the venv console script. It is a wrapper that
+# clears PYTHONPATH/PYTHONHOME and execs
+#   $HERMES_ROOT/venv/bin/python $HERMES_ROOT/hermes "$@"
+# Running a script at $HERMES_ROOT puts $HERMES_ROOT at sys.path[0], AHEAD of
+# site-packages. So the gateway imports the git CHECKOUT, not the wheel.
+# Confirmed live on enteros-minori / enteros-ws-c7937b219232: /proc/138/cmdline
+# is exactly that argv pair. scripts/neutralize-vendor-branding.py documents
+# the same finding from the other end (it must patch the checkout to have any
+# effect at all).
+#
+# This layer used to curl install.sh from `main` and let the installer clone
+# `main` unpinned, then force-reinstall a PyPI wheel over site-packages. The
+# wheel pin was therefore INERT for the running agent, and the effective agent
+# was "whatever upstream main happened to be on the day the image was built" —
+# two builds of this identical Dockerfile produced two different agents. The
+# image live on 2026-09-03 carries checkout 56526bc0 (upstream 0.20.1,
+# 2026-08-16) while the wheel pin claimed 0.19.0.
+#
+# Both the installer script and the checkout are now fetched at HERMES_COMMIT,
+# so the build is reproducible. A git commit SHA is itself the content hash of
+# the tree, so pinning by SHA authenticates install.sh without a second digest.
+ARG HERMES_COMMIT=29112bef099274229cadff79cdff7bf7b99c4b77
 USER agent
 WORKDIR /home/agent
-RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
-      | bash -s -- --skip-setup
+RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" \
+      | bash -s -- --skip-setup --commit "${HERMES_COMMIT}" --force-commit
+# Never trust a curl|bash to have honoured a flag: the installer treats an
+# ignored --commit as a WARNING and still exits 0. Assert the checkout is
+# actually at the pin, and fail the build if it is not. This is the whole
+# reproducibility guarantee, so it is checked, not assumed.
+RUN set -eu; \
+    actual="$(git -C /home/agent/.hermes/hermes-agent rev-parse HEAD)"; \
+    if [ "$actual" != "${HERMES_COMMIT}" ]; then \
+      echo "FATAL: hermes checkout is at $actual, expected ${HERMES_COMMIT}." >&2; \
+      echo "       install.sh ignored --commit; the image would ship unpinned upstream main." >&2; \
+      exit 1; \
+    fi; \
+    echo "hermes checkout pinned at $actual"
 # hermes installer symlinks ~/.hermes/hermes-agent/venv/bin/hermes into
 # ~/.local/bin/hermes, so ~/.local/bin is the only PATH entry we need.
 ENV PATH="/home/agent/.local/bin:${PATH}"
@@ -163,29 +223,34 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # Two refs are installed into the same venv that the upstream installer
 # created above:
 #
-#   1. Stock UPSTREAM hermes-agent, version-pinned from PyPI. FORK RETIRED
-#      (2026-07-22): the molecule-ai/hermes-agent fork existed only to carry
-#      the `register_platform_adapter` socket from the era before upstream
-#      had one. Upstream shipped a superior socket in #17751 (merged
-#      2026-04-30: `ctx.register_platform(...)` + open Platform enum +
+#   1. hermes-agent itself is NOT installed here any more. The upstream
+#      installer above already did `uv pip install -e .[all]` from the
+#      checkout it pinned to HERMES_COMMIT, and the checkout is what the
+#      gateway imports (see the sys.path[0] note above). The old
+#      `--force-reinstall hermes-agent==${HERMES_VERSION}` line pinned the
+#      one copy nothing imports; keeping it would reintroduce exactly the
+#      wheel-vs-checkout skew this change removes. FORK RETIRED (2026-07-22):
+#      the molecule-ai/hermes-agent fork existed only to carry the
+#      `register_platform_adapter` socket from the era before upstream had
+#      one. Upstream shipped a superior socket in #17751 (merged 2026-04-30:
+#      `ctx.register_platform(...)` + open Platform enum +
 #      gateway/platform_registry.py), our PR #18775 was closed as superseded
-#      (2026-05-03), and the A2A plugin has been dual-mode since May — it
-#      PREFERS the upstream API and only fell back to the fork's. The fork
-#      then rotted (0.10-era base, unmergeable vs upstream main by July)
-#      while stock hermes moved on. Pin the official wheel instead; the
-#      daily upstream-sync workflow watches PyPI and opens bump PRs here.
-#      Force-reinstall over whatever the installer grabbed so the pin — not
-#      the installer's floating resolution — decides the effective version.
+#      (2026-05-03), and the A2A plugin has been dual-mode since May.
 #   2. The Molecule A2A platform plugin, auto-discovered via hermes's
 #      `hermes_agent.plugins` entry-point group (registers through
 #      ctx.register_platform, #17751).
-ARG HERMES_VERSION=0.19.0
+#
+# HERMES_PYPI_FLOOR is the lowest PyPI release that would carry everything
+# HERMES_COMMIT carries. PyPI's newest hermes-agent is still 0.19.0
+# (2026-07-20) — the fixes we need exist only as git refs — so the pin above
+# is an UNRELEASED third-party ref, taken with owner authorisation. The
+# upstream-sync workflow compares PyPI's latest against this floor and files
+# the "you can go back to a published release now" PR when one appears.
+ARG HERMES_PYPI_FLOOR=0.21.0
 ARG HERMES_PLATFORM_MOLECULE_A2A_REF=93d43d772470eb3ddc781858dc5629f3464eed99
 # The hermes installer uses uv to create the venv and doesn't seed pip
-# into it. Bootstrap pip first via ensurepip, then install both wheels.
+# into it. Bootstrap pip first via ensurepip, then install the plugin.
 RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && \
-    /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir --force-reinstall \
-      "hermes-agent==${HERMES_VERSION}" && \
     /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir \
       "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
 

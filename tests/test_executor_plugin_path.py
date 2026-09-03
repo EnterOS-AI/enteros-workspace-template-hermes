@@ -83,6 +83,22 @@ def _build_context(text: str, *, task_id: str = "task-1"):
     ctx.context_id = None
     msg = MagicMock()
     msg.task_id = task_id
+    # A bare MagicMock auto-creates ANY attribute, `.message` included, and
+    # molecule_runtime's canonical extract_message_text now accepts three
+    # input shapes — probing `.message` FIRST to detect a RequestContext. So a
+    # MagicMock message reads as a context wrapping a phantom message whose
+    # `.parts` is itself a MagicMock; that is not iterable, parts falls back to
+    # [], and the text comes back EMPTY. execute() then short-circuits on
+    # "Your message was empty" and never dispatches — which is why the
+    # wire-level tests in this file stopped exercising the transport at all
+    # while still looking like tests. Pinning `.message = None` puts the
+    # object back on the bare-Message branch (parts read directly off it).
+    #
+    # Several tests below build their own MagicMock context inline instead of
+    # using this helper and are still rotted the same way; they are left as
+    # found. Note this whole FILE is absent from the pytest list in
+    # .gitea/workflows/ci.yml, which is how the rot went unnoticed.
+    msg.message = None
     # Stand up a `parts` list of `TextPart`-shaped objects so
     # extract_message_text(msg) returns our prompt.
     text_part = MagicMock()
@@ -1194,6 +1210,10 @@ def _build_context_with_history(text: str, history, *, task_id: str = "task-1"):
     ctx.session_id = None
     ctx.context_id = None
     msg = MagicMock()
+    # See _build_context: a bare MagicMock's auto-created `.message`
+    # makes the canonical extract_message_text read this as a
+    # RequestContext and yield empty text.
+    msg.message = None
     msg.task_id = task_id
     text_part = MagicMock()
     text_part.text = text
@@ -1610,6 +1630,10 @@ async def test_plugin_path_payload_chat_id_uses_context_id_not_task_id(monkeypat
     ctx.task_id = "task-changes-per-turn"
     ctx.session_id = None
     msg = MagicMock()
+    # See _build_context: a bare MagicMock's auto-created `.message`
+    # makes the canonical extract_message_text read this as a
+    # RequestContext and yield empty text.
+    msg.message = None
     msg.context_id = "chat-stable-cross-turn"
     msg.task_id = "task-changes-per-turn"
     text_part = MagicMock()
@@ -1829,6 +1853,10 @@ async def test_plugin_path_peer_identity_from_metadata(monkeypatch):
     ctx.session_id = None
     ctx.task_id = "task-peer-1"
     msg = MagicMock()
+    # See _build_context: a bare MagicMock's auto-created `.message`
+    # makes the canonical extract_message_text read this as a
+    # RequestContext and yield empty text.
+    msg.message = None
     msg.task_id = "task-peer-1"
     text_part = MagicMock()
     text_part.text = "hello from peer"
@@ -2149,3 +2177,138 @@ async def test_done_future_race_treats_new_content_as_orphan(monkeypatch):
     finally:
         await ex.stop()
         await runner.cleanup()
+
+
+# ---- scheduled-delivery provenance (source_type) ---------------------
+#
+# The scheduler plugin stamps metadata.source_type="self-scheduler" on every
+# trigger turn so the receiving agent can tell an autonomous self-ping from a
+# human message. _dispatch_and_wait enumerates the forwarded payload fields by
+# hand and never listed source_type, so the marker died at this boundary and a
+# scheduled delivery reached hermes looking exactly like a person typing —
+# one half of the ~305s scheduled-run approval hang.
+
+
+def _build_context_with_metadata(text: str, metadata, *, task_id: str = "task-1"):
+    """_build_context, but with a real ``metadata`` on the message.
+
+    The default helper leaves ``msg.metadata`` a MagicMock, which is
+    deliberately NOT a dict — that is what keeps every pre-existing test on
+    the interactive path.
+    """
+    ctx = _build_context(text, task_id=task_id)
+    ctx.message.metadata = metadata
+    return ctx
+
+
+def test_scheduled_marker_is_extracted(monkeypatch):
+    ex = _make_executor(monkeypatch)
+    ctx = _build_context_with_metadata("run the report", {"source_type": "self-scheduler"})
+    assert ex._derive_source_type(ctx) == "self-scheduler"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"source_type": ""},
+        {"source_type": None},
+        {"source_type": 123},
+        {"source_type": ["self-scheduler"]},
+        {"peer_id": "ws-1"},
+        "not-a-dict",
+        None,
+    ],
+)
+def test_absent_or_malformed_marker_is_interactive(monkeypatch, metadata):
+    """Anything that is not a recognised marker takes the human path."""
+    ex = _make_executor(monkeypatch)
+    ctx = _build_context_with_metadata("hi", metadata)
+    assert ex._derive_source_type(ctx) == ""
+
+
+def test_unknown_source_type_is_not_forwarded(monkeypatch):
+    """The allow-list is the security boundary, not decoration.
+
+    ``metadata`` on the A2A path is peer-supplied. If this were a passthrough,
+    a peer workspace could stamp its own message as unattended and — once the
+    receiving end honours the marker — skip the human approval a peer message
+    is supposed to require. An unrecognised value must be indistinguishable
+    from no value.
+    """
+    ex = _make_executor(monkeypatch)
+    for hostile in ("cron", "webhook", "api_server", "self-scheduler-x", "SELF-SCHEDULER"):
+        ctx = _build_context_with_metadata("hi", {"source_type": hostile})
+        assert ex._derive_source_type(ctx) == "", hostile
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [
+        ({"source_type": "self-scheduler"}, "self-scheduler"),
+        ({"source_type": "totally-made-up"}, None),
+        ({}, None),
+    ],
+)
+async def test_source_type_on_the_wire(monkeypatch, metadata, expected):
+    """End-to-end: what actually lands in the POST body to /a2a/inbound.
+
+    ``expected=None`` means the key must be ABSENT, not present-and-empty: an
+    interactive payload has to stay byte-identical to what it was before this
+    field existed, so a human message keeps prompting a human.
+    """
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    inbound_received: List[Dict[str, Any]] = []
+
+    async def fake_inbound(request: web.Request) -> web.Response:
+        body = await request.json()
+        inbound_received.append(body)
+
+        async def _delayed_reply():
+            await asyncio.sleep(0.05)
+            async with ClientSession(timeout=ClientTimeout(total=2)) as s:
+                await s.post(
+                    body["callback_url"],
+                    json={
+                        "chat_id": body["chat_id"],
+                        "content": "ack",
+                        "reply_to": body["message_id"],
+                        "metadata": {},
+                    },
+                )
+
+        asyncio.create_task(_delayed_reply())
+        return web.json_response({"ok": True, "queued": True})
+
+    plugin_app = web.Application()
+    plugin_app.router.add_post("/a2a/inbound", fake_inbound)
+    plugin_runner = web.AppRunner(plugin_app)
+    await plugin_runner.setup()
+    plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
+    await plugin_site.start()
+
+    ex = _make_executor(
+        monkeypatch,
+        MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
+        MOLECULE_A2A_CALLBACK_PORT=str(cb_port),
+    )
+    queue = _CapturingQueue()
+    try:
+        await ex.start()
+        await ex.execute(_build_context_with_metadata("do the thing", metadata), queue)
+    finally:
+        await ex.stop()
+        await plugin_site.stop()
+        await plugin_runner.cleanup()
+
+    assert len(inbound_received) == 1
+    body = inbound_received[0]
+    if expected is None:
+        assert "source_type" not in body, (
+            "an interactive delivery grew a source_type key; the interactive "
+            f"payload must stay unchanged. body={body!r}"
+        )
+    else:
+        assert body["source_type"] == expected

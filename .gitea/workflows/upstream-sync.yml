@@ -3,12 +3,28 @@ name: upstream-sync
 # Daily hermes freshness bot (2026-07-22, principal directive: "keep at least
 # once a day sync so everything is up to date").
 #
-# SIMPLIFIED after the fork retirement (same day): the effective hermes is now
-# the stock upstream wheel pinned as HERMES_VERSION in the Dockerfile, so
-# "sync" is just: check PyPI for a newer hermes-agent release and open a bump
-# PR. The old fork-merge + conflict-flag machinery (molecule-ai/hermes-agent,
-# feat/platform-adapter-plugins) is gone with the fork — upstream #17751
-# provides the plugin socket and the A2A plugin registers through it.
+# SIMPLIFIED after the fork retirement (same day): the effective hermes is the
+# stock upstream code, so "sync" is just: watch PyPI and tell us when to move.
+#
+# REPURPOSED 2026-09-03 — this bot used to rewrite `ARG HERMES_VERSION` in the
+# Dockerfile to PyPI's latest. That ARG is gone. The image now pins an
+# immutable upstream git commit (`ARG HERMES_COMMIT`), because the fixes the
+# fleet needs exist only as git refs: PyPI's newest hermes-agent is still
+# 0.19.0 (2026-07-20). Shipping an unreleased third-party ref is a deliberate,
+# owner-authorised exception, and this job is the tripwire that ends it.
+#
+# So the comparison is now PyPI-latest vs `ARG HERMES_PYPI_FLOOR` — the lowest
+# PUBLISHED release that would carry everything HERMES_COMMIT carries. While
+# PyPI is below the floor there is nothing to do and the job says so. Once PyPI
+# reaches the floor, the bot opens a PR that does NOT pretend to be a
+# mechanical bump: returning to a published release means deleting the
+# `--commit/--force-commit` pin, restoring a wheel install, and re-verifying
+# the vendor-branding neutralizer against the new source. That is a human/agent
+# decision, so the PR is a checklist against an unchanged tree, not a rewrite.
+#
+# Deliberately NOT auto-bumping HERMES_COMMIT to newer git refs: `main` moves
+# ~300 commits a week, and every bump is unreviewed third-party code entering
+# a customer image. The pin moves when someone decides it should.
 #
 # NOT a scheduled CI gate: molecule-core's zero-cron ratchet forbids
 # timer-driven TEST runs; this job runs no tests and gates nothing — bump PRs
@@ -42,7 +58,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Check PyPI for a newer hermes-agent and open a bump PR
+    name: Check whether PyPI has caught up to the pinned upstream ref
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -78,7 +94,7 @@ jobs:
           echo "::add-mask::$BOT"
           echo "BOT_TOKEN=$BOT" >> "$GITHUB_ENV"
 
-      - name: Compare PyPI latest against the Dockerfile pin; open bump PR
+      - name: Compare PyPI latest against HERMES_PYPI_FLOOR; open return-to-release PR
         env:
           BOT_TOKEN: ${{ env.BOT_TOKEN }}
           API: ${{ env.GITHUB_SERVER_URL }}/api/v1
@@ -87,29 +103,50 @@ jobs:
           set -euo pipefail
           LATEST=$(curl -fsS --max-time 30 https://pypi.org/pypi/hermes-agent/json \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["info"]["version"])')
-          CURRENT=$(sed -n 's/^ARG HERMES_VERSION=//p' Dockerfile | head -1)
-          echo "pypi latest=$LATEST pinned=$CURRENT"
-          if [ -z "$LATEST" ] || [ -z "$CURRENT" ]; then
-            echo "::error::could not resolve versions (latest='$LATEST' pinned='$CURRENT')"; exit 1
+          FLOOR=$(sed -n 's/^ARG HERMES_PYPI_FLOOR=//p' Dockerfile | head -1)
+          COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
+          echo "pypi latest=$LATEST floor=$FLOOR pinned-commit=$COMMIT"
+          if [ -z "$LATEST" ] || [ -z "$FLOOR" ] || [ -z "$COMMIT" ]; then
+            echo "::error::could not resolve (latest='$LATEST' floor='$FLOOR' commit='$COMMIT')"; exit 1
           fi
-          if [ "$LATEST" = "$CURRENT" ]; then
-            echo "pin is current — nothing to do"; exit 0
-          fi
-          if [ -z "${BOT_TOKEN:-}" ]; then
-            echo "::warning::report-only (no BOT_TOKEN): hermes-agent $CURRENT -> $LATEST bump needed."
+          # Compare as versions, not strings: "0.9.0" > "0.10.0" lexically.
+          # packaging is not guaranteed present on the runner, so use the tuple
+          # of leading integer components — enough for hermes' N.N.N scheme.
+          if ! python3 -c '
+          import sys
+          def key(v):
+              out = []
+              for part in v.split("."):
+                  num = ""
+                  for ch in part:
+                      if not ch.isdigit():
+                          break
+                      num += ch
+                  out.append(int(num) if num else 0)
+              return tuple(out)
+          sys.exit(0 if key(sys.argv[1]) >= key(sys.argv[2]) else 1)
+          ' "$LATEST" "$FLOOR"; then
+            echo "PyPI latest $LATEST is still below the floor $FLOOR — the image"
+            echo "stays on the pinned upstream git commit $COMMIT. Nothing to do."
             exit 0
           fi
-          python3 - "$LATEST" "$CURRENT" <<'PYEOF'
-          import base64, json, os, sys, urllib.request
+          echo "::notice::PyPI has caught up: hermes-agent $LATEST >= floor $FLOOR."
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "::warning::report-only (no BOT_TOKEN): hermes-agent $LATEST published;"
+            echo "::warning::the image can return to a tagged release (pinned commit $COMMIT)."
+            exit 0
+          fi
+          python3 - "$LATEST" "$FLOOR" "$COMMIT" <<'PYEOF'
+          import json, os, sys, urllib.request
 
-          latest, current = sys.argv[1], sys.argv[2]
+          latest, floor, commit = sys.argv[1], sys.argv[2], sys.argv[3]
           api = os.environ["API"]; repo = os.environ["REPO"]
           tok = os.environ["BOT_TOKEN"]
-          branch = f"sync/hermes-{latest}"
+          title = f"hermes-agent {latest} is on PyPI — return the pin to a tagged release"
 
-          def req(method, path, body=None):
+          def req(method, p, body=None):
               r = urllib.request.Request(
-                  f"{api}{path}", method=method,
+                  f"{api}{p}", method=method,
                   data=json.dumps(body).encode() if body is not None else None,
                   headers={"Authorization": f"token {tok}",
                            "Content-Type": "application/json",
@@ -123,52 +160,55 @@ jobs:
               except urllib.error.HTTPError as e:
                   return e.code, {}
 
-          st, _ = req("GET", f"/repos/{repo}/branches/{branch}")
-          if st == 200:
-              print(f"branch {branch} already exists — skipping"); sys.exit(0)
-          # Stale-PR handling (review wf_7cb5003d #10): an open bump PR for
-          # the SAME version means a previous tick already surfaced this
-          # bump — skip. An open bump PR for an OLDER version must NOT
-          # block newer releases forever (a red/unreviewed 0.19.1 PR would
-          # otherwise stall a 0.19.2 security fix indefinitely): close it
-          # with a comment and fall through to open the fresh one.
-          st, prs = req("GET", f"/repos/{repo}/pulls?state=open")
-          for p in (prs if isinstance(prs, list) else []):
-              ref = p.get("head", {}).get("ref", "")
-              if not ref.startswith("sync/hermes-"):
-                  continue
-              if ref == branch:
-                  print("bump PR for this version already open — skipping"); sys.exit(0)
-              num = p.get("number")
-              req("POST", f"/repos/{repo}/issues/{num}/comments", {
-                  "body": f"Superseded by a newer upstream release ({latest}); closing so the daily sync can surface it.",
-              })
-              st, _ = req("PATCH", f"/repos/{repo}/pulls/{num}", {"state": "closed"})
-              print(f"closed stale bump PR #{num} ({ref}) -> {st}")
-              req("DELETE", f"/repos/{repo}/branches/{ref}")
+          # Idempotent: one open issue per published version. This is a
+          # NOTIFICATION, not a mechanical bump. Returning to a release is a
+          # multi-file change with a re-verification step, so the bot files the
+          # checklist and a human/agent does the work. Opening a PR would mean
+          # pushing a dummy commit just to have a branch, and would imply the
+          # change is mechanical when it is not.
+          st, issues = req("GET", f"/repos/{repo}/issues?state=open&type=issues")
+          for i in (issues if isinstance(issues, list) else []):
+              if i.get("title") == title:
+                  print(f"issue #{i.get('number')} already open — skipping")
+                  sys.exit(0)
 
-          st, meta = req("GET", f"/repos/{repo}/contents/Dockerfile?ref=main")
-          assert st == 200, f"contents GET {st}"
-          text = base64.b64decode(meta["content"]).decode()
-          needle = f"ARG HERMES_VERSION={current}"
-          assert text.count(needle) == 1, "pin line not found exactly once"
-          text = text.replace(needle, f"ARG HERMES_VERSION={latest}")
+          body = "\n".join([
+              f"PyPI now publishes hermes-agent **{latest}**, at or above",
+              f"`ARG HERMES_PYPI_FLOOR={floor}` in the Dockerfile.",
+              "",
+              "The image currently pins the unreleased upstream git commit",
+              f"`{commit}`. See the Dockerfile comment for why: the",
+              "context-compaction and unattended-approval fixes the fleet needs",
+              "were git-only when the pin was taken. A published release at or",
+              "above the floor means that exception can end.",
+              "",
+              "This is NOT a one-line bump. To return to a tagged release:",
+              "",
+              f"1. Confirm {latest} actually contains the mechanisms the pin was",
+              "   taken for — grep the published sdist for `_MAX_KEEP_TOOL_IMAGES`,",
+              "   `_anti_thrash_recovery_deadline`, `_PRESSURE_KEEP_RECENT_MESSAGES`,",
+              "   `proactive_prune`, and `approvals.unattended_mode`. Do not infer",
+              "   presence from the version number.",
+              "2. Decide how the wheel becomes the code the gateway RUNS.",
+              "   `~/.local/bin/hermes` execs `$HERMES_ROOT/hermes`, which puts the",
+              "   CHECKOUT at `sys.path[0]` ahead of site-packages — so installing a",
+              "   wheel is not by itself enough. Either keep installing from the",
+              "   checkout (pinned to the release tag's commit) or change the",
+              "   launcher. A wheel pin that only site-packages satisfies is the",
+              "   exact inert pin this workflow was rewritten to stop shipping.",
+              "3. Re-verify `scripts/neutralize-vendor-branding.py` against the new",
+              "   source, re-capture the fixture in",
+              "   `tests/test_vendor_branding_neutralized.py`, and update",
+              "   `VERIFIED_HERMES_COMMIT`.",
+              "4. Re-run the breaking-change review: config schema, plugin",
+              "   entry-point classification, approval semantics, state.db schema.",
+              "5. Update `ARG HERMES_COMMIT`, `ARG HERMES_PYPI_FLOOR`, and the",
+              "   `gateway-live-roundtrip` install line in `.gitea/workflows/ci.yml`.",
+              "",
+              "Filed automatically by `.gitea/workflows/upstream-sync.yml`.",
+          ])
 
-          st, _ = req("PUT", f"/repos/{repo}/contents/Dockerfile", {
-              "message": f"chore(sync): bump hermes-agent {current} -> {latest} (daily upstream sync)",
-              "content": base64.b64encode(text.encode()).decode(),
-              "sha": meta["sha"], "branch": "main", "new_branch": branch,
-          })
-          assert st in (200, 201), f"contents PUT {st}"
-
-          st, pr = req("POST", f"/repos/{repo}/pulls", {
-              "title": f"chore(sync): bump hermes-agent {current} -> {latest}",
-              "head": branch, "base": "main",
-              "body": ("Automated daily upstream sync: PyPI reports "
-                       f"hermes-agent {latest} (pinned: {current}). Per-PR "
-                       "CI (image build + prebake self-check + adapter "
-                       "socket conformance) gates the merge as usual."),
-          })
-          assert st in (200, 201), f"pulls POST {st}"
-          print(f"opened bump PR #{pr.get('number')} for hermes-agent {latest}")
+          st, issue = req("POST", f"/repos/{repo}/issues", {"title": title, "body": body})
+          assert st in (200, 201), f"issues POST {st}"
+          print(f"opened issue #{issue.get('number')}: {title}")
           PYEOF

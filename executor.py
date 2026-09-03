@@ -129,6 +129,20 @@ SECRET_HEADER = "X-Molecule-A2A-Secret"
 # hermes daemon from wedging the A2A queue forever.
 _PLUGIN_REPLY_TIMEOUT = 600.0
 
+# Inbound `metadata.source_type` values that mean "this delivery is an
+# autonomous self-turn, not a human talking". The scheduler plugin stamps
+# `self-scheduler` (its TRIGGER_DEFAULT_SOURCE_TYPE) on every trigger turn.
+#
+# This is an ALLOW-LIST, not a passthrough, and that is the security-relevant
+# part: `context.message.metadata` is peer-supplied on the A2A path, so a peer
+# workspace can put anything in it. Forwarding arbitrary strings would let a
+# peer claim its message is unattended and, once the receiving end honours the
+# marker, skip the human approval a peer message is supposed to require. Only
+# markers we recognise cross the boundary; everything else — including a
+# missing, malformed, or unknown value — resolves to "" and takes the existing
+# interactive path unchanged.
+_SCHEDULED_SOURCE_TYPES = frozenset({"self-scheduler"})
+
 
 def _record_tool_activity() -> None:
     """Tier-C turn-lease liveness ping on each tool call (RC #203, template side).
@@ -487,6 +501,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
     ) -> None:
         chat_id = self._derive_chat_id(context)
         peer_id, peer_name = self._derive_peer_identity(context)
+        source_type = self._derive_source_type(context)
         callback_url = (
             f"http://{self._callback_host}:{self._callback_port}{_DEFAULT_CALLBACK_PATH}"
         )
@@ -504,6 +519,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
             callback_url=callback_url,
             history=history,
             event_queue=event_queue,
+            source_type=source_type,
         )
         if text is None:
             return  # the failure message was already enqueued
@@ -539,6 +555,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
                     callback_url=callback_url,
                     history=history,
                     event_queue=event_queue,
+                    # The retry IS the same turn — it must not change
+                    # provenance, or a scheduled turn would become
+                    # interactive purely by having overflowed once.
+                    source_type=source_type,
                 )
                 if retry is None:
                     return
@@ -613,6 +633,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         callback_url: str,
         history: list[dict[str, Any]] | None,
         event_queue: EventQueue | None,
+        source_type: str = "",
     ) -> str | None:
         """POST one message into the hermes plugin and await its reply.
 
@@ -650,6 +671,25 @@ class HermesAgentProxyExecutor(AgentExecutor):
             "message_id": message_id,
             "callback_url": callback_url,
         }
+        # Autonomy marker, forwarded ONLY for a recognised scheduled delivery
+        # (see _SCHEDULED_SOURCE_TYPES). Absent for every interactive turn, so
+        # an interactive payload is byte-identical to what it was before — a
+        # human message keeps prompting a human, which is the point.
+        #
+        # STATED PLAINLY: this is currently INERT end-to-end, and shipping it
+        # is a deliberate half-fix, not a dead knob left by accident. The
+        # plugin passes the payload through as MessageEvent.raw_message, so
+        # the marker does reach hermes — but the hermes we pin resolves cron
+        # provenance in gateway/run.py::_set_session_env, which is a single
+        # `return set_session_vars(..., cron_session="")` with no branch and
+        # no field on SessionContext.source for a source_type to ride in.
+        # Verified byte-identical at upstream HEAD 63279301, so the pin bump
+        # in this same change does NOT close it either. Forwarding the marker
+        # is the half we own; the other half needs an upstream change. Until
+        # that lands, a scheduled run whose approval nobody is listening for
+        # still blocks on the approval timeout.
+        if source_type:
+            payload["source_type"] = source_type
         # Defensive: if history is malformed (not a list), log + skip
         # rather than crash the turn. Per
         # feedback_surface_actionable_failure_reason_to_user, we still
@@ -964,6 +1004,34 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if not isinstance(peer_name, str):
             peer_name = ""
         return (peer_id, peer_name)
+
+    @staticmethod
+    def _derive_source_type(context: RequestContext) -> str:
+        """The delivery's autonomy marker, or "" for an interactive turn.
+
+        The scheduler plugin stamps ``metadata.source_type="self-scheduler"``
+        on a trigger turn so the receiving agent can tell an autonomous
+        self-ping from a human message. We dropped it here: every field the
+        plugin transport forwards is enumerated by hand in
+        ``_dispatch_and_wait``'s payload, and ``source_type`` was never added,
+        so a scheduled delivery arrived at hermes indistinguishable from a
+        person typing. That is one half of the ~305s scheduled-run hang: with
+        no marker, a flagged command opens an approval nobody is listening for
+        and the turn blocks until the approval timeout.
+
+        Returns "" for anything not in ``_SCHEDULED_SOURCE_TYPES`` — see the
+        note there for why this is an allow-list and not a passthrough.
+        """
+        message = getattr(context, "message", None)
+        if message is None:
+            return ""
+        metadata = getattr(message, "metadata", None) or {}
+        if not isinstance(metadata, dict):
+            return ""
+        source_type = metadata.get("source_type")
+        if not isinstance(source_type, str):
+            return ""
+        return source_type if source_type in _SCHEDULED_SOURCE_TYPES else ""
 
     # ------------------------------------------------------------------
     # Legacy chat_completions transport (fallback)

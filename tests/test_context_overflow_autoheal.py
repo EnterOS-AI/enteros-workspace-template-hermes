@@ -131,15 +131,19 @@ def _executor_with_scripted_replies(monkeypatch, replies):
     """Build an executor whose _dispatch_and_wait returns `replies` in order.
 
     Records every dispatched `content` so the test can assert what was sent
-    (the turn prompt vs the `/new` reset) and how many turns ran.
+    (the turn prompt vs the `/new` reset) and how many turns ran, plus the
+    `source_type` on each dispatch so the retry's provenance can be checked.
     """
     inst = ex.HermesAgentProxyExecutor.__new__(ex.HermesAgentProxyExecutor)
     sent = []
+    source_types = []
     pending = list(replies)
 
     async def fake_dispatch(self, *, content, chat_id, peer_id, peer_name,
-                            callback_url, history, event_queue):
+                            callback_url, history, event_queue,
+                            source_type=""):
         sent.append(content)
+        source_types.append(source_type)
         return pending.pop(0) if pending else None
 
     monkeypatch.setattr(
@@ -157,7 +161,7 @@ def _executor_with_scripted_replies(monkeypatch, replies):
     monkeypatch.setattr(ex, "_tool_trace_from_session_delta", lambda snap: [])
     inst._callback_host = "127.0.0.1"
     inst._callback_port = 8646
-    return inst, sent
+    return inst, sent, source_types
 
 
 def _run(inst, queue, prompt="do the work"):
@@ -169,7 +173,7 @@ def _run(inst, queue, prompt="do the work"):
 def test_overflow_triggers_reset_then_retry(monkeypatch):
     """The wedge-breaker: overflow -> /new -> replay the SAME prompt once."""
     overflow = "Context length exceeded (182,430 tokens). Cannot compress further."
-    inst, sent = _executor_with_scripted_replies(
+    inst, sent, _source_types = _executor_with_scripted_replies(
         monkeypatch,
         [overflow, "Session reset! Starting fresh.", "here is the real answer"],
     )
@@ -184,7 +188,7 @@ def test_overflow_triggers_reset_then_retry(monkeypatch):
 
 def test_healthy_turn_does_not_reset(monkeypatch):
     """No reset on a normal reply — the heal must not touch healthy sessions."""
-    inst, sent = _executor_with_scripted_replies(monkeypatch, ["all done"])
+    inst, sent, _source_types = _executor_with_scripted_replies(monkeypatch, ["all done"])
     queue = _FakeQueue()
     _run(inst, queue)
 
@@ -200,7 +204,7 @@ def test_heal_is_bounded_to_one_retry(monkeypatch):
     bound the executor would spin /new + retry until the turn timed out.
     """
     overflow = "Context length exceeded (245,527 tokens). Cannot compress further."
-    inst, sent = _executor_with_scripted_replies(
+    inst, sent, _source_types = _executor_with_scripted_replies(
         monkeypatch, [overflow, "Session reset!", overflow],
     )
     queue = _FakeQueue()
@@ -218,7 +222,7 @@ def test_failed_reset_skips_the_retry(monkeypatch):
     the transcript that is already known to overflow.
     """
     overflow = "Context length exceeded (182,430 tokens). Cannot compress further."
-    inst, sent = _executor_with_scripted_replies(
+    inst, sent, _source_types = _executor_with_scripted_replies(
         monkeypatch, [overflow, None],
     )
     queue = _FakeQueue()
@@ -231,10 +235,74 @@ def test_failed_reset_skips_the_retry(monkeypatch):
 def test_reset_reply_that_is_itself_an_overflow_aborts(monkeypatch):
     """A `/new` that returns the overflow string means it was not cleared."""
     overflow = "Context length exceeded (182,430 tokens). Cannot compress further."
-    inst, sent = _executor_with_scripted_replies(
+    inst, sent, _source_types = _executor_with_scripted_replies(
         monkeypatch, [overflow, overflow],
     )
     queue = _FakeQueue()
     _run(inst, queue)
 
     assert sent == ["do the work", "/new"], "abort when the reset did not take"
+
+
+# ---- provenance across the heal -------------------------------------
+
+
+class _CtxWithMetadata:
+    """Minimal context carrying message.metadata, for _derive_source_type.
+
+    Deliberately a plain class, not a MagicMock: a MagicMock auto-creates
+    `.message` and every other attribute, which is exactly the trap that
+    silently emptied the wire-level tests in test_executor_plugin_path.py.
+    """
+
+    class _Msg:
+        def __init__(self, metadata):
+            self.metadata = metadata
+
+    def __init__(self, metadata):
+        self.message = self._Msg(metadata)
+
+
+def _run_with_ctx(inst, queue, ctx, prompt="do the work"):
+    return asyncio.run(inst._execute_via_plugin(ctx, queue, prompt, history=None))
+
+
+def test_retry_after_heal_keeps_scheduled_provenance(monkeypatch):
+    """The auto-heal replay is the SAME turn and must not change provenance.
+
+    If the retry dropped the marker, a scheduled run that happened to overflow
+    once would silently become an interactive turn — and then block on an
+    approval nobody is listening for. The heal must not be able to launder a
+    turn's origin.
+    """
+    overflow = "Context length exceeded (182,430 tokens). Cannot compress further."
+    inst, sent, source_types = _executor_with_scripted_replies(
+        monkeypatch,
+        [overflow, "Session reset! Starting fresh.", "here is the real answer"],
+    )
+    queue = _FakeQueue()
+    _run_with_ctx(inst, queue, _CtxWithMetadata({"source_type": "self-scheduler"}))
+
+    assert sent == ["do the work", "/new", "do the work"]
+    # dispatch 0 = the turn, 1 = the internal /new reset, 2 = the replay.
+    assert source_types[0] == "self-scheduler"
+    assert source_types[2] == "self-scheduler", (
+        "the heal replay lost the scheduled marker; the same turn changed "
+        f"provenance mid-heal. source_types={source_types!r}"
+    )
+
+
+def test_interactive_turn_stays_interactive_across_the_heal(monkeypatch):
+    """The mirror case: a human turn must never acquire a marker."""
+    overflow = "Context length exceeded (182,430 tokens). Cannot compress further."
+    inst, sent, source_types = _executor_with_scripted_replies(
+        monkeypatch,
+        [overflow, "Session reset! Starting fresh.", "here is the real answer"],
+    )
+    queue = _FakeQueue()
+    _run_with_ctx(inst, queue, _CtxWithMetadata({"peer_id": "ws-1"}))
+
+    assert sent == ["do the work", "/new", "do the work"]
+    assert set(source_types) == {""}, (
+        f"an interactive turn acquired a provenance marker: {source_types!r}"
+    )

@@ -60,19 +60,38 @@ corresponding platform contract change and validation.
 
 ## Upstream freshness
 
-The effective hermes engine is the **stock upstream wheel**, pinned as
-`ARG HERMES_VERSION` in the Dockerfile. The Molecule A2A integration lives
-entirely in the [`hermes-platform-molecule-a2a`](https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a)
+The effective hermes engine is **stock upstream, installed from a pinned git
+commit**: `ARG HERMES_COMMIT` in the Dockerfile. That ARG is the whole
+reproducibility story, and it is a commit rather than a version for a reason
+worth knowing before you touch this: `~/.local/bin/hermes` is not the venv
+console script, it is a wrapper that execs `$HERMES_ROOT/hermes`, which puts
+the git **checkout** at `sys.path[0]` ahead of site-packages. The gateway runs
+the checkout. A wheel pin in site-packages is inert — which is what it was
+until 2026-09-03, while the checkout silently tracked whatever upstream `main`
+happened to be on build day.
+
+The pin is currently an **unreleased upstream ref**, taken with owner
+authorisation: PyPI's newest `hermes-agent` is still 0.19.0 (2026-07-20) and
+the context-compaction and unattended-approval fixes the fleet needs exist only
+as git refs. `ARG HERMES_PYPI_FLOOR` records the lowest published release that
+would carry them, and the plan is to return to a tagged release once one
+exists.
+
+The Molecule A2A integration lives entirely in the
+[`hermes-platform-molecule-a2a`](https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a)
 plugin, which registers through upstream's `ctx.register_platform(...)`
 socket (NousResearch #17751). There is **no patched fork** — the interim
 `molecule-ai/hermes-agent` fork was retired on 2026-07-22 (#294) once the
 plugin migrated to the upstream API.
 
 A daily bot (`.gitea/workflows/upstream-sync.yml`, 06:17 UTC + manual
-dispatch) checks PyPI for a newer `hermes-agent` release and opens a bump
-PR against the pin. Bump PRs go through the normal per-PR CI (image build,
-prebake self-check, adapter-socket conformance) — the bot only surfaces
-work, it never gates or lands anything.
+dispatch) compares PyPI's latest `hermes-agent` against `HERMES_PYPI_FLOOR`.
+Below the floor it does nothing; at or above it, it files an issue with the
+checklist for returning to a published release. It deliberately does **not**
+auto-bump `HERMES_COMMIT` to newer git refs — every such bump is unreviewed
+third-party code entering a customer image, so the pin moves when someone
+decides it should. The bot only surfaces work; it never gates or lands
+anything.
 
 ## Development and delivery
 

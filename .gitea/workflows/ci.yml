@@ -135,6 +135,25 @@ jobs:
               ctx = line.lower()
               return '...' in ctx or '<example' in ctx or '</example' in ctx
 
+          # A 40-char git object id is not a credential. The generic
+          # ["'][a-zA-Z0-9/+=]{40}["'] rule above cannot tell a base64-ish
+          # 40-char blob from a SHA-1, and this repo pins upstream commits by
+          # SHA on purpose (ARG HERMES_COMMIT, ARG HERMES_PLATFORM_MOLECULE_A2A_REF,
+          # and the anchors in tests/ that must match them). Exempting at the
+          # MATCH level rather than reaching for the line-level `...` escape is
+          # deliberate: `...` disables every pattern for the whole line, so a
+          # real key sharing a line with a SHA would sail through.
+          #
+          # Narrow on purpose — exactly 40 chars, lowercase hex only. None of
+          # the credential formats above live in that alphabet: a base64 token
+          # of length 40 that happens to be all-lowercase-hex has ~1e-9 odds,
+          # and every named format (sk-ant-, ghp_, AKIA, sk_test_, Bearer) is
+          # matched by its own prefix rule regardless.
+          GIT_SHA1 = re.compile(r'\A["\'][0-9a-f]{40}["\']\Z')
+
+          def is_git_sha(matched_text):
+              return bool(GIT_SHA1.match(matched_text))
+
           root = Path(os.environ.get('GITHUB_WORKSPACE', '.'))
           warnings = []
           for dirpath, dirnames, filenames in os.walk(root):
@@ -148,8 +167,11 @@ jobs:
                           for lineno, line in enumerate(f.readlines(), 1):
                               for pattern in PATTERNS:
                                   for match in pattern.finditer(line):
-                                      if not is_false_positive(line):
-                                          warnings.append(f"  {filepath}:{lineno}: {match.group(0)[:40]}...")
+                                      if is_false_positive(line):
+                                          continue
+                                      if is_git_sha(match.group(0)):
+                                          continue
+                                      warnings.append(f"  {filepath}:{lineno}: {match.group(0)[:40]}...")
                   except Exception:
                       pass
 
@@ -882,8 +904,8 @@ jobs:
 
   gateway-live-roundtrip:
     # The gate the 2026-07-23 hermes-0.19 incident demanded: boot the REAL
-    # pinned hermes gateway (installed at the Dockerfile's HERMES_VERSION,
-    # so every upstream-sync bump PR exercises the NEW version pre-merge)
+    # pinned hermes gateway (installed at the Dockerfile's HERMES_COMMIT,
+    # so every upstream pin bump exercises the NEW ref pre-merge)
     # with the REAL a2a plugin (at HERMES_PLATFORM_MOLECULE_A2A_REF) and
     # run scripts/e2e_full_chain.py: executor -> /a2a/inbound -> gateway
     # pipeline -> stub LLM -> plugin send() -> executor callback, TWICE
@@ -917,7 +939,7 @@ jobs:
         if: github.event.pull_request.head.repo.fork != true
         run: |
           set -euo pipefail
-          HERMES_VERSION=$(sed -n 's/^ARG HERMES_VERSION=//p' Dockerfile | head -1)
+          HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
           A2A_REF=$(sed -n 's/^ARG HERMES_PLATFORM_MOLECULE_A2A_REF=//p' Dockerfile | head -1)
           # review wf_3a7b849d #6: pin the runtime to .runtime-version, the
           # EXACT version the shipped image is built and asserted against
@@ -927,9 +949,33 @@ jobs:
           # break in the pinned 0.4.x could ship green, and an unrelated newer
           # release could red every template PR.
           RUNTIME_VERSION=$(tr -d '[:space:]' < .runtime-version)
-          test -n "$HERMES_VERSION" && test -n "$A2A_REF" && test -n "$RUNTIME_VERSION"
-          echo "pinned hermes-agent==$HERMES_VERSION a2a-plugin@$A2A_REF runtime==$RUNTIME_VERSION"
-          pip install -q "hermes-agent==$HERMES_VERSION" aiohttp
+          test -n "$HERMES_COMMIT" && test -n "$A2A_REF" && test -n "$RUNTIME_VERSION"
+          echo "pinned hermes-agent@$HERMES_COMMIT a2a-plugin@$A2A_REF runtime==$RUNTIME_VERSION"
+          # Install from the SAME immutable git ref the image pins (2026-09-03).
+          # It used to be `hermes-agent==$HERMES_VERSION` from PyPI; that pin
+          # named the wheel in site-packages, which the shipped image does not
+          # import (~/.local/bin/hermes puts the checkout at sys.path[0]) — so
+          # this gate was conformance-testing code the fleet does not run.
+          #
+          # It must be an EDITABLE install from a checkout, not `pip install
+          # <git-ref>`: upstream's build backend refuses to build a wheel or
+          # sdist at all ("Building wheels or sdists for hermes-agent is not
+          # supported. Hermes is distributed via the shell installer, Docker
+          # image, or Nix"), so the package form fails outright. This mirrors
+          # what install.sh does in the image (`uv pip install -e .` from the
+          # pinned checkout), which is also why the image was never affected.
+          git clone -q --filter=blob:none --no-checkout \
+            https://github.com/NousResearch/hermes-agent.git /tmp/hermes-src
+          git -C /tmp/hermes-src checkout -q --detach "$HERMES_COMMIT"
+          # Same reasoning as the Dockerfile's assertion: verify the ref rather
+          # than trust the fetch, so this gate cannot silently test other code.
+          ACTUAL_COMMIT="$(git -C /tmp/hermes-src rev-parse HEAD)"
+          if [ "$ACTUAL_COMMIT" != "$HERMES_COMMIT" ]; then
+            echo "::error::hermes checkout is at $ACTUAL_COMMIT, expected $HERMES_COMMIT"
+            exit 1
+          fi
+          pip install -q -e /tmp/hermes-src
+          pip install -q aiohttp
           pip install -q "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${A2A_REF}#egg=hermes-platform-molecule-a2a"
           pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" "molecules-workspace-runtime==$RUNTIME_VERSION"
       - name: Run the full-chain round-trip against the pinned gateway
@@ -996,11 +1042,19 @@ jobs:
   #
   # SCOPE: this job runs adapter conformance plus the narrow release/runtime
   # supply-chain contracts, not the whole tests/ dir. The adapter-socket suite
-  # (16 cases) is the CI2 target and is green. tests/test_executor_plugin_path.py
-  # is intentionally NOT gated here — it is unrelated to this contract and
-  # currently fails independently (a2a extract_message_text / MagicMock-context
-  # version sensitivity). The remaining adapter-adjacent suites can be folded
-  # in after that separate debt is fixed.
+  # (16 cases) is the CI2 target and is green.
+  #
+  # 2026-09-03: tests/test_executor_plugin_path.py used to be excluded here
+  # because it "currently fails independently (a2a extract_message_text /
+  # MagicMock-context version sensitivity)". That debt is now PAID — the
+  # runtime's canonical extract_message_text probes `.message` first to detect
+  # a RequestContext, and a bare MagicMock auto-creates that attribute, so
+  # every wire-level test read as a context wrapping a phantom message, got
+  # empty text, and returned before dispatching. Pinning `.message = None` on
+  # the mocked messages restores all 19. The file is folded in, as that comment
+  # anticipated. tests/test_vendor_branding_neutralized.py is folded in too:
+  # it is the guard that turns an upstream pin bump red until someone re-reads
+  # prompt_builder.py, and it cannot do that from outside CI.
   conformance:
     name: Adapter-socket conformance
     runs-on: ubuntu-latest
@@ -1031,6 +1085,18 @@ jobs:
       # transitive deps.
       - if: github.event.pull_request.head.repo.fork != true
         run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements-dev.txt
+      # test_vendor_branding_neutralized.py and test_executor_plugin_path.py
+      # were NOT in this list (2026-09-03). That is how both rotted unnoticed:
+      #   * the vendor-branding guard exists specifically to turn an upstream
+      #     pin bump RED until someone re-reads prompt_builder.py — it cannot
+      #     do that from outside CI, and upstream had meanwhile added a THIRD
+      #     vendor constant the neutralizer did not know about;
+      #   * every wire-level test in the executor file had silently stopped
+      #     exercising the transport (runtime's extract_message_text changed
+      #     shape-detection; a MagicMock message now reads as a RequestContext
+      #     and yields empty text, so execute() short-circuited before
+      #     dispatching). 19 of them failed on a pristine tree.
+      # Both are green and in the list now. A guard nobody runs is not a guard.
       - name: Run adapter and private-runtime contracts
         if: github.event.pull_request.head.repo.fork != true
         run: >-
@@ -1045,4 +1111,6 @@ jobs:
           tests/test_github_cli_present.py
           tests/test_context_overflow_autoheal.py
           tests/test_cron_approval_mode.py
+          tests/test_executor_plugin_path.py
+          tests/test_vendor_branding_neutralized.py
           -v

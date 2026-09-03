@@ -42,7 +42,9 @@ not identical (109195 B vs 101647 B on 0408b7cdfe09):
 
   1. ``$HERMES_ROOT/agent/prompt_builder.py``                       (checkout)
   2. ``$HERMES_ROOT/venv/lib/python3.11/site-packages/agent/prompt_builder.py``
-     (the PyPI wheel the Dockerfile pins via ``hermes-agent==${HERMES_VERSION}``)
+     (the editable install the upstream installer created from that checkout;
+     until 2026-09-03 this was instead a PyPI wheel force-reinstalled over it,
+     which is how the image came to run code no pin in this repo named)
 
 The gateway imports **the checkout**, because ``~/.local/bin/hermes`` is not a
 symlink to the venv console script — it is a wrapper that reads::
@@ -140,19 +142,46 @@ HELP_GUIDANCE_REPLACEMENT = (
 # Byte-identical to upstream's DEFAULT_AGENT_IDENTITY with the vendor
 # attribution sentence replaced; every behavioural clause is preserved so this
 # is a branding change and not a behaviour change.
+#
+# RE-DERIVED 2026-09-03 for the HERMES_COMMIT pin. Upstream rewrote this
+# constant wholesale in #95681: the old trait list ("helpful, knowledgeable,
+# and direct...") became a behaviour spec about reply length, filler, and
+# earned depth. Our replacement was a copy of the OLD text, so carrying it
+# forward unchanged would have quietly reverted upstream's new behaviour for
+# every workspace — a behaviour change smuggled in under a branding patch,
+# which is exactly what "byte-identical except the vendor sentence" exists to
+# prevent. Only the first sentence is ours; the rest is upstream's, verbatim.
 DEFAULT_IDENTITY_REPLACEMENT = (
-    "You are the AI agent for this workspace. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
+    "You are the AI agent for this workspace. Be direct: match the "
+    "length of your reply to the weight of the ask — a one-line question "
+    "gets a one-line answer, and finished work gets a short report of what "
+    "changed, what's verified, and what's left, never a replay of the "
+    "process. No filler (\"Great question,\" \"I'd be happy to\"), no "
+    "restating the request back, no re-summarizing what you already said, "
+    "no narrating tool calls the user can see. Plain claims over "
+    "adjectives; when unsure, say so plainly. Agree because it's right, "
+    "not because the user said it. Depth is earned — give it when the "
+    "user asks for detail, teaches, or the stakes demand it, not by "
+    "default."
 )
 
 # (module relative path, constant name, replacement).
+#
+# HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS is NEW at the current pin and is the
+# reason this file changed. Upstream split the help pointer in two
+# (agent/system_prompt.py:498 appends the NO_SKILLS variant unconditionally;
+# :656 swaps that slot for the skill-aware one ONLY when the `hermes-agent`
+# skill is actually installed). Our workspaces ship their own skills, so the
+# NO_SKILLS variant is the one most of the fleet would get — and it carries
+# the same "You run on Hermes Agent (by Nous Research)" byline plus the
+# nousresearch.com docs pointer. Neutralizing only the old constant name would
+# have let the vendor byline back into every customer's system prompt at the
+# very moment we bumped the pin. Both variants get the same replacement: once
+# the third-party product pointer is gone, upstream's skill-installed /
+# not-installed distinction has nothing left to distinguish.
 TARGETS = (
     ("agent/prompt_builder.py", "HERMES_AGENT_HELP_GUIDANCE", HELP_GUIDANCE_REPLACEMENT),
+    ("agent/prompt_builder.py", "HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS", HELP_GUIDANCE_REPLACEMENT),
     ("agent/prompt_builder.py", "DEFAULT_AGENT_IDENTITY", DEFAULT_IDENTITY_REPLACEMENT),
 )
 

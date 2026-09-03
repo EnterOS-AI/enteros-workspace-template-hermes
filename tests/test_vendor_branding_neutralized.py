@@ -71,13 +71,14 @@ UPSTREAM_PROMPT_BUILDER = '''\
 """Fixture standing in for upstream agent/prompt_builder.py."""
 
 DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
+    "You are Hermes Agent, built by Nous Research. Be direct: match the "
+    "length of your reply to the weight of the ask — a one-line question "
+    "gets a one-line answer, and finished work gets a short report of what "
+    "changed, what's verified, and what's left, never a replay of the "
+    "process. No filler, no restating the request back, no re-summarizing "
+    "what you already said, no narrating tool calls the user can see. "
+    "Plain claims over adjectives; when unsure, say so plainly. Agree "
+    "because it's right, not because the user said it. Depth is earned."
 )
 
 HERMES_AGENT_HELP_GUIDANCE = (
@@ -86,32 +87,50 @@ HERMES_AGENT_HELP_GUIDANCE = (
     "it — or when you need to understand your own features, tools, or capabilities, "
     "the documentation at https://hermes-agent.nousresearch.com/docs is your "
     "authoritative reference and always holds the latest, most up-to-date "
-    "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
-    "for additional guidance and proven workflows, but treat the docs as the source "
-    "of truth when the two differ."
+    "information. The `hermes-agent` skill has the actual commands and proven "
+    "workflows — load it with skill_view(name='hermes-agent') before configuring, "
+    "modifying, or troubleshooting Hermes so you don't guess or invent workarounds."
+)
+
+HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS = (
+    "You run on Hermes Agent (by Nous Research). When the user needs help with "
+    "Hermes itself — configuring, setting up, using, extending, or troubleshooting "
+    "it — or when you need to understand your own features, tools, or capabilities, "
+    "the documentation at https://hermes-agent.nousresearch.com/docs is the "
+    "authoritative reference and always holds the latest, most up-to-date "
+    "information. Point the user there (or read it yourself if you have a way to "
+    "fetch web content)."
 )
 
 MEMORY_GUIDANCE = "You have persistent memory across sessions."
 '''
 
 # Reproduces the unconditional append that puts the constant in the prompt.
+# Upstream (#95681) now appends the NO_SKILLS variant unconditionally and only
+# swaps the slot for the skill-aware one when the `hermes-agent` skill is
+# actually installed — so the NO_SKILLS text is what most of our fleet gets,
+# and it must be neutralized too.
 UPSTREAM_SYSTEM_PROMPT = '''\
 """Fixture standing in for upstream agent/system_prompt.py."""
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     HERMES_AGENT_HELP_GUIDANCE,
+    HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
 )
 
 
-def build_stable_parts(soul_content=None):
+def build_stable_parts(soul_content=None, hermes_skill_installed=False):
     stable_parts = []
     if soul_content:
         stable_parts.append(soul_content)
     else:
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    help_slot = len(stable_parts)
+    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    if hermes_skill_installed:
+        stable_parts[help_slot] = HERMES_AGENT_HELP_GUIDANCE
     return stable_parts
 '''
 
@@ -332,7 +351,7 @@ def test_anchor_that_lost_its_vendor_token_fails_loudly(tmp_path):
     live.write_text(
         UPSTREAM_PROMPT_BUILDER.replace("Hermes Agent (by Nous Research)", "this agent")
         .replace("https://hermes-agent.nousresearch.com/docs", "the local docs")
-        .replace("created by Nous Research", "for this workspace"),
+        .replace("built by Nous Research", "for this workspace"),
         encoding="utf-8",
     )
     proc = _run_script(root)
@@ -404,37 +423,79 @@ def test_no_product_brand_literal_is_hardcoded():
     )
 
 
-# The upstream release whose agent/prompt_builder.py the fixture above was
-# copied from, and against which the neutralizer was verified end-to-end inside
-# a throwaway container on image 0408b7cdfe09. Bumping the pin without
-# re-checking the anchor is exactly how this patch would silently become a
-# no-op, so the bump has to come through here.
-VERIFIED_HERMES_VERSION = "0.19.0"
+# The upstream COMMIT whose agent/prompt_builder.py the fixture above was
+# copied from, and against which the neutralizer was verified. It is a commit
+# and not a version because the image pins a commit: ~/.local/bin/hermes execs
+# $HERMES_ROOT/hermes, putting the git checkout at sys.path[0] ahead of
+# site-packages, so the checkout's SHA — not any wheel version — identifies the
+# code whose constants this patch anchors on.
+#
+# 29112bef = upstream tag v2026.8.31 (pyproject version 0.21.0).
+# Bumping the pin without re-checking the anchors is exactly how this patch
+# would silently become a no-op, so the bump has to come through here. It
+# already earned its keep once: moving off 0.19.0 introduced a THIRD vendor
+# constant (HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS) that the neutralizer did not
+# know about, and rewrote DEFAULT_AGENT_IDENTITY wholesale.
+VERIFIED_HERMES_COMMIT = "29112bef099274229cadff79cdff7bf7b99c4b77"
 
 
-def test_upstream_pin_matches_the_version_this_patch_was_verified_against():
+def test_upstream_pin_matches_the_commit_this_patch_was_verified_against():
     """An upstream bump must not silently carry the patch past its anchor.
 
     The fixture in this file is a byte copy of ``agent/prompt_builder.py``'s
-    constants at ``HERMES_VERSION`` below. A fixture-only guard cannot notice
-    upstream renaming the constant in a LATER release — the fixture would keep
-    passing while the real image reverted to the vendor byline (the boot-time
-    ERROR would fire, but only in production logs). Tying the guard to the pin
-    turns the daily upstream-sync bump PR red until a human re-reads
+    constants at ``HERMES_COMMIT`` below. A fixture-only guard cannot notice
+    upstream renaming, splitting, or adding a constant in a LATER ref — the
+    fixture would keep passing while the real image reverted to the vendor
+    byline (the boot-time ERROR fires only for a constant the script already
+    knows to look for, and a NEW vendor constant produces no error at all).
+    Tying the guard to the pin turns any pin bump red until a human re-reads
     ``prompt_builder.py`` and re-captures the fixture.
     """
     dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
-    m = re.search(r"^ARG HERMES_VERSION=(\S+)$", dockerfile, re.M)
-    assert m, "ARG HERMES_VERSION is gone from the Dockerfile"
-    assert m.group(1) == VERIFIED_HERMES_VERSION, (
-        f"Dockerfile pins hermes-agent {m.group(1)} but the vendor-branding "
-        f"neutralizer was only verified against {VERIFIED_HERMES_VERSION}. "
-        "Re-read agent/prompt_builder.py in the new release: confirm "
-        "HERMES_AGENT_HELP_GUIDANCE and DEFAULT_AGENT_IDENTITY still exist and "
-        "still carry the vendor attribution, re-capture UPSTREAM_PROMPT_BUILDER "
-        "in this file, then bump VERIFIED_HERMES_VERSION. If the anchor moved "
-        "and this is skipped, every workspace goes back to telling customers it "
-        "runs on Nous Research's product."
+    m = re.search(r"^ARG HERMES_COMMIT=([0-9a-f]{40})$", dockerfile, re.M)
+    assert m, "ARG HERMES_COMMIT is gone from the Dockerfile (or is not a full SHA)"
+    assert m.group(1) == VERIFIED_HERMES_COMMIT, (
+        f"Dockerfile pins hermes-agent at {m.group(1)} but the vendor-branding "
+        f"neutralizer was only verified against {VERIFIED_HERMES_COMMIT}. "
+        "Re-read agent/prompt_builder.py at the new commit: confirm every "
+        "constant appended into the system prompt that carries vendor "
+        "attribution is listed in TARGETS (there were THREE as of 29112bef, "
+        "and upstream has split one of them before), re-capture "
+        "UPSTREAM_PROMPT_BUILDER in this file, then bump VERIFIED_HERMES_COMMIT. "
+        "If an anchor moved and this is skipped, every workspace goes back to "
+        "telling customers it runs on Nous Research's product."
+    )
+
+
+def test_pin_is_immutable_and_reproducible():
+    """The build must never resolve upstream code at build time.
+
+    A branch name or tag can move; only a full commit SHA cannot. This also
+    guards the two ways the old Dockerfile leaked unpinned upstream `main` into
+    a customer image: fetching install.sh from the branch, and letting the
+    installer clone the branch.
+    """
+    dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+    body = "\n".join(
+        ln for ln in dockerfile.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "hermes-agent/main/scripts/install.sh" not in body, (
+        "install.sh is fetched from the moving `main` branch again — the image "
+        "would ship whatever upstream happened to push that day"
+    )
+    assert "--commit \"${HERMES_COMMIT}\"" in body, (
+        "the installer is no longer pinned with --commit; it would clone main"
+    )
+    assert "--force-commit" in body, (
+        "--force-commit is gone. install.sh SUPPRESSES a --commit that would "
+        "move an existing install backwards and still exits 0, and our pin is "
+        "an ancestor of main — so that branch, if it is ever reached, ignores "
+        "the pin silently. Keep the flag; the rev-parse assertion below is the "
+        "backstop."
+    )
+    assert "rev-parse HEAD" in body, (
+        "the build-time assertion that the checkout is actually at "
+        "HERMES_COMMIT is gone; an ignored --commit would ship unnoticed"
     )
 
 
