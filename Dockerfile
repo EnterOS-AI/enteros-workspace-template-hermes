@@ -148,7 +148,7 @@ RUN chmod +x /usr/local/bin/molecule-askpass
 # The installer lives under the agent's home (~/.hermes, symlinks the
 # `hermes` entrypoint into ~/.local/bin/). Running as root would place
 # it in /root and break discovery.
-#   --skip-setup → no interactive wizard (curl|bash is non-tty anyway
+#   --skip-setup → no interactive wizard (a build step has no tty anyway
 #                  but the installer treats this as "run anyway" by
 #                  default; passing it explicitly avoids surprises).
 #   --commit SHA → upstream's own first-class checkout pin (install.sh
@@ -195,15 +195,41 @@ RUN chmod +x /usr/local/bin/molecule-askpass
 # image live on 2026-09-03 carries checkout 56526bc0 (upstream 0.20.1,
 # 2026-08-16) while the wheel pin claimed 0.19.0.
 #
-# Both the installer script and the checkout are now fetched at HERMES_COMMIT,
-# so the build is reproducible. A git commit SHA is itself the content hash of
-# the tree, so pinning by SHA authenticates install.sh without a second digest.
+# The installer and the checkout are both taken at HERMES_COMMIT, so the build
+# is reproducible.
+#
+# THE INSTALLER IS VENDORED, NOT DOWNLOADED (2026-09-29)
+# ------------------------------------------------------
+# vendor/hermes-agent/install.sh is a byte copy of upstream scripts/install.sh
+# at HERMES_COMMIT. This step used to be
+#   curl -fsSL https://raw.githubusercontent.com/.../${HERMES_COMMIT}/scripts/install.sh | bash -s -- ...
+# and on 2026-09-29 every build of the runtime 0.4.92 bump failed on it:
+#   - raw.githubusercontent.com answered HTTP 429 to all four builds, on two
+#     runner hosts, so no image could be built while that limit lasted.
+#   - The pipe hid the failure. The RUN had no pipefail, so the step's status
+#     was bash's: bash read an empty script and exited 0, and the build failed
+#     one step later with
+#     "fatal: cannot change to '/home/agent/.hermes/hermes-agent'".
+# Now nothing is downloaded and nothing is piped. The copy must hash to
+# HERMES_INSTALL_SH_SHA256 before it runs, so an edited copy fails this step
+# by name. The CI gateway-live-roundtrip job compares the copy with
+# scripts/install.sh at HERMES_COMMIT upstream, so it cannot drift from the
+# pin. Moving HERMES_COMMIT means refreshing the copy and the digest in the
+# same change; vendor/hermes-agent/README.md has the commands.
+#
+# The installer's own network steps are unchanged: it still clones the
+# checkout from github.com (with its own retries) and pins it with --commit,
+# and the rev-parse assertion below still decides whether the pin held.
 ARG HERMES_COMMIT=29112bef099274229cadff79cdff7bf7b99c4b77
+ARG HERMES_INSTALL_SH_SHA256=85ef536d455e51ab67aa74d79272efd49fe717597dbaadfd3cca179a905f4706
+COPY --chown=agent:agent vendor/hermes-agent/install.sh /tmp/hermes-install.sh
 USER agent
 WORKDIR /home/agent
-RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_COMMIT}/scripts/install.sh" \
-      | bash -s -- --skip-setup --commit "${HERMES_COMMIT}" --force-commit
-# Never trust a curl|bash to have honoured a flag: the installer treats an
+RUN set -eu; \
+    echo "${HERMES_INSTALL_SH_SHA256}  /tmp/hermes-install.sh" | sha256sum -c -; \
+    bash /tmp/hermes-install.sh --skip-setup --commit "${HERMES_COMMIT}" --force-commit; \
+    rm -f /tmp/hermes-install.sh
+# Never trust an installer to have honoured a flag: the installer treats an
 # ignored --commit as a WARNING and still exits 0. Assert the checkout is
 # actually at the pin, and fail the build if it is not. This is the whole
 # reproducibility guarantee, so it is checked, not assumed.
