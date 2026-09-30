@@ -978,6 +978,24 @@ jobs:
           pip install -q aiohttp
           pip install -q "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${A2A_REF}#egg=hermes-platform-molecule-a2a"
           pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" "molecules-workspace-runtime==$RUNTIME_VERSION"
+      # The image build runs vendor/hermes-agent/install.sh instead of
+      # downloading it (Dockerfile, above ARG HERMES_COMMIT). The upstream
+      # clone from the previous step is at HERMES_COMMIT, so compare git blob
+      # ids: equal ids mean byte-identical files. A HERMES_COMMIT bump that
+      # does not refresh the vendored copy fails here.
+      - name: Vendored installer is upstream scripts/install.sh at HERMES_COMMIT
+        if: github.event.pull_request.head.repo.fork != true
+        run: |
+          set -euo pipefail
+          HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
+          test -n "$HERMES_COMMIT"
+          UPSTREAM_BLOB="$(git -C /tmp/hermes-src rev-parse "$HERMES_COMMIT:scripts/install.sh")"
+          VENDORED_BLOB="$(git hash-object vendor/hermes-agent/install.sh)"
+          if [ "$UPSTREAM_BLOB" != "$VENDORED_BLOB" ]; then
+            echo "::error::vendor/hermes-agent/install.sh is blob $VENDORED_BLOB, but scripts/install.sh at $HERMES_COMMIT is blob $UPSTREAM_BLOB. Refresh the copy (vendor/hermes-agent/README.md)."
+            exit 1
+          fi
+          echo "vendored installer == upstream scripts/install.sh at $HERMES_COMMIT (blob $VENDORED_BLOB)"
       - name: Run the full-chain round-trip against the pinned gateway
         if: github.event.pull_request.head.repo.fork != true
         run: |
@@ -1113,4 +1131,5 @@ jobs:
           tests/test_cron_approval_mode.py
           tests/test_executor_plugin_path.py
           tests/test_vendor_branding_neutralized.py
+          tests/test_vendored_hermes_installer.py
           -v
