@@ -70,6 +70,12 @@ the checkout. A wheel pin in site-packages is inert — which is what it was
 until 2026-09-03, while the checkout silently tracked whatever upstream `main`
 happened to be on build day.
 
+The upstream installer that clones and pins that checkout is vendored at
+`vendor/hermes-agent/install.sh` (a byte copy of `scripts/install.sh` at
+`HERMES_COMMIT`, checked by sha256 at build time) rather than downloaded, so a
+build does not depend on raw.githubusercontent.com. Moving `HERMES_COMMIT`
+means refreshing that copy; `vendor/hermes-agent/README.md` has the steps.
+
 The pin is currently an **unreleased upstream ref**, taken with owner
 authorisation: PyPI's newest `hermes-agent` is still 0.19.0 (2026-07-20) and
 the context-compaction and unattended-approval fixes the fleet needs exist only

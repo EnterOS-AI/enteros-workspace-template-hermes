@@ -204,6 +204,8 @@ jobs:
               "   entry-point classification, approval semantics, state.db schema.",
               "5. Update `ARG HERMES_COMMIT`, `ARG HERMES_PYPI_FLOOR`, and the",
               "   `gateway-live-roundtrip` install line in `.gitea/workflows/ci.yml`.",
+              "   A new commit also needs a refreshed `vendor/hermes-agent/install.sh`",
+              "   and `ARG HERMES_INSTALL_SH_SHA256` (see `vendor/hermes-agent/README.md`).",
               "",
               "Filed automatically by `.gitea/workflows/upstream-sync.yml`.",
           ])
