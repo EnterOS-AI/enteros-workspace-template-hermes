@@ -84,6 +84,32 @@ async def _stub_llm_server(port: int):
         )
         # Echo with a tag so we can match the trip.
         reply = f"echo[{last_user}]"
+        if body.get("stream"):
+            # hermes asks for stream=true; a plain JSON body is an empty
+            # stream to it (EmptyStreamError), so answer in SSE chunks.
+            resp = web.StreamResponse(
+                status=200, headers={"Content-Type": "text/event-stream"}
+            )
+            await resp.prepare(request)
+            created = int(time.time())
+            model = body.get("model", "test")
+
+            def chunk(delta, finish=None):
+                return {
+                    "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }
+
+            for obj in (
+                chunk({"role": "assistant", "content": ""}),
+                chunk({"content": reply}),
+                chunk({}, "stop"),
+            ):
+                await resp.write(("data: " + json.dumps(obj) + "\n\n").encode())
+            await resp.write(b"data: [DONE]\n\n")
+            await resp.write_eof()
+            return resp
         return web.json_response({
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -122,6 +148,7 @@ def _ctx(text: str, *, task_id: str = "task-fullchain"):
     text_part.kind = "text"
     msg = MagicMock()
     msg.task_id = task_id
+    msg.message = None  # else extract_message_text() returns "" and execute() never dispatches
     msg.parts = [text_part]
     ctx = MagicMock()
     ctx.task_id = task_id
@@ -203,6 +230,7 @@ async def _amain() -> int:
         print(f"OK: hermes plugin /a2a/health responds")
 
         # Stand up the real executor pointing at the real plugin.
+        os.environ["MOLECULE_A2A_PLATFORM_ENABLED"] = "true"
         os.environ["MOLECULE_A2A_PLATFORM_PORT"] = str(plugin_port)
         os.environ["MOLECULE_A2A_CALLBACK_PORT"] = str(cb_port)
         # Stable workspace-scoped chat_id (review wf_3a7b849d #5): without this
@@ -257,6 +285,16 @@ async def _amain() -> int:
         assert len(queue2.events) == 1, (
             "second same-session message dropped through the pinned stack: "
             f"{queue2.events!r}"
+        )
+        def _reply_text(event):
+            return "".join(p.text for p in event.parts if getattr(p, "text", None))
+
+        first, second = _reply_text(queue.events[0]), _reply_text(queue2.events[0])
+        assert "echo[" in first and "hello fullchain" in first, (
+            f"first reply did not come from the stub LLM via the plugin: {first!r}"
+        )
+        assert second == "echo[second message]", (
+            f"second reply did not come from the stub LLM via the plugin: {second!r}"
         )
         print("OK: second same-session message round-tripped through the pinned stack")
         text = repr(queue.events[0])
