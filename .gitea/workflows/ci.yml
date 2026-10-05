@@ -1132,4 +1132,5 @@ jobs:
           tests/test_executor_plugin_path.py
           tests/test_vendor_branding_neutralized.py
           tests/test_vendored_hermes_installer.py
+          tests/test_start_sh_tmpdir.py
           -v

@@ -41,6 +41,12 @@ _OVERFLOW_TEXTS = [
     "Request payload too large (413). Cannot compress further.",
     # Case-insensitivity: the reply is prose, not a stable error code.
     "CONTEXT LENGTH EXCEEDED (205,130 TOKENS). CANNOT COMPRESS FURTHER.",
+    # hermes >= v0.21.4 (f97608f1, agent/turn_failure_copy.py site_copy):
+    "This conversation has grown too long for MiniMax-M2.7 to read, and Hermes couldn't shrink it enough automatically. Start a new session with /new (your history is kept), or try /compress once more. Switching to a model with a bigger context window also works.",
+    "This conversation (including attachments) has grown too large to send to MiniMax-M2.7, and Hermes couldn't shrink it enough automatically. Start a new session with /new (your history is kept), or try /compress once more.",
+    # Gateway auto-reset suffix (gateway/run_turn.py @f97608f1) on a body that
+    # carries none of the other phrases (compression-timeout variant):
+    "Context compression timed out without reducing this conversation. No messages were dropped. Start a fresh session with /new, or check auxiliary.compression before retrying /compress.\n\n\U0001f504 Session auto-reset \u2014 the conversation exceeded the maximum context size and could not be compressed further. Your next message will start a fresh session.",
 ]
 
 # Failures that must NOT be treated as overflow. Resetting on any of these
@@ -77,6 +83,8 @@ _REQUIRED_PHRASES = [
     "context length exceeded",
     "max compression attempts",
     "request payload too large",
+    "couldn't shrink it enough automatically",
+    "exceeded the maximum context size",
 ]
 
 

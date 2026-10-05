@@ -430,13 +430,13 @@ def test_no_product_brand_literal_is_hardcoded():
 # site-packages, so the checkout's SHA — not any wheel version — identifies the
 # code whose constants this patch anchors on.
 #
-# 29112bef = upstream tag v2026.8.31 (pyproject version 0.21.0).
+# f97608f1 = upstream tag v2026.9.24 (pyproject version 0.21.5).
 # Bumping the pin without re-checking the anchors is exactly how this patch
 # would silently become a no-op, so the bump has to come through here. It
 # already earned its keep once: moving off 0.19.0 introduced a THIRD vendor
 # constant (HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS) that the neutralizer did not
 # know about, and rewrote DEFAULT_AGENT_IDENTITY wholesale.
-VERIFIED_HERMES_COMMIT = "29112bef099274229cadff79cdff7bf7b99c4b77"
+VERIFIED_HERMES_COMMIT = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
 
 
 def test_upstream_pin_matches_the_commit_this_patch_was_verified_against():
