@@ -220,6 +220,14 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     "context length exceeded",          # agent.conversation_loop terminal branch
     "max compression attempts",         # compression-attempt ceiling branch
     "request payload too large",        # the 413 sibling of the same dead end
+    # hermes >= v0.21.4 (upstream 23036e20a6) replaced the four literals above
+    # with plain-language copy (agent/turn_failure_copy.py site_copy
+    # 'context_overflow' / 'payload_too_large'); the old phrases now reach only
+    # logs. Keep both generations.
+    "couldn't shrink it enough automatically",  # site_copy context_overflow + payload_too_large
+    # Suffix the gateway appends to EVERY compression_exhausted reply when it
+    # auto-resets the session (gateway/run_turn.py; same text at 29112bef).
+    "exceeded the maximum context size",
 )
 
 

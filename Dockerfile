@@ -220,8 +220,8 @@ RUN chmod +x /usr/local/bin/molecule-askpass
 # The installer's own network steps are unchanged: it still clones the
 # checkout from github.com (with its own retries) and pins it with --commit,
 # and the rev-parse assertion below still decides whether the pin held.
-ARG HERMES_COMMIT=29112bef099274229cadff79cdff7bf7b99c4b77
-ARG HERMES_INSTALL_SH_SHA256=85ef536d455e51ab67aa74d79272efd49fe717597dbaadfd3cca179a905f4706
+ARG HERMES_COMMIT=f97608f178d1ffeca59860195ab7da295f7c8e5f
+ARG HERMES_INSTALL_SH_SHA256=2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af
 COPY --chown=agent:agent vendor/hermes-agent/install.sh /tmp/hermes-install.sh
 USER agent
 WORKDIR /home/agent
@@ -272,7 +272,7 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # is an UNRELEASED third-party ref, taken with owner authorisation. The
 # upstream-sync workflow compares PyPI's latest against this floor and files
 # the "you can go back to a published release now" PR when one appears.
-ARG HERMES_PYPI_FLOOR=0.21.0
+ARG HERMES_PYPI_FLOOR=0.21.5
 ARG HERMES_PLATFORM_MOLECULE_A2A_REF=93d43d772470eb3ddc781858dc5629f3464eed99
 # The hermes installer uses uv to create the venv and doesn't seed pip
 # into it. Bootstrap pip first via ensurepip, then install the plugin.

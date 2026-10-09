@@ -164,6 +164,14 @@ HERMES_HOME="/tmp/.hermes"
 install -d -o agent -g agent /configs/.hermes
 rm -rf /tmp/.hermes 2>/dev/null || true
 ln -sfn /configs/.hermes /tmp/.hermes
+# hermes at f97608f1 (absent at 29112bef) points TMPDIR/TMP/TEMP at
+# $HERMES_HOME/cache/scratch on import unless one of them is already set
+# (hermes_constants.apply_scratch_tmp_env). $HERMES_HOME is the symlink onto
+# the persisted /configs volume made just above, so without this every
+# tempfile of the gateway, its MCP servers and the agent's commands would land
+# on the identity volume next to state.db and .auth_token. Every launch below
+# inherits it (gosu and `env HOME=/tmp ...` keep the environment).
+export TMPDIR="${TMPDIR:-/tmp}"
 # A container (re)start is ALWAYS a platform-orchestrated restart from the
 # gateway's point of view (docker stop/recreate — plugin installs, admin
 # restarts, host reboots), never a hermes-internal crash. Upstream's marker
