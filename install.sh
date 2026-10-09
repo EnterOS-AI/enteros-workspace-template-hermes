@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# install.sh — set up hermes-agent on a bare-host workspace (EC2 /
-# bare-metal / any OS-level install). Runs as the workspace's runtime
-# user (typically `ubuntu` on EC2) AFTER molecule-ai-workspace-runtime
-# has been pip-installed and this repo's *.py adapter files have been
-# copied into site-packages, BEFORE molecule-runtime is started.
+# install.sh — legacy setup for an explicitly self-managed bare host.
+# It runs as the workspace's runtime user after
+# molecule-ai-workspace-runtime and this repo's adapter files have been
+# installed, before molecule-runtime starts.
 #
-# This is the symmetric twin of start.sh. start.sh is the entrypoint
-# of the Docker image used for local dev (`docker compose up`).
-# install.sh is what the SaaS EC2 provisioner calls on the host.
+# Hosted workspaces use the published image and start.sh; the hosted
+# control plane does not call this script. Keep it only for self-managed
+# installations that deliberately select the bare-host path.
 #
 # Both do the same high-level work:
 #   1. Install the real hermes-agent from NousResearch/hermes-agent
@@ -15,12 +14,6 @@
 #   3. Seed ~/.hermes/config.yaml (default model + provider)
 #   4. Start `hermes gateway` in the background
 #   5. Wait until :8642 /health returns 200
-#
-# Architectural context: each workspace template ships both recipes
-# because the control plane picks different code paths depending on
-# backend. See internal/product/designs/workspace-backends.md for the
-# manifest-driven backend-selection design that subsumes this dual
-# setup.
 #
 # Idempotent: safe to re-run. Kills any prior gateway process for
 # this user before starting a fresh one.
@@ -36,12 +29,30 @@ echo "[install.sh] hermes bare-host setup starting (user=$USER, home=$HOME)"
 
 # --- System deps (idempotent) ---
 # hermes-agent installer pulls a Node 22 .tar.xz and builds some
-# Python deps from source. Ubuntu EC2 AMI ships without xz or gcc.
+# Python deps from source. Minimal Ubuntu hosts may omit xz or gcc.
 if ! command -v xz >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
   echo "[install.sh] installing system deps (xz-utils + build-essential)..."
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
     curl ca-certificates git xz-utils build-essential
+fi
+
+# --- GitHub CLI (issue #371) ---
+# Runtime dependency, not a convenience: the seo-agent workspace class
+# ships via `gh pr create` / `gh pr merge` and authenticates with
+# `gh auth token`. Kept in step with the Dockerfile so the bare-host
+# path and the image agree — a workspace that works in one and not the
+# other is the drift this guards against. Idempotent: skipped when gh
+# is already on PATH.
+if ! command -v gh >/dev/null 2>&1; then
+  echo "[install.sh] installing GitHub CLI (gh)..."
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | sudo tee /usr/share/keyrings/githubcli-archive-keyring.gpg >/dev/null
+  sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gh
 fi
 
 # --- Install hermes-agent (only if not already present) ---
@@ -58,14 +69,39 @@ export PATH="$HOME/.local/bin:$PATH"
 # --- Ensure hermes home exists ---
 mkdir -p "$HERMES_HOME"
 
-# --- Generate API_SERVER_KEY if not already set in env ---
+# --- Resolve API_SERVER_KEY (persisted key wins on reruns) ---
 # hermes-agent requires a bearer for the api-server platform. The
 # molecule_runtime adapter (executor.py) reads this same var at
-# request time to auth against the gateway.
+# request time to auth against the gateway. Once a durable .env exists,
+# keep that key authoritative: an idempotent install must not rotate a
+# serving gateway across three files via non-atomic writes.
+reused_persisted_api_server_key=0
+if [ -r "$HERMES_HOME/.env" ]; then
+  persisted_api_server_key=""
+  while IFS= read -r env_line; do
+    case "$env_line" in
+      API_SERVER_KEY=*) persisted_api_server_key="${env_line#API_SERVER_KEY=}" ;;
+    esac
+  done <"$HERMES_HOME/.env"
+  if [ -n "$persisted_api_server_key" ]; then
+    API_SERVER_KEY="$persisted_api_server_key"
+    export API_SERVER_KEY
+    reused_persisted_api_server_key=1
+  fi
+  unset persisted_api_server_key env_line
+fi
 if [ -z "${API_SERVER_KEY:-}" ]; then
   API_SERVER_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 40)"
   export API_SERVER_KEY
 fi
+if [[ ! "$API_SERVER_KEY" =~ ^[-A-Za-z0-9._~]{32,128}$ ]]; then
+  echo "[install.sh] invalid API_SERVER_KEY: expected 32-128 URL-safe characters" >&2
+  exit 1
+fi
+if [ "$reused_persisted_api_server_key" = "1" ]; then
+  echo "[install.sh] reusing existing gateway API key"
+fi
+unset reused_persisted_api_server_key
 
 # --- FIX #12: export API_SERVER_KEY into /etc/environment so ---
 # --- molecule-runtime (started by user-data sudo before this   ---
@@ -82,33 +118,87 @@ fi
 #   1. /etc/environment for the systemd-launched runtime (no shell)
 #   2. /etc/profile.d/ for any future sudo -i or login shell
 #
-# The runtime is already running at this point (started by
-# user-data). We signal a restart at the end of install.sh so it
-# re-reads the env.
-if [ -w /etc/environment ] || sudo test -w /etc/environment 2>/dev/null; then
-  # Remove any prior entry (idempotent) then append fresh.
-  sudo sed -i '/^API_SERVER_KEY=/d' /etc/environment
-  echo "API_SERVER_KEY=${API_SERVER_KEY}" | sudo tee -a /etc/environment >/dev/null
-fi
-sudo tee /etc/profile.d/hermes-api-key.sh >/dev/null <<EOF
-# Generated by template-hermes install.sh. Makes API_SERVER_KEY
-# available to sudo/login shells so molecule-runtime (which reads
-# os.environ) can auth against the local hermes gateway.
-export API_SERVER_KEY="${API_SERVER_KEY}"
-EOF
-sudo chmod 644 /etc/profile.d/hermes-api-key.sh
-echo "[install.sh] exported API_SERVER_KEY to /etc/environment + /etc/profile.d/"
+# The runtime is already running at this point (started by user-data). We
+# signal a restart at the end of install.sh so it re-reads the env. Durable
+# writes are deferred until platform routing has passed its fail-closed checks.
+persist_gateway_api_key() {
+  if sudo sh -c '
+    key=$1
+    [ -f /etc/environment ] && [ ! -L /etc/environment ] &&
+      [ "$(stat -c "%u:%g:%a" /etc/environment 2>/dev/null || true)" = "0:0:644" ] || exit 1
+    [ -f /etc/profile.d/hermes-api-key.sh ] && [ ! -L /etc/profile.d/hermes-api-key.sh ] &&
+      [ "$(stat -c "%u:%g:%a" /etc/profile.d/hermes-api-key.sh 2>/dev/null || true)" = "0:0:644" ] || exit 1
+    env_total=$(grep -c "^API_SERVER_KEY=" /etc/environment 2>/dev/null || true)
+    env_exact=$(grep -Fxc "API_SERVER_KEY=$key" /etc/environment 2>/dev/null || true)
+    profile_total=$(grep -c "^export API_SERVER_KEY=" /etc/profile.d/hermes-api-key.sh 2>/dev/null || true)
+    profile_exact=$(grep -Fxc "export API_SERVER_KEY=\"$key\"" /etc/profile.d/hermes-api-key.sh 2>/dev/null || true)
+    [ "${env_total:-0}" -eq 1 ] && [ "${env_exact:-0}" -eq 1 ] &&
+      [ "${profile_total:-0}" -eq 1 ] && [ "${profile_exact:-0}" -eq 1 ]
+  ' sh "$API_SERVER_KEY"; then
+    echo "[install.sh] gateway API key already synchronized"
+    return 0
+  fi
+
+  sudo sh -c '
+    set -eu
+    key=$1
+    env_file=/etc/environment
+    profile_file=/etc/profile.d/hermes-api-key.sh
+    env_tmp=""
+    profile_tmp=""
+    cleanup() {
+      [ -z "$env_tmp" ] || rm -f "$env_tmp"
+      [ -z "$profile_tmp" ] || rm -f "$profile_tmp"
+    }
+    trap cleanup 0
+
+    for path in "$env_file" "$profile_file"; do
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        if [ ! -f "$path" ] || [ -L "$path" ]; then
+          echo "[install.sh] refusing non-regular gateway key destination: $path" >&2
+          exit 1
+        fi
+      fi
+    done
+
+    env_tmp=$(mktemp /etc/.molecule-environment.XXXXXX)
+    profile_tmp=$(mktemp /etc/profile.d/.hermes-api-key.XXXXXX)
+    if [ -f "$env_file" ]; then
+      sed "/^API_SERVER_KEY=/d" "$env_file" >"$env_tmp"
+    fi
+    printf "API_SERVER_KEY=%s\\n" "$key" >>"$env_tmp"
+    {
+      printf "%s\\n" \
+        "# Generated by template-hermes install.sh. Makes API_SERVER_KEY" \
+        "# available to sudo/login shells so molecule-runtime (which reads" \
+        "# os.environ) can auth against the local hermes gateway."
+      printf "export API_SERVER_KEY=\"%s\"\\n" "$key"
+    } >"$profile_tmp"
+    chown 0:0 "$env_tmp" "$profile_tmp"
+    chmod 0644 "$env_tmp" "$profile_tmp"
+    mv -f "$env_tmp" "$env_file"
+    env_tmp=""
+    mv -f "$profile_tmp" "$profile_file"
+    profile_tmp=""
+    trap - 0
+  ' sh "$API_SERVER_KEY"
+  echo "[install.sh] exported API_SERVER_KEY to /etc/environment + /etc/profile.d/"
+}
 
 # --- Write hermes-agent .env ---
 # Every provider key the workspace's process env carries is forwarded.
-# CP's provisioner injects these from Secrets Manager + the per-tenant
-# shared secret bundle before this script runs.
-cat >"$HERMES_HOME/.env" <<EOF
+# The caller must provide these through the workspace/platform secret
+# surfaces before this script runs.
+ENV_FILE="$HERMES_HOME/.env"
+ENV_FILE_TMP="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+trap 'if [ -n "${ENV_FILE_TMP:-}" ]; then rm -f "${ENV_FILE_TMP}"; fi' EXIT
+
+cat >"$ENV_FILE_TMP" <<EOF
 API_SERVER_ENABLED=true
 API_SERVER_KEY=${API_SERVER_KEY}
 API_SERVER_HOST=${API_SERVER_HOST}
 API_SERVER_PORT=${API_SERVER_PORT}
-${HERMES_INFERENCE_PROVIDER:+HERMES_INFERENCE_PROVIDER=${HERMES_INFERENCE_PROVIDER}}
+# Provider selection is appended after platform-routing translation below.
 ${HERMES_AUXILIARY_PROVIDER:+HERMES_AUXILIARY_PROVIDER=${HERMES_AUXILIARY_PROVIDER}}
 ${HERMES_API_KEY:+HERMES_API_KEY=${HERMES_API_KEY}}
 ${NOUS_API_KEY:+NOUS_API_KEY=${NOUS_API_KEY}}
@@ -136,7 +226,7 @@ ${OPENCODE_GO_API_KEY:+OPENCODE_GO_API_KEY=${OPENCODE_GO_API_KEY}}
 ${COPILOT_GITHUB_TOKEN:+COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN}}
 ${GH_TOKEN:+GH_TOKEN=${GH_TOKEN}}
 EOF
-chmod 600 "$HERMES_HOME/.env"
+chmod 600 "$ENV_FILE_TMP"
 
 # --- Write hermes-agent config.yaml ---
 # Unconditional overwrite — the hermes installer drops its
@@ -175,6 +265,23 @@ if [ -f "$(dirname "$0")/scripts/derive-platform-llm.sh" ]; then
   }
 fi
 
+# Hermes reloads this file with override=True before every request. Persist the
+# translated value only after derive-platform-llm.sh has mapped the Molecule
+# `platform` arm to Hermes's native `custom` provider.
+if [ -n "${HERMES_INFERENCE_PROVIDER:-}" ]; then
+  printf 'HERMES_INFERENCE_PROVIDER=%s\n' "${HERMES_INFERENCE_PROVIDER}" >>"$ENV_FILE_TMP"
+fi
+
+# Commit the gateway bearer to the system stores only after platform routing
+# validation succeeds. A failed explicit key rotation therefore changes no
+# durable auth state.
+persist_gateway_api_key
+
+# Keep the last known-good durable env intact when platform validation fails or
+# install.sh is interrupted. The sibling temp file makes replacement atomic.
+mv -f "$ENV_FILE_TMP" "$ENV_FILE"
+ENV_FILE_TMP=""
+
 # --- OpenAI bridge: PROVIDER=custom + chat_completions api_mode ---
 #
 # hermes-agent does NOT have a native "openai" provider in its registry
@@ -210,6 +317,15 @@ if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERME
   export HERMES_CUSTOM_API_KEY="${OPENAI_API_KEY}"
   export HERMES_CUSTOM_API_MODE="chat_completions"
   echo "[install.sh] bridged OPENAI_API_KEY -> custom provider @ ${HERMES_CUSTOM_BASE_URL} (api_mode=chat_completions)"
+fi
+
+# --- MiniMax bridge (SSOT: scripts/derive-minimax-bridge.sh) ---
+# Sourced, not inlined, so install.sh and start.sh cannot drift.
+MINIMAX_BRIDGE_SCRIPT="$(dirname "$0")/scripts/derive-minimax-bridge.sh"
+[ -f "$MINIMAX_BRIDGE_SCRIPT" ] || MINIMAX_BRIDGE_SCRIPT="/app/scripts/derive-minimax-bridge.sh"
+if [ -f "$MINIMAX_BRIDGE_SCRIPT" ]; then
+  # shellcheck source=scripts/derive-minimax-bridge.sh
+  MOLECULE_BRIDGE_CALLER=install.sh . "$MINIMAX_BRIDGE_SCRIPT"
 fi
 
 # Defense-in-depth: when the resolved provider is platform (derive-platform-llm.sh

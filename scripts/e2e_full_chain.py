@@ -84,6 +84,32 @@ async def _stub_llm_server(port: int):
         )
         # Echo with a tag so we can match the trip.
         reply = f"echo[{last_user}]"
+        if body.get("stream"):
+            # hermes asks for stream=true; a plain JSON body is an empty
+            # stream to it (EmptyStreamError), so answer in SSE chunks.
+            resp = web.StreamResponse(
+                status=200, headers={"Content-Type": "text/event-stream"}
+            )
+            await resp.prepare(request)
+            created = int(time.time())
+            model = body.get("model", "test")
+
+            def chunk(delta, finish=None):
+                return {
+                    "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }
+
+            for obj in (
+                chunk({"role": "assistant", "content": ""}),
+                chunk({"content": reply}),
+                chunk({}, "stop"),
+            ):
+                await resp.write(("data: " + json.dumps(obj) + "\n\n").encode())
+            await resp.write(b"data: [DONE]\n\n")
+            await resp.write_eof()
+            return resp
         return web.json_response({
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -122,6 +148,7 @@ def _ctx(text: str, *, task_id: str = "task-fullchain"):
     text_part.kind = "text"
     msg = MagicMock()
     msg.task_id = task_id
+    msg.message = None  # else extract_message_text() returns "" and execute() never dispatches
     msg.parts = [text_part]
     ctx = MagicMock()
     ctx.task_id = task_id
@@ -164,6 +191,14 @@ async def _amain() -> int:
         f"  base_url: \"http://127.0.0.1:{llm_port}/v1\"\n"
         "  api_key: \"sk-stub-fullchain\"\n"
         "  api_mode: \"chat_completions\"\n"
+        # hermes >= 0.19: entry-point plugins are OPT-IN via
+        # plugins.enabled; without it the molecule_a2a plugin silently
+        # never loads and /a2a/health below fails — which is exactly the
+        # first 2026-07-23 boot hang this harness now guards (start.sh
+        # emits the same block).
+        "plugins:\n"
+        "  enabled:\n"
+        "    - molecule_a2a\n"
         "platforms:\n"
         "  molecule-a2a:\n"
         "    enabled: true\n"
@@ -195,8 +230,14 @@ async def _amain() -> int:
         print(f"OK: hermes plugin /a2a/health responds")
 
         # Stand up the real executor pointing at the real plugin.
+        os.environ["MOLECULE_A2A_PLATFORM_ENABLED"] = "true"
         os.environ["MOLECULE_A2A_PLATFORM_PORT"] = str(plugin_port)
         os.environ["MOLECULE_A2A_CALLBACK_PORT"] = str(cb_port)
+        # Stable workspace-scoped chat_id (review wf_3a7b849d #5): without this
+        # executor._derive_chat_id falls through to str() of each context's
+        # auto-vivified MagicMock, so the second message would land in a
+        # DIFFERENT session and the "same-session" claim below would be vacuous.
+        os.environ["WORKSPACE_ID"] = "ws-e2e-fullchain"
 
         from executor import HermesAgentProxyExecutor
         from molecule_runtime.adapters.base import AdapterConfig
@@ -217,6 +258,45 @@ async def _amain() -> int:
         assert len(queue.events) == 1, (
             f"expected 1 event, got {len(queue.events)}: {queue.events!r}"
         )
+
+        # SECOND message on the SAME (now-existing) session. With WORKSPACE_ID
+        # set above, this reuses the workspace-scoped session key rather than
+        # minting a fresh one, so it exercises the existing-session dispatch
+        # path through the pinned stack — catching plumbing regressions
+        # (plugins.enabled opt-in, the connect() ABI, callback wiring) on a
+        # non-cold session.
+        #
+        # HONESTY NOTE (review wf_3a7b849d #5): this does NOT deterministically
+        # exercise hermes's BUSY-path authz gate (_handle_active_session_busy_
+        # message), which only fires while a turn is IN FLIGHT — the stub echo
+        # LLM completes in milliseconds, so forcing that race reliably is not
+        # possible here without a flaky timing hack. The actual contract we own
+        # for the 2026-07-23 active-session drop — the adapter DECLARING
+        # authorization_is_upstream — is pinned deterministically by the plugin
+        # repo's test_authorization_is_upstream. This round-trip is the
+        # same-session delivery guard; that test is the authz-flag guard.
+        queue2 = _CapturingQueue()
+        await asyncio.wait_for(
+            executor.execute(
+                _ctx("second message", task_id="task-fullchain-2"), queue2
+            ),
+            timeout=60,
+        )
+        assert len(queue2.events) == 1, (
+            "second same-session message dropped through the pinned stack: "
+            f"{queue2.events!r}"
+        )
+        def _reply_text(event):
+            return "".join(p.text for p in event.parts if getattr(p, "text", None))
+
+        first, second = _reply_text(queue.events[0]), _reply_text(queue2.events[0])
+        assert "echo[" in first and "hello fullchain" in first, (
+            f"first reply did not come from the stub LLM via the plugin: {first!r}"
+        )
+        assert second == "echo[second message]", (
+            f"second reply did not come from the stub LLM via the plugin: {second!r}"
+        )
+        print("OK: second same-session message round-tripped through the pinned stack")
         text = repr(queue.events[0])
         # Our stub echoes "echo[<user>]" — the user message is the
         # prompt the executor forwarded. The hermes pipeline may

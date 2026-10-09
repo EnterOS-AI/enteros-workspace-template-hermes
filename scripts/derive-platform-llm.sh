@@ -31,8 +31,9 @@
 #           $MOLECULE_LLM_BASE_URL / $OPENAI_BASE_URL   platform OpenAI-compat base
 #           $MOLECULE_LLM_USAGE_TOKEN / $ANTHROPIC_API_KEY   platform bearer token
 #           $DEFAULT_MODEL                   selected model id (e.g. moonshot/kimi-k2.6)
-#   Writes: $PROVIDER=custom, exports MOLECULE_PLATFORM_LLM_ACTIVE=1 plus
-#           HERMES_CUSTOM_BASE_URL / HERMES_CUSTOM_API_KEY /
+#   Writes: $PROVIDER=custom, exports HERMES_INFERENCE_PROVIDER=custom,
+#           MOLECULE_PLATFORM_LLM_ACTIVE=1 plus HERMES_CUSTOM_BASE_URL /
+#           HERMES_CUSTOM_API_KEY /
 #           HERMES_CUSTOM_API_MODE=chat_completions, and strips a leading
 #           "platform/" from $DEFAULT_MODEL.
 #   On error (provider==platform but no base URL): sets PLATFORM_LLM_ERROR=1
@@ -89,6 +90,10 @@ fi
 # billing-mode env.
 export MOLECULE_PLATFORM_LLM_ACTIVE=1
 PROVIDER="custom"
+# The gateway passes this env var as an explicit provider on every request,
+# ahead of config.yaml. Leaving the platform arm name here bypasses the custom
+# proxy config and fails with "Unknown provider 'platform'".
+export HERMES_INFERENCE_PROVIDER="custom"
 export HERMES_CUSTOM_BASE_URL="${_PLATFORM_BASE}"
 export HERMES_CUSTOM_API_KEY="${_PLATFORM_TOKEN}"
 # chat_completions (NOT codex_responses) — the platform proxy exposes

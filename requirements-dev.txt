@@ -9,10 +9,10 @@
 
 pytest>=8
 pytest-asyncio>=0.23
+packaging>=23
 
 # ADR-004 §4 adapter-socket conformance suite lives in the SDK
 # (molecule_plugin.adapter_conformance); tests/test_conformance.py inherits it.
-# CI already installs this from git main in the validate-static job; pinned here
-# so a local `pip install -r requirements-dev.txt` can run the conformance test.
-# NOT public PyPI — the private Gitea registry index is set in requirements.txt.
-molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@main
+# Pin the reviewed SDK contract commit so adapter conformance cannot drift when
+# SDK main advances. NOT public PyPI; this is a content-addressed Gitea source.
+molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586

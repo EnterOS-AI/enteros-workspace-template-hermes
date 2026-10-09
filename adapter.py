@@ -200,6 +200,23 @@ class HermesAgentAdapter(BaseAdapter):
 
         import httpx
 
+        # PREPARE MODE (core#4587): `molecule-runtime-prepare` runs this
+        # setup() BEFORE start.sh launches the hermes gateway, so the gateway
+        # reads a COMPLETE mcp_servers config (just written by
+        # install_plugins_via_registry above) on its FIRST boot — eliminating
+        # the ~90s post-launch gateway RESTART that hermes >= 0.19's eager MCP
+        # discovery otherwise required. The gateway is INTENTIONALLY not up
+        # yet, so the /a2a/health reachability probe below is inapplicable —
+        # it would ALWAYS fail here. Skip it and return: the config is already
+        # materialized. The real `molecule-runtime` serve (which start.sh
+        # exec's AFTER the gateway is up) runs setup() again and DOES probe, so
+        # the "surface reachable" contract still holds for the serving path.
+        # start.sh sets this env ONLY on the prepare invocation, never on the
+        # real serve. (Mirrors the MOLECULE_SMOKE_MODE skip above, but AFTER
+        # the plugin pipeline — prepare's whole purpose is to run it.)
+        if os.environ.get("MOLECULE_RUNTIME_PREPARE_ONLY") == "1":
+            return
+
         # Default off — see executor.py module docstring. Workspace boot
         # was wedging on the plugin /a2a/health probe because the plugin
         # didn't bind :8645 inside the deployed image. Falls back to the
@@ -213,7 +230,7 @@ class HermesAgentAdapter(BaseAdapter):
             port = int(os.environ.get("MOLECULE_A2A_PLATFORM_PORT", "8645"))
             health_url = f"http://{host}:{port}/a2a/health"
             err_hint = (
-                "Check /var/log/hermes-gateway.log inside the container — "
+                "Check the workspace logs for the Hermes gateway — "
                 "the molecule-a2a platform stanza in ~/.hermes/config.yaml "
                 "should make hermes load the plugin and bind this port."
             )
@@ -222,7 +239,7 @@ class HermesAgentAdapter(BaseAdapter):
                 "HERMES_API_BASE", "http://127.0.0.1:8642/v1"
             ).rstrip("/")
             health_url = base.replace("/v1", "") + "/health"
-            err_hint = "Check /var/log/hermes-gateway.log inside the container."
+            err_hint = "Check the workspace logs for the Hermes gateway."
 
         # AsyncClient — sync httpx inside an async setup() can deadlock
         # against an aiohttp server sharing the same event loop (only
@@ -288,9 +305,14 @@ class HermesAgentAdapter(BaseAdapter):
         self, config: AdapterConfig, name: str, spec: dict
     ) -> None:
         """ADR-004 socket — additively merge ``name -> spec`` into hermes' native
-        ``~/.hermes/config.yaml`` ``mcp_servers`` map. Idempotent; preserves the
-        rest of the file (the ``model`` block, the a2a ``molecule`` url sidecar,
-        any other server or hand-written key).
+        ``~/.hermes/config.yaml`` ``mcp_servers`` map. Idempotent at the FILE
+        level (RFC rule 5): a call that would not change the parsed ``mcp_servers``
+        mapping returns WITHOUT rewriting the file, so a semantically-unchanged
+        register is a true no-op and never churns bytes the gateway
+        config-watcher would md5-diff into a spurious restart (which kills the
+        in-flight concierge greeting). Preserves the rest of the file (the
+        ``model`` block, the a2a ``molecule`` url sidecar, any other server or
+        hand-written key).
 
         FAITHFUL copy of the engine's ``render_hermes_config`` — writes the stdio
         descriptor (``{command, args?, env?}``) verbatim under
@@ -329,6 +351,20 @@ class HermesAgentAdapter(BaseAdapter):
         servers = data.get(self._HERMES_MCP_KEY)
         if not isinstance(servers, dict):
             servers = {}
+
+        # Idempotency guard (RFC rule 5): if this exact ``name -> spec`` is
+        # ALREADY materialized, the re-serialize below would be a SEMANTIC
+        # no-op that only churns bytes — ``yaml.safe_dump`` re-quoting a
+        # heredoc-seeded url, reordering keys, normalizing whitespace. The
+        # gateway's config watcher md5-compares ``mcp_servers`` and restarts
+        # on any byte delta, so a spurious rewrite here costs a ~gateway
+        # restart that kills the in-flight concierge greeting. Return WITHOUT
+        # writing when nothing actually changed; write only on a genuine
+        # add / spec-change. (``==`` on the parsed dicts is a structural
+        # compare — yaml formatting and key order are irrelevant.)
+        if servers.get(name) == spec:
+            return
+
         servers[name] = spec
         data[self._HERMES_MCP_KEY] = servers
 

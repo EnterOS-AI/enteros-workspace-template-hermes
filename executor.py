@@ -129,6 +129,20 @@ SECRET_HEADER = "X-Molecule-A2A-Secret"
 # hermes daemon from wedging the A2A queue forever.
 _PLUGIN_REPLY_TIMEOUT = 600.0
 
+# Inbound `metadata.source_type` values that mean "this delivery is an
+# autonomous self-turn, not a human talking". The scheduler plugin stamps
+# `self-scheduler` (its TRIGGER_DEFAULT_SOURCE_TYPE) on every trigger turn.
+#
+# This is an ALLOW-LIST, not a passthrough, and that is the security-relevant
+# part: `context.message.metadata` is peer-supplied on the A2A path, so a peer
+# workspace can put anything in it. Forwarding arbitrary strings would let a
+# peer claim its message is unattended and, once the receiving end honours the
+# marker, skip the human approval a peer message is supposed to require. Only
+# markers we recognise cross the boundary; everything else — including a
+# missing, malformed, or unknown value — resolves to "" and takes the existing
+# interactive path unchanged.
+_SCHEDULED_SOURCE_TYPES = frozenset({"self-scheduler"})
+
 
 def _record_tool_activity() -> None:
     """Tier-C turn-lease liveness ping on each tool call (RC #203, template side).
@@ -168,6 +182,140 @@ def _bool_env(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+
+_SESSIONS_DIR = os.path.join("/tmp/.hermes", "sessions")
+_TOOL_TRACE_MAX_STEPS = 40
+_TOOL_TRACE_INPUT_MAX = 200
+
+# --- Context-overflow auto-heal (issue #370) -------------------------------
+# When a hermes session grows past the model's context window and compaction
+# cannot shrink it further, the turn returns one of the strings below and the
+# session stays on disk. Every later turn resumes the same oversized
+# transcript and dies identically — the workspace is dead until someone
+# clears the session by hand.
+#
+# hermes DOES ship its own remedy: gateway/run.py `_handle_message_with_agent`
+# skips transcript persistence on a context-overflow failure and calls
+# `reset_session()` (upstream #9893/#10063/#35809). Measured on the live
+# molecule-a2a lane, that path does not fire: workspace 90139d37 logged 50
+# "Cannot compress further" turns between 2026-08-12 and 08-13 while its
+# state.db recorded only 2 sessions with end_reason='session_reset', BOTH of
+# them operator-typed /new. The session opened 12:33Z was still current at
+# 20:30Z with its token count climbing ~1.7k per failed tick. So the heal
+# below is OUR lane's, and it does not assume upstream's ever runs.
+#
+# The reset itself is delegated to hermes's own /new command rather than
+# reaching into its storage: /new evicts the cached agent, tears down tool
+# resources, interrupts in-flight delegations and rotates the session in one
+# supported operation. `state.db` — not the .jsonl snapshots this module
+# reads for tool traces — is the canonical transcript store, so deleting
+# files here would heal nothing.
+#
+# Patterns are deliberately NARROW: each is a multi-word phrase hermes emits
+# on a genuine overflow. A bare "token"/"exceeded" would also match rate-limit
+# and auth errors, and discarding a healthy session on a 429 would lose real
+# conversation history.
+_CONTEXT_OVERFLOW_PATTERNS = (
+    "cannot compress further",          # "…(182,430 tokens). Cannot compress further."
+    "context length exceeded",          # agent.conversation_loop terminal branch
+    "max compression attempts",         # compression-attempt ceiling branch
+    "request payload too large",        # the 413 sibling of the same dead end
+)
+
+
+def _is_context_overflow(text: str | None) -> bool:
+    """True when a hermes reply is the terminal context-overflow failure.
+
+    Matched case-insensitively against the reply text, which is all the
+    plugin callback delivers (`/a2a/reply` carries `content`, not the
+    gateway's structured `compression_exhausted` flag).
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(p in lowered for p in _CONTEXT_OVERFLOW_PATTERNS)
+
+
+def _session_jsonl_snapshot() -> dict[str, int]:
+    """Byte-offset snapshot of every session .jsonl file, taken BEFORE a turn
+    dispatches. The gateway owns session state; the executor only ever READS
+    the delta after the reply arrives, so tool calls made during the turn can
+    be surfaced as the canvas tool_trace chain (parity with claude-code)."""
+    sizes: dict[str, int] = {}
+    try:
+        for name in os.listdir(_SESSIONS_DIR):
+            if not name.endswith(".jsonl"):
+                continue
+            p = os.path.join(_SESSIONS_DIR, name)
+            try:
+                sizes[p] = os.path.getsize(p)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return sizes
+
+
+def _tool_trace_from_session_delta(before: dict[str, int]) -> list[dict[str, str]]:
+    """Parse assistant tool_calls out of the session-file bytes written since
+    ``before`` and map them to the platform tool_trace shape
+    ([{"tool": name, "input": truncated-args}]). Best-effort: any parse
+    problem yields a shorter (or empty) trace, never an exception."""
+    trace: list[dict[str, str]] = []
+    try:
+        for name in os.listdir(_SESSIONS_DIR):
+            if not name.endswith(".jsonl"):
+                continue
+            p = os.path.join(_SESSIONS_DIR, name)
+            start = before.get(p, 0)
+            try:
+                if os.path.getsize(p) <= start:
+                    continue
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(start)
+                    delta = fh.read()
+            except OSError:
+                continue
+            for line in delta.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("role") != "assistant":
+                    continue
+                for tc in rec.get("tool_calls") or []:
+                    fn = (tc or {}).get("function") or {}
+                    tool = str(fn.get("name") or "").strip()
+                    if not tool:
+                        continue
+                    args = fn.get("arguments")
+                    entry: dict[str, str] = {"tool": tool}
+                    if args:
+                        entry["input"] = str(args)[:_TOOL_TRACE_INPUT_MAX]
+                    trace.append(entry)
+                    if len(trace) >= _TOOL_TRACE_MAX_STEPS:
+                        return trace
+    except Exception:  # noqa: BLE001 — presentation only, never break a reply
+        return trace
+    return trace
+
+
+def _reply_message_with_tool_trace(text: str, trace: list[dict[str, str]]):
+    """new_text_message + metadata.tool_trace when the turn used tools. The
+    platform extracts result.metadata.tool_trace from the serialized reply
+    (a2a_proxy_helpers.extractToolTrace) and the canvas renders the chain."""
+    msg = new_text_message(text)
+    if trace:
+        try:
+            msg.metadata.update({"tool_trace": trace})
+        except Exception:  # noqa: BLE001 — metadata is optional decoration
+            pass
+    return msg
+
+
 class HermesAgentProxyExecutor(AgentExecutor):
     """Forwards every A2A turn to hermes-agent."""
 
@@ -200,6 +348,17 @@ class HermesAgentProxyExecutor(AgentExecutor):
         )
 
         self._pending: Dict[str, asyncio.Future] = {}
+        # (message_id, sha256(content)) -> monotonic ts of delivery. Lets
+        # _handle_reply tell a RETRY duplicate (same id, same content —
+        # drop) from a genuinely new late reply (same id, new content —
+        # relay via /notify). See _handle_reply's orphan branch.
+        self._delivered: Dict[tuple, float] = {}
+        # message_id -> ("user"|"peer", monotonic ts). Recorded at execute()
+        # registration so the orphan branch knows the turn's ORIGIN: only
+        # human canvas turns may relay to /notify — a late reply to a
+        # PEER-delegated turn on the user's canvas is an out-of-context
+        # bubble addressed to another agent (review wf_7cb5003d #5).
+        self._origin: Dict[str, tuple] = {}
         self._reply_runner: Optional["web.AppRunner"] = None
         self._reply_site: Optional["web.TCPSite"] = None
         self._started: bool = False
@@ -340,16 +499,154 @@ class HermesAgentProxyExecutor(AgentExecutor):
         prompt: str,
         history: list[dict[str, Any]] | None = None,
     ) -> None:
-        message_id = uuid.uuid4().hex
         chat_id = self._derive_chat_id(context)
         peer_id, peer_name = self._derive_peer_identity(context)
+        source_type = self._derive_source_type(context)
         callback_url = (
             f"http://{self._callback_host}:{self._callback_port}{_DEFAULT_CALLBACK_PATH}"
         )
 
+        # Tool-trace capture (canvas chain parity with claude-code): snapshot
+        # the session files before dispatch; the post-reply delta holds the
+        # turn's assistant tool_calls.
+        session_snapshot = _session_jsonl_snapshot()
+
+        text = await self._dispatch_and_wait(
+            content=prompt,
+            chat_id=chat_id,
+            peer_id=peer_id,
+            peer_name=peer_name,
+            callback_url=callback_url,
+            history=history,
+            event_queue=event_queue,
+            source_type=source_type,
+        )
+        if text is None:
+            return  # the failure message was already enqueued
+
+        # --- Context-overflow auto-heal (issue #370) ---
+        # The session is permanently too large to process; resuming it makes
+        # every future turn fail identically. Clear it via hermes's own /new
+        # and replay this turn ONCE on the fresh session.
+        #
+        # Bounded to a single attempt: a second overflow on an empty session
+        # means THIS prompt is itself oversized, which no reset can fix, so
+        # the overflow text is delivered rather than looping.
+        if _is_context_overflow(text):
+            logger.error(
+                "auto-heal: hermes context overflow on chat_id=%s — resetting "
+                "the session and retrying once. reply=%s",
+                chat_id,
+                text[:200],
+            )
+            if await self._reset_hermes_session(
+                chat_id=chat_id,
+                peer_id=peer_id,
+                peer_name=peer_name,
+                callback_url=callback_url,
+            ):
+                # Re-seed from the caller-supplied history: the fresh session
+                # has no transcript, so without this the retry starts amnesiac.
+                retry = await self._dispatch_and_wait(
+                    content=prompt,
+                    chat_id=chat_id,
+                    peer_id=peer_id,
+                    peer_name=peer_name,
+                    callback_url=callback_url,
+                    history=history,
+                    event_queue=event_queue,
+                    # The retry IS the same turn — it must not change
+                    # provenance, or a scheduled turn would become
+                    # interactive purely by having overflowed once.
+                    source_type=source_type,
+                )
+                if retry is None:
+                    return
+                if _is_context_overflow(retry):
+                    logger.error(
+                        "auto-heal: still overflowing on a FRESH session for "
+                        "chat_id=%s — the prompt itself exceeds the window",
+                        chat_id,
+                    )
+                text = retry
+
+        await event_queue.enqueue_event(
+            _reply_message_with_tool_trace(
+                text, _tool_trace_from_session_delta(session_snapshot)
+            )
+        )
+
+    async def _reset_hermes_session(
+        self,
+        *,
+        chat_id: str,
+        peer_id: str,
+        peer_name: str | None,
+        callback_url: str,
+    ) -> bool:
+        """Clear this chat's hermes session by sending the `/new` command.
+
+        `/new` is hermes's own supported reset: it evicts the cached agent,
+        tears down tool resources, interrupts in-flight delegations and
+        rotates the session id. It is gated behind an interactive confirm
+        unless `approvals.destructive_slash_confirm` is false — start.sh
+        writes that key for exactly this reason (an unattended workspace has
+        nobody to confirm). Returns True when the reset reply came back.
+        """
+        reply = await self._dispatch_and_wait(
+            content="/new",
+            chat_id=chat_id,
+            peer_id=peer_id,
+            peer_name=peer_name,
+            callback_url=callback_url,
+            history=None,
+            event_queue=None,
+        )
+        if reply is None:
+            logger.error("auto-heal: /new dispatch failed for chat_id=%s", chat_id)
+            return False
+        # A confirm prompt instead of a reset means the approvals gate is
+        # still on: the session was NOT cleared, so retrying would replay the
+        # same oversized transcript. Say so loudly rather than silently
+        # burning the retry.
+        if _is_context_overflow(reply):
+            logger.error(
+                "auto-heal: /new itself returned an overflow reply for "
+                "chat_id=%s — session not cleared",
+                chat_id,
+            )
+            return False
+        logger.info(
+            "auto-heal: hermes session reset for chat_id=%s (reply=%s)",
+            chat_id,
+            reply[:120],
+        )
+        return True
+
+    async def _dispatch_and_wait(
+        self,
+        *,
+        content: str,
+        chat_id: str,
+        peer_id: str,
+        peer_name: str | None,
+        callback_url: str,
+        history: list[dict[str, Any]] | None,
+        event_queue: EventQueue | None,
+        source_type: str = "",
+    ) -> str | None:
+        """POST one message into the hermes plugin and await its reply.
+
+        Returns the reply text, or None when the turn failed. On failure a
+        user-facing message is enqueued when ``event_queue`` is provided;
+        internal dispatches (the `/new` reset) pass None and are silent.
+        """
+        message_id = uuid.uuid4().hex
+
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._pending[message_id] = future
+        self._record_origin(message_id, "peer" if peer_id else "user")
 
         # Belt-and-suspenders session continuity (task #385): the hermes
         # daemon owns session state natively, but its store at
@@ -370,10 +667,29 @@ class HermesAgentProxyExecutor(AgentExecutor):
             "chat_id": chat_id,
             "peer_id": peer_id,
             "peer_name": peer_name,
-            "content": prompt,
+            "content": content,
             "message_id": message_id,
             "callback_url": callback_url,
         }
+        # Autonomy marker, forwarded ONLY for a recognised scheduled delivery
+        # (see _SCHEDULED_SOURCE_TYPES). Absent for every interactive turn, so
+        # an interactive payload is byte-identical to what it was before — a
+        # human message keeps prompting a human, which is the point.
+        #
+        # STATED PLAINLY: this is currently INERT end-to-end, and shipping it
+        # is a deliberate half-fix, not a dead knob left by accident. The
+        # plugin passes the payload through as MessageEvent.raw_message, so
+        # the marker does reach hermes — but the hermes we pin resolves cron
+        # provenance in gateway/run.py::_set_session_env, which is a single
+        # `return set_session_vars(..., cron_session="")` with no branch and
+        # no field on SessionContext.source for a source_type to ride in.
+        # Verified byte-identical at upstream HEAD 63279301, so the pin bump
+        # in this same change does NOT close it either. Forwarding the marker
+        # is the half we own; the other half needs an upstream change. Until
+        # that lands, a scheduled run whose approval nobody is listening for
+        # still blocks on the approval timeout.
+        if source_type:
+            payload["source_type"] = source_type
         # Defensive: if history is malformed (not a list), log + skip
         # rather than crash the turn. Per
         # feedback_surface_actionable_failure_reason_to_user, we still
@@ -402,32 +718,33 @@ class HermesAgentProxyExecutor(AgentExecutor):
         except httpx.HTTPError as exc:
             self._pending.pop(message_id, None)
             logger.exception("hermes plugin POST failed")
-            await event_queue.enqueue_event(
-                new_text_message(f"[hermes plugin POST error] {exc!s}")
-            )
-            return
+            if event_queue is not None:
+                await event_queue.enqueue_event(
+                    new_text_message(f"[hermes plugin POST error] {exc!s}")
+                )
+            return None
 
         try:
-            text = await asyncio.wait_for(future, timeout=_PLUGIN_REPLY_TIMEOUT)
+            return await asyncio.wait_for(future, timeout=_PLUGIN_REPLY_TIMEOUT)
         except asyncio.TimeoutError:
             logger.error(
                 "hermes plugin: reply timeout for message_id=%s", message_id
             )
-            await event_queue.enqueue_event(
-                new_text_message(
-                    f"[hermes plugin reply timeout after {_PLUGIN_REPLY_TIMEOUT:.0f}s]"
+            if event_queue is not None:
+                await event_queue.enqueue_event(
+                    new_text_message(
+                        f"[hermes plugin reply timeout after {_PLUGIN_REPLY_TIMEOUT:.0f}s]"
+                    )
                 )
-            )
-            return
+            return None
         except Exception as exc:
-            await event_queue.enqueue_event(
-                new_text_message(f"[hermes plugin error] {exc!s}")
-            )
-            return
+            if event_queue is not None:
+                await event_queue.enqueue_event(
+                    new_text_message(f"[hermes plugin error] {exc!s}")
+                )
+            return None
         finally:
             self._pending.pop(message_id, None)
-
-        await event_queue.enqueue_event(new_text_message(text))
 
     async def _handle_reply(self, request: "web.Request") -> "web.Response":
         if self._shared_secret:
@@ -452,18 +769,171 @@ class HermesAgentProxyExecutor(AgentExecutor):
             )
 
         future = self._pending.get(reply_to)
-        if future is None:
-            # Late or duplicate delivery — the original execute() either
-            # already timed out or never registered. Acknowledge so the
-            # plugin doesn't retry forever.
-            logger.warning(
-                "hermes plugin: reply for unknown message_id=%s", reply_to
+        if future is not None and not future.done():
+            future.set_result(content)
+            self._mark_delivered(reply_to, content)
+            return web.json_response({"ok": True})
+
+        # Orphan path: no pending future, OR a present-but-done future (a
+        # racing earlier delivery — e.g. the busy-interrupt ack — already
+        # resolved it, so THIS content will never reach execute(); marking
+        # it delivered here would silently bury it, review wf_7cb5003d #2).
+        # The gateway's busy-interrupt flow answers the pending future with
+        # the "⚡ Interrupting current task" ack, then delivers the REAL
+        # reply seconds later under the same reply_to. Dropping such
+        # orphans loses the agent's answer forever (2026-07-22: canvas
+        # stuck on the interrupt ack while the actual 2176-char reply was
+        # discarded as "unknown message_id"). Relay genuinely new content
+        # to the canvas via the platform's /notify (AgentMessageWriter
+        # SSOT) — but ONLY for human canvas turns: a late reply to a
+        # PEER-delegated turn does not belong on the user's chat (#5);
+        # peers get the timeout signal and own their retries.
+        if self._already_delivered(reply_to, content):
+            logger.info(
+                "hermes plugin: duplicate reply for message_id=%s — dropped",
+                reply_to,
             )
             return web.json_response({"ok": True, "stale": True})
+        origin = self._origin_of(reply_to)
+        if origin != "user":
+            # "peer" — or unknown (executor restarted since registration;
+            # conservative pre-relay behavior: drop, matching the old
+            # uniform-drop contract for turns we cannot attribute).
+            logger.warning(
+                "hermes plugin: late reply for message_id=%s origin=%s — not relayed",
+                reply_to,
+                origin or "unknown",
+            )
+            return web.json_response({"ok": True, "stale": True})
+        # RESERVE the dedup slot BEFORE awaiting the relay so a concurrent
+        # duplicate delivery cannot double-post while the POST is in
+        # flight (#6); roll the reservation back on failure and answer
+        # 503 so the plugin's retry loop redelivers — a 200 here would
+        # make one transient platform blip a permanent reply loss (#3).
+        self._mark_delivered(reply_to, content)
+        relayed = await self._relay_orphan_reply(reply_to, content)
+        if not relayed:
+            self._unmark_delivered(reply_to, content)
+            return web.json_response(
+                {"ok": False, "stale": True, "relayed": False},
+                status=503,
+            )
+        return web.json_response({"ok": True, "stale": True, "relayed": True})
 
-        if not future.done():
-            future.set_result(content)
-        return web.json_response({"ok": True})
+    # Retry-dedup bookkeeping for _handle_reply. TTL bounds memory AND
+    # bounds the redelivery-dedup horizon: a retry arriving after expiry
+    # (or after cap eviction) relays again, so both bounds are sized well
+    # above any plausible adapter retry/redelivery window (review
+    # wf_7cb5003d #7) and the cap evicts OLDEST-BY-AGE, never a fresh
+    # entry that still guards an in-flight retry cycle.
+    _DELIVERED_TTL = 3600.0
+    _DELIVERED_MAX = 2048
+
+    @staticmethod
+    def _content_key(message_id: str, content: str) -> tuple:
+        import hashlib
+
+        digest = hashlib.sha256(
+            content.encode("utf-8", errors="replace")
+        ).hexdigest()
+        return (str(message_id), digest)
+
+    def _mark_delivered(self, message_id: str, content: str) -> None:
+        import time
+
+        now = time.monotonic()
+        self._delivered[self._content_key(message_id, content)] = now
+        self._prune_bookkeeping(now)
+
+    def _unmark_delivered(self, message_id: str, content: str) -> None:
+        self._delivered.pop(self._content_key(message_id, content), None)
+
+    def _prune_bookkeeping(self, now: float) -> None:
+        cutoff = now - self._DELIVERED_TTL
+        for k, ts in list(self._delivered.items()):
+            if ts < cutoff:
+                self._delivered.pop(k, None)
+        while len(self._delivered) > self._DELIVERED_MAX:
+            oldest = min(self._delivered, key=self._delivered.get)
+            self._delivered.pop(oldest, None)
+        for m, (_, ts) in list(self._origin.items()):
+            if ts < cutoff:
+                self._origin.pop(m, None)
+        while len(self._origin) > self._DELIVERED_MAX:
+            oldest = min(self._origin, key=lambda m: self._origin[m][1])
+            self._origin.pop(oldest, None)
+
+    def _record_origin(self, message_id: str, origin: str) -> None:
+        import time
+
+        now = time.monotonic()
+        self._origin[str(message_id)] = (origin, now)
+        self._prune_bookkeeping(now)
+
+    def _origin_of(self, message_id: str) -> str:
+        entry = self._origin.get(str(message_id))
+        return entry[0] if entry else ""
+
+    def _already_delivered(self, message_id: str, content: str) -> bool:
+        import time
+
+        ts = self._delivered.get(self._content_key(message_id, content))
+        return ts is not None and (time.monotonic() - ts) < self._DELIVERED_TTL
+
+    async def _relay_orphan_reply(self, reply_to: str, content: str) -> bool:
+        """Push a late gateway reply to the canvas chat via /notify.
+
+        Uses the platform's sanctioned agent→user path (AgentMessageWriter:
+        broadcast + durable activity row) so the message both renders live
+        and survives reload. Never raises — a relay failure must not break
+        the reply endpoint; the plugin already got its 200.
+        """
+        if not content.strip():
+            return False
+        workspace_id = (
+            os.environ.get("MOLECULE_WORKSPACE_ID")
+            or os.environ.get("WORKSPACE_ID", "")
+        ).strip()
+        base = (os.environ.get("PLATFORM_URL") or "").strip().rstrip("/")
+        if not workspace_id or not base:
+            logger.warning(
+                "hermes plugin: late reply for message_id=%s NOT relayed — "
+                "PLATFORM_URL/MOLECULE_WORKSPACE_ID unset",
+                reply_to,
+            )
+            return False
+        headers: Dict[str, str] = {}
+        try:
+            from molecule_runtime.platform_auth import auth_headers
+
+            headers = dict(auth_headers() or {})
+        except Exception:
+            pass
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{base}/workspaces/{workspace_id}/notify",
+                    json={"message": content},
+                    headers=headers,
+                )
+            ok = 200 <= resp.status_code < 300
+            log = logger.info if ok else logger.warning
+            log(
+                "hermes plugin: late reply for message_id=%s relayed via "
+                "/notify (status=%s)",
+                reply_to,
+                resp.status_code,
+            )
+            if ok:
+                self._mark_delivered(reply_to, content)
+            return ok
+        except Exception as exc:
+            logger.warning(
+                "hermes plugin: late-reply relay for message_id=%s failed: %s",
+                reply_to,
+                exc,
+            )
+            return False
 
     @staticmethod
     def _derive_chat_id(context: RequestContext) -> str:
@@ -534,6 +1004,34 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if not isinstance(peer_name, str):
             peer_name = ""
         return (peer_id, peer_name)
+
+    @staticmethod
+    def _derive_source_type(context: RequestContext) -> str:
+        """The delivery's autonomy marker, or "" for an interactive turn.
+
+        The scheduler plugin stamps ``metadata.source_type="self-scheduler"``
+        on a trigger turn so the receiving agent can tell an autonomous
+        self-ping from a human message. We dropped it here: every field the
+        plugin transport forwards is enumerated by hand in
+        ``_dispatch_and_wait``'s payload, and ``source_type`` was never added,
+        so a scheduled delivery arrived at hermes indistinguishable from a
+        person typing. That is one half of the ~305s scheduled-run hang: with
+        no marker, a flagged command opens an approval nobody is listening for
+        and the turn blocks until the approval timeout.
+
+        Returns "" for anything not in ``_SCHEDULED_SOURCE_TYPES`` — see the
+        note there for why this is an allow-list and not a passthrough.
+        """
+        message = getattr(context, "message", None)
+        if message is None:
+            return ""
+        metadata = getattr(message, "metadata", None) or {}
+        if not isinstance(metadata, dict):
+            return ""
+        source_type = metadata.get("source_type")
+        if not isinstance(source_type, str):
+            return ""
+        return source_type if source_type in _SCHEDULED_SOURCE_TYPES else ""
 
     # ------------------------------------------------------------------
     # Legacy chat_completions transport (fallback)

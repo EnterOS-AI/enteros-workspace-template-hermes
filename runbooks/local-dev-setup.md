@@ -1,207 +1,88 @@
-# Runbook: Local Development Setup — hermes Workspace Template
+# Local development — Hermes workspace template
 
-Use this runbook to set up a local development environment for the hermes workspace
-template. It covers cloning, dependency installation, running the adapter outside
-Docker, config overrides for dev, building the container, and diagnosing common
-problems.
-
----
+These commands follow the checks that the repository currently runs in CI.
+Local validation does not require a live workspace or production credential.
 
 ## Prerequisites
 
-| Requirement | Version | Notes |
-|---|---|---|
-| Python | 3.11+ | |
-| pip | 23+ | |
-| Docker | 24+ | |
-| Docker Compose | v2 | |
-| Git | 2.40+ | |
-| Redis (optional) | 7+ | Only needed when testing with `event_log.backend: redis` |
-| Molecule platform access | Token with `workspace:dev` scope | |
+- Python 3.11+
+- Git
+- Bash
+- Access to `git.moleculesai.app` and its package registry
+- Docker only when reproducing the image/T4 jobs
 
----
-
-## Step 1 — Clone the Repository
+## Clone and install test dependencies
 
 ```bash
-git clone https://github.com/your-org/molecule-ai-workspace-template-hermes.git
+git clone https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-hermes.git
 cd molecule-ai-workspace-template-hermes
+git switch -c fix/describe-the-change
+
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip packaging pyyaml jsonschema
+
+rm -rf .molecule-ci-canonical
+git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing
+python3 -m pip install -r requirements-dev.txt
 ```
 
-Create a local development branch:
+The canonical installer acquires the private runtime from the Gitea package
+registry. Do not route all packages through a private extra index or install a
+similarly named public package.
+
+## Static and shell checks
 
 ```bash
-git checkout -b feat/your-feature-name
+PROVIDERS_MANIFEST_FILE=internal/providers/providers.yaml \
+  python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+bash scripts/test-derive-provider.sh
+bash scripts/test-derive-platform-llm.sh
+bash scripts/test-install-prefix-strip.sh
+bash scripts/test-load-workspace-config.sh
+bash scripts/test-default-model-selection.sh
+bash scripts/test-mcp-configs-dir.sh
+bash scripts/test-process-liveness.sh
+bash scripts/test-publish-local-runtime-cache.sh
 ```
 
----
+## Adapter and release contracts
 
-## Step 2 — Install Dependencies
+CI intentionally runs the following focused set while a separate executor test
+remains outside the required gate:
 
 ```bash
-pip install -r requirements.txt
+python3 -m pytest \
+  tests/test_conformance.py \
+  tests/test_release_contracts.py \
+  tests/test_prepare_runtime_requirements.py \
+  tests/test_plugin_installer_cutover.py \
+  -v
 ```
 
-For an isolated virtual environment:
+Do not replace this with a claim that every file under `tests/` is a required
+gate unless the workflow is changed at the same time.
+
+## Image validation
+
+With Docker and package access available, the basic build is:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Linux/macOS
-# .\.venv\Scripts\Activate.ps1  # Windows
-pip install -r requirements.txt
+docker build -t workspace-template-hermes:dev .
 ```
 
-Verify hermes is importable:
+The container is not a standalone `python adapter.py` program. The supported
+entrypoint is `start.sh`, which expects platform-provided mounts and runtime
+configuration. CI owns the platform-shaped smoke and privilege-conformance
+checks; do not invent a local control-plane hostname or fake workspace token.
+
+## Before opening a pull request
 
 ```bash
-python -c "import hermes; print(hermes.__version__)"
+git diff --check
+python3 -m pytest --rootdir=tests --import-mode=importlib tests/test_release_contracts.py -q
 ```
 
----
-
-## Step 3 — Configure Environment Variables
-
-```bash
-cp .env.example .env.local
-```
-
-Edit `.env.local` with your credentials:
-
-```bash
-# Required
-ANTHROPIC_API_KEY=sk-ant-...
-MOLECULE_PLATFORM_URL=https://platform.molecule.ai
-MOLECULE_WORKSPACE_ID=ws-dev-local
-
-# Optional — event log persistence (redis)
-HERMES_EVENT_LOG_URL=redis://localhost:6379/0
-
-# Optional — concurrency limit
-HERMES_MAX_CONCURRENT_TASKS=1
-
-# Optional — log verbosity
-LOG_LEVEL=DEBUG
-```
-
-> **Security note:** `.env.local` is gitignored. Never commit API keys or tokens.
-
----
-
-## Step 4 — Config Overrides for Development
-
-Create `config.dev.yaml` to override production defaults locally:
-
-```yaml
-# config.dev.yaml — hermes local development overrides
-
-runtime:
-  event_log:
-    backend: memory       # no redis needed for local dev
-    ttl_seconds: 600
-  max_turns_per_task: 10  # faster test cycles
-
-model:
-  temperature: 0.8        # more exploratory
-  max_tokens: 4096        # lower latency for local testing
-
-observability:
-  heartbeat_interval_seconds: 30
-  log_level: DEBUG
-```
-
-Run the adapter with both configs merged:
-
-```bash
-python adapter.py --config config.yaml --config-override config.dev.yaml
-```
-
-The dev overrides take precedence for any conflicting keys.
-
----
-
-## Step 5 — Run the Adapter Locally
-
-```bash
-python adapter.py
-```
-
-Expected startup output:
-
-```
-hermes adapter v0.8.2 (runtime=hermes)
-  platform : https://platform.molecule.ai
-  workspace: ws-dev-local
-  model    : claude-sonnet-4-6 (max_tokens=4096)
-  event_log: memory (ttl=600s)
-  heartbeat: 30s interval
-
-[hermes] INFO  — config loaded (schema_version=1.1)
-[hermes] INFO  — skills loaded from: /opt/molecule/skills
-[hermes] INFO  — event loop running — press Ctrl+C to stop
-```
-
-The adapter will begin polling the platform for inbound events. Stop with `Ctrl+C`.
-
----
-
-## Step 6 — Docker Build and Smoke Test
-
-Build the dev image:
-
-```bash
-docker build -t molecule-hermes-workspace:dev .
-```
-
-Run a quick smoke test (verifies the adapter starts without crashing):
-
-```bash
-docker run --rm \
-  --env-file .env.local \
-  molecule-hermes-workspace:dev \
-  python -c "
-from adapter import HermesAdapter
-a = HermesAdapter()
-a.load_config()
-print('smoke test PASSED')
-"
-```
-
-Full Docker Compose stack (with Redis for event log persistence):
-
-```bash
-docker compose up --build
-```
-
-Tail logs:
-
-```bash
-docker compose logs -f workspace
-```
-
-Teardown:
-
-```bash
-docker compose down
-```
-
-To also remove the Redis volume:
-
-```bash
-docker compose down -v
-```
-
----
-
-## Common Issues Table
-
-| Symptom | Likely Cause | Resolution |
-|---|---|---|
-| `ModuleNotFoundError: No module named 'hermes'` | `requirements.txt` not installed | Run `pip install -r requirements.txt` |
-| Adapter exits immediately with code 0 | Hermes version mismatch with platform | Pin `hermes` in `requirements.txt` to platform version; see known-issues.md |
-| `ValidationError: config schema version '1.0' is not supported` | `schema_version` too old | Update `config.yaml` to minimum supported by platform |
-| Workspace shows "inactive" in platform dashboard | HEARTBEAT not forwarded | Set `heartbeat_interval_seconds: 60` in `config.yaml`; upgrade to v0.7.2+ |
-| `redis.exceptions.ConnectionError` on startup | `HERMES_EVENT_LOG_URL` set but redis not running | Start redis: `docker compose up -d redis`; or set `backend: memory` in dev overrides |
-| `system-prompt.md` appears to be ignored | Prompt exceeds token limit | Check token count: see known-issues.md; keep file under 8,000 tokens |
-| Model override in `config.yaml` not respected | Platform override being overwritten by local config | Use `config.dev.yaml` with env var substitution instead; see known-issues.md |
-| `docker build` fails at `pip install` step | Corporate proxy / network restriction | Set pip index mirror: `pip install --index-url https://pypi.org/simple/ -r requirements.txt` |
-| `docker run` crashes with `OMP_NUM_THREADS` warning | Missing CPU thread config | Add `OMP_NUM_THREADS=1` to `.env.local` and pass with `--env-file` |
+Never commit `.env` files, provider keys, platform tokens, or generated
+credential files.

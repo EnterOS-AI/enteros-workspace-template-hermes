@@ -13,11 +13,69 @@ set -euo pipefail
 # shellcheck source=scripts/process-liveness.sh
 . /app/scripts/process-liveness.sh
 
+# shellcheck source=scripts/log-mirror.sh
+# mirror_log_to_stdout(): tee a file-only log (gateway.log, molecule-mcp-server.log)
+# to PID1 stdout so `docker logs` / Dozzle can see it. See the helper header for the
+# full rationale (it never touches the producers' own >>"$LOG" redirect).
+. /app/scripts/log-mirror.sh
+
 # Source persistent workspace secrets BEFORE anything else that might need them.
 # /configs is volume-mounted from the host so this survives container restart.
 if [ -f /configs/secrets.d/load.sh ]; then
   # shellcheck disable=SC1091
   . /configs/secrets.d/load.sh
+fi
+
+# --- PRIVILEGE DROP, CONDITIONAL ON ACTUALLY HAVING PRIVILEGE -------------
+#
+# This image's contract is "start as root, chown the volumes, drop to agent",
+# and every launch below therefore went through a bare `gosu agent`. That is
+# correct on docker, where the provisioner runs the container as root with
+# CAP_SETUID/CAP_SETGID deliberately retained. It is FATAL on Kubernetes, and
+# it is fatal in a way that does not look like a permissions problem.
+#
+# MEASURED 2026-08-07 against the live k3s fleet. Every tenant namespace
+# enforces Pod Security Admission `restricted`, which REQUIRES runAsNonRoot
+# and FORBIDS adding SETUID/SETGID. The pod therefore starts as uid 1000 —
+# already the agent user — and gosu still needs CAP_SETGID for the
+# setgroups()/setgid() it performs before exec, so it dies with
+#
+#   error: failed switching to "agent": operation not permitted
+#
+# start.sh then prints "MCP server exited before /mcp came up" and the
+# container CrashLoopBackOffs. Reproduced on this exact image with a control,
+# so it is the CAPABILITY and not the identity:
+#
+#   docker run --user 1000:1000 --cap-drop ALL   ... gosu agent id
+#     -> error: failed switching to "agent": operation not permitted
+#   docker run --cap-add SETUID --cap-add SETGID ... gosu agent id
+#     -> uid=1000(agent) gid=1000(agent)
+#
+# So resolve the privilege-drop prefix ONCE, from whether we actually hold the
+# privilege, and use it everywhere instead of a bare `gosu agent`.
+#
+# WHY A PREFIX AND NOT THE SIBLINGS' `exec gosu agent "$0" "$@"` RE-EXEC.
+# claude-code and openclaw both wrap their whole root section in `id -u == 0`
+# and re-exec themselves. hermes cannot copy that shape without changing what
+# runs as root today: several launches below are documented as depending on
+# the ROOT parent shell opening their `>>` log redirect BEFORE gosu execs (see
+# the nohup notes further down), and docker is where every paying tenant runs.
+# A prefix keeps the root path byte-identical — as root ${AS_AGENT} expands to
+# exactly `gosu agent` — and changes only the path that is currently a crash.
+#
+# Non-root is not a weakening of the boundary: we ARE uid 1000 already, so
+# running the command directly lands in precisely the context gosu was being
+# asked to produce. The two chowns below stay guarded on `id -u` = 0 because
+# those genuinely need root, and are genuinely unnecessary when the volume
+# already arrives agent-owned (on k8s the pod's fsGroup does that).
+#
+# Deliberately resolved ABOVE the smoke-mode branch: that branch execs a gosu
+# of its own and would otherwise be the one boot path this fix does not cover.
+if [ "$(id -u)" = "0" ]; then
+  AS_AGENT="gosu agent"
+else
+  AS_AGENT=""
+  echo "[start.sh] uid $(id -u) is not root: the privilege drop is a no-op here, launching directly"
 fi
 
 # Boot-smoke contract (molecule-core#2275): the publish-image gate
@@ -30,7 +88,8 @@ fi
 # production boots are unaffected.
 if [ "${MOLECULE_SMOKE_MODE:-0}" = "1" ]; then
   echo "[start.sh] MOLECULE_SMOKE_MODE=1 — skipping hermes gateway spawn"
-  exec gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
+  # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+  exec ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
 fi
 
 # --- Make /configs agent-owned (fleet contract) ---
@@ -71,9 +130,54 @@ fi
 # host-root-reach assertion. Mirrors claude-code entrypoint.sh (12dd604).
 if [ "$(id -u)" = "0" ]; then
   chown -R agent:agent /configs 2>/dev/null || true
+  # /workspace is the DURABLE volume (mailbox kernel state: inbox cursor,
+  # delegation tombstones, goal-state, task ledger, memory — plus chat
+  # uploads). Docker ships named volumes root:755; the provisioner contract
+  # (workspace-server provisioner.go: "the entrypoint starts as root, chowns
+  # /configs and /workspace, then drops to agent") was only half-implemented
+  # here — /configs was chowned, /workspace was NOT, so every uid-1000 kernel
+  # write failed (durability guard: UNWRITABLE; idle-digest providers
+  # PermissionError; goal_set silently unable to persist). core#4295.
+  #
+  # GUARDED on current ownership: only claim a ROOT-owned tree (the broken-era
+  # named-volume shape — the heal fires exactly once, then steady-state boots
+  # skip the full tree walk). Never touch a /workspace owned by anyone else:
+  # in WorkspacePath mode it is an operator's real HOST directory, and
+  # recursively re-owning their files to uid 1000 would be a silent, harmful
+  # host mutation. Everything below runs uid-1000 via gosu, so an agent-owned
+  # tree never drifts back to root.
+  if [ "$(stat -c %u /workspace 2>/dev/null)" = "0" ]; then
+    chown -R agent:agent /workspace 2>/dev/null || true
+  fi
 fi
 
 HERMES_HOME="/tmp/.hermes"
+# Persist hermes state across container RECREATES (plugin installs and
+# platform restarts recreate the container): every process resolves the state
+# dir as ~/.hermes with HOME=/tmp (gateway, hermes CLI, the runtime's config
+# render), so rather than re-plumb HOME everywhere, /tmp/.hermes becomes a
+# SYMLINK onto the persisted /configs volume. Without this the session store
+# (state.db, sessions/) died with the old container and the agent woke
+# amnesiac -- "session history is empty" (2026-07-19, lost the lark-install
+# task mid-conversation; executor.py's history re-attach comment tracks the
+# same gap as "separate task: move HERMES_HOME to a workspace volume").
+install -d -o agent -g agent /configs/.hermes
+rm -rf /tmp/.hermes 2>/dev/null || true
+ln -sfn /configs/.hermes /tmp/.hermes
+# A container (re)start is ALWAYS a platform-orchestrated restart from the
+# gateway's point of view (docker stop/recreate — plugin installs, admin
+# restarts, host reboots), never a hermes-internal crash. Upstream's marker
+# for exactly this class ("hermes update", "gateway restart") makes startup
+# SKIP suspend_recently_active(); without it, a reprovision that lands
+# mid-turn suspends the session and the FIRST post-boot message force-resets
+# it (end_reason=session_reset) — the agent wakes amnesiac and drops the
+# task it promised to resume (2026-07-21, lark-install flow lost again
+# even WITH the /configs symlink persisting the transcripts). The gateway
+# consumes (unlinks) the marker on startup, so an in-container gateway
+# crash-respawn still gets the normal suspension treatment, and the
+# stuck-loop guard (.restart_failure_counts, 3+ restarts while active)
+# runs unconditionally either way — real crash loops still get wiped.
+install -o agent -g agent /dev/null /tmp/.hermes/.clean_shutdown
 ENV_FILE="${HERMES_HOME}/.env"
 HERMES_CONFIG="${HERMES_HOME}/config.yaml"
 # Log files live under HERMES_HOME (agent-owned via `install -d -o agent`
@@ -106,6 +210,103 @@ fi
 # log-file or MCP-log-file `install` calls.
 install -d -o agent -g agent "$HERMES_HOME"
 
+# --- Persona -> SOUL.md graft -------------------------------------------------
+# The platform delivers the workspace persona to /configs (the concierge's
+# composed config grafts it at prompts/concierge.md; plain workspaces use
+# system-prompt.md). The hermes DAEMON reads its identity from
+# ${HERMES_HOME}/SOUL.md and knows nothing about prompt_files -- without this
+# graft it boots on the stock Hermes soul and answers as "Hermes", not its
+# role (the 2026-07-19 "I'm Hermes" concierge-identity incident). The
+# daemon's _ensure_default_soul_md only seeds SOUL.md when ABSENT, so our
+# pre-start install wins; re-installing on every boot keeps a persona update
+# effective after restart.
+#
+# The loop below has an ELSE branch for a reason. Before 2026-08-05 it had
+# none: when NEITHER file was delivered it fell off the end silently, leaving
+# whatever SOUL.md was already on the persisted volume and printing nothing
+# that distinguishes that boot from a healthy one. That is the exact silent
+# degradation that put a third-party identity in front of a customer
+# (enteros-ws-test2-… boots with no /configs/prompts/ at all, on the same image
+# as a workspace that has one). It must not FAIL the boot — a workspace that
+# cannot boot is worse than one with a generic persona — but it must be LOUD.
+persona_grafted=0
+for persona in /configs/prompts/concierge.md /configs/system-prompt.md; do
+  if [ -s "$persona" ]; then
+    install -m 644 -o agent -g agent "$persona" "${HERMES_HOME}/SOUL.md"
+    echo "[start.sh] grafted persona ${persona} -> ${HERMES_HOME}/SOUL.md"
+    persona_grafted=1
+    break
+  fi
+done
+if [ "$persona_grafted" = 0 ]; then
+  echo "[start.sh] ERROR no workspace persona was delivered: neither" \
+       "/configs/prompts/concierge.md nor /configs/system-prompt.md exists" \
+       "(or both are empty). ${HERMES_HOME}/SOUL.md keeps whatever identity" \
+       "was already on the volume, so this workspace will introduce itself" \
+       "with a generic/stock identity instead of its role. Boot CONTINUES;" \
+       "this is a delivery defect in the control plane's config relay, not a" \
+       "reason to fail the container." >&2
+fi
+
+# --- Neutralize the upstream vendor self-identification -----------------------
+# The vendored upstream builds its system prompt in agent/system_prompt.py and,
+# with NO config knob and NO condition, appends
+# agent/prompt_builder.py::HERMES_AGENT_HELP_GUIDANCE to the STABLE tier right
+# after the identity block:
+#
+#     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+#     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+#
+# That constant reads "You run on Hermes Agent (by Nous Research) … the
+# documentation at https://hermes-agent.nousresearch.com/docs is your
+# authoritative reference …", so every workspace on this template tells its
+# customer it is a third party's product — measured identically on a container
+# WITH the concierge persona delivered and one WITHOUT, on the same image, which
+# is what proves the persona file is not the cause.
+#
+# WHY HERE AND NOT IN THE Dockerfile. start.sh is COPY'd into the image
+# (see Dockerfile), so a start.sh patch is NOT cheaper than a build-time patch
+# on the "already-built images" axis — both need a rebuild + runtime release +
+# template-pin promote. The reasons this seam wins are different ones:
+#   1. TESTABILITY. This repo's tests execute real blocks out of start.sh and
+#      real scripts out of scripts/ (see tests/); nothing in the suite builds an
+#      image, so a `RUN sed` in the Dockerfile could only ever be guarded by
+#      eyeballing. The helper invoked below is executed verbatim by
+#      tests/test_vendor_branding_neutralized.py.
+#   2. RE-APPLICATION. It runs on every container START, so it survives a
+#      `docker restart`, a container recreate, and any runtime path that
+#      refreshes ~/.hermes/hermes-agent after the image was built.
+#   3. LOCALITY. start.sh already owns workspace identity assembly (the persona
+#      graft directly above); keeping both in one file means one place to read.
+# The helper is idempotent, so (2) does not accumulate edits.
+#
+# It rewrites EVERY copy of agent/prompt_builder.py under the hermes root (the
+# image ships two non-identical copies: the installer's checkout tree and the
+# venv site-packages wheel) and then RE-IMPORTS the module the way the gateway
+# does to prove the value the gateway will see actually changed. Patching a copy
+# nothing imports is a vacuous fix.
+#
+# Non-fatal by construction: a bad byline is not worth a dead workspace. A
+# failure is logged loudly and CI catches the same condition
+# (tests/test_vendor_branding_neutralized.py) before it reaches a customer.
+HERMES_UPSTREAM_ROOT="${HERMES_UPSTREAM_ROOT:-/home/agent/.hermes/hermes-agent}"
+if [ -d "$HERMES_UPSTREAM_ROOT" ]; then
+  if python3 /app/scripts/neutralize-vendor-branding.py \
+       --hermes-root "$HERMES_UPSTREAM_ROOT"; then
+    echo "[start.sh] upstream vendor self-identification neutralized"
+  else
+    echo "[start.sh] ERROR scripts/neutralize-vendor-branding.py failed (rc=$?)." \
+         "The upstream HERMES_AGENT_HELP_GUIDANCE / DEFAULT_AGENT_IDENTITY" \
+         "constants are still in the system prompt, so this agent will tell" \
+         "users it runs on Nous Research's Hermes Agent product and point them" \
+         "at nousresearch.com docs. Boot CONTINUES." >&2
+  fi
+else
+  echo "[start.sh] ERROR upstream install ${HERMES_UPSTREAM_ROOT} not found;" \
+       "vendor self-identification NOT neutralized — the agent will tell users" \
+       "it runs on Nous Research's Hermes Agent product. Boot CONTINUES." >&2
+fi
+
 # --- Install log files atomically (race-free) ---
 # Regression fix re-applied 2026-05-15: a previous build (image
 # sha-7669af2, built 13:31 UTC) crashloops in prod with:
@@ -124,6 +325,16 @@ install -d -o agent -g agent "$HERMES_HOME"
 # logs inside HERMES_HOME (agent-owned). Re-applying that fix here.
 install -m 644 -o agent -g agent /dev/null "$LOG_FILE"
 
+# --- Mirror the gateway log to the container stdout (Dozzle visibility) ---
+# `hermes gateway` is launched detached below with `>>"$LOG_FILE" 2>&1 &`, so
+# its logs land in a FILE and never reach `docker logs` / Dozzle. Start the
+# stdout mirror NOW (right after the file exists, before the pre-materialize
+# step and the gateway both append to it) so nothing is missed. Safe by
+# construction: it only reads the file and never touches the gateway's own
+# redirect, so the reconcile watcher (reads config.yaml) and the boot
+# `tail -40/-80 "$LOG_FILE"` error dumps are unaffected. See log-mirror.sh.
+mirror_log_to_stdout "$LOG_FILE"
+
 # --- Write hermes-agent's .env ---
 # API_SERVER_ENABLED must be true and the bearer must match. Every
 # provider key hermes-agent knows about is forwarded from the container
@@ -135,8 +346,7 @@ API_SERVER_ENABLED=true
 API_SERVER_KEY=${API_SERVER_KEY}
 API_SERVER_HOST=${API_SERVER_HOST:-127.0.0.1}
 API_SERVER_PORT=${API_SERVER_PORT:-8642}
-# Provider-selection override (optional; empty = hermes auto-detect).
-${HERMES_INFERENCE_PROVIDER:+HERMES_INFERENCE_PROVIDER=${HERMES_INFERENCE_PROVIDER}}
+# Provider selection is appended after platform-routing translation below.
 # Auxiliary model defaults — used by vision, web summarization, MoA.
 ${HERMES_AUXILIARY_PROVIDER:+HERMES_AUXILIARY_PROVIDER=${HERMES_AUXILIARY_PROVIDER}}
 # ── Primary inference providers (keyed) ───────────────────────
@@ -293,7 +503,43 @@ if [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ] &&
   echo "[start.sh] no model env was set; auto-selected '${HERMES_DEFAULT_MODEL}' from available API keys"
 fi
 
-DEFAULT_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL}}"
+# `:-` on the inner expansion so this is safe under `set -u` even when the
+# key-presence block above was gated off (e.g. HERMES_INFERENCE_PROVIDER set)
+# and never assigned HERMES_DEFAULT_MODEL — previously that dereferenced an
+# unbound var and crashed the container with a cryptic error.
+DEFAULT_MODEL="${HERMES_INFERENCE_MODEL:-${HERMES_DEFAULT_MODEL:-}}"
+
+# --- Platform-managed model guard (fail-loud, OUTCOME-based) ---
+# On a platform-routed workspace (MOLECULE_RESOLVED_PROVIDER=platform — the SSOT
+# signal core injects; derive-platform-llm.sh keys on the SAME value) the tenant
+# BYOK keys are STRIPPED and the CP is contracted to deliver the resolved model.
+# If model selection nonetheless landed on the BYOK default
+# `nousresearch/hermes-4-70b` (the key-presence fallback with no keys present) or
+# on nothing at all, that model is deliberately unpriced (IsPlatform:false) and
+# the platform LLM proxy fail-closes it 422 "model has no price catalog entry" on
+# EVERY turn — a silent, minutes-long retry loop rather than an obvious failure
+# (the exact class that took a full staging repro to diagnose). Refuse loudly.
+#
+# This tests the FINAL resolved DEFAULT_MODEL (not intermediate HERMES_* proxies)
+# and keys ONLY on the authoritative MOLECULE_RESOLVED_PROVIDER, so it can never
+# false-fire: a workspace that actually resolved a model (whatever path delivered
+# it) has a non-default DEFAULT_MODEL and is left alone, and a byok arm (or a
+# stale legacy LLM_PROVIDER=platform) is never mis-classified as platform. It
+# fires ONLY on the exact unpriced BYOK default — the empty-model case is a
+# distinct concern already made non-fatal by the `:-` on DEFAULT_MODEL above.
+case "${MOLECULE_RESOLVED_PROVIDER:-}" in
+  platform)
+    if [ "${DEFAULT_MODEL}" = "nousresearch/hermes-4-70b" ]; then
+      echo "[start.sh] platform-managed hermes workspace fell through to the BYOK default 'nousresearch/hermes-4-70b'." >&2
+      echo "[start.sh] That model is unpriced (IsPlatform:false), so the platform LLM proxy rejects it 422" >&2
+      echo "[start.sh] 'model has no price catalog entry' on every turn. The control plane must inject the" >&2
+      echo "[start.sh] resolved platform model (MOLECULE_MODEL). Refusing to boot on the unpriced default." >&2
+      exit 1
+    fi
+    ;;
+esac
+# --- end platform-managed model guard ---
+
 # Derive provider from model slug prefix — shared with install.sh via
 # scripts/derive-provider.sh so Docker + bare-host paths match.
 # Dockerfile COPYs scripts/ to /app/scripts; fall back to /scripts
@@ -320,6 +566,13 @@ if [ -f "$PLATFORM_LLM_SCRIPT" ]; then
   }
 fi
 
+# Hermes reloads this file with override=True before every request. Persist the
+# translated value only after derive-platform-llm.sh has mapped the Molecule
+# `platform` arm to Hermes's native `custom` provider.
+if [ -n "${HERMES_INFERENCE_PROVIDER:-}" ]; then
+  printf 'HERMES_INFERENCE_PROVIDER=%s\n' "${HERMES_INFERENCE_PROVIDER}" >>"$ENV_FILE"
+fi
+
 # --- OpenAI bridge: custom provider + chat_completions api_mode ---
 # Symmetric with install.sh. See install.sh for the full explanation.
 # hermes has NO native "openai" provider — bridge must use custom+
@@ -331,6 +584,17 @@ if [ "${PROVIDER}" = "custom" ] && [ -n "${OPENAI_API_KEY:-}" ] && [ -z "${HERME
   export HERMES_CUSTOM_API_MODE="chat_completions"
   DEFAULT_MODEL="${DEFAULT_MODEL#openai/}"
   echo "[start.sh] bridged OPENAI_API_KEY -> custom provider @ ${HERMES_CUSTOM_BASE_URL} (api_mode=chat_completions, model=${DEFAULT_MODEL})"
+fi
+
+# --- MiniMax bridge (SSOT: scripts/derive-minimax-bridge.sh) ---
+# Sourced, not inlined, so install.sh and start.sh cannot drift — same
+# discipline as derive-provider.sh / derive-platform-llm.sh.
+MINIMAX_BRIDGE_SCRIPT="/app/scripts/derive-minimax-bridge.sh"
+[ -f "$MINIMAX_BRIDGE_SCRIPT" ] || MINIMAX_BRIDGE_SCRIPT="/scripts/derive-minimax-bridge.sh"
+[ -f "$MINIMAX_BRIDGE_SCRIPT" ] || MINIMAX_BRIDGE_SCRIPT="$(dirname "$0")/scripts/derive-minimax-bridge.sh"
+if [ -f "$MINIMAX_BRIDGE_SCRIPT" ]; then
+  # shellcheck source=scripts/derive-minimax-bridge.sh
+  MOLECULE_BRIDGE_CALLER=start.sh . "$MINIMAX_BRIDGE_SCRIPT"
 fi
 
 # Defense-in-depth: when the resolved provider is platform (derive-platform-llm.sh
@@ -380,6 +644,119 @@ fi
   if [ -n "${HERMES_CUSTOM_API_MODE:-}" ]; then
     echo "  api_mode: \"${HERMES_CUSTOM_API_MODE}\""
   fi
+  # --- Tool search (progressive disclosure) — OFF for EVERY workspace ---
+  # hermes' tiered disclosure (tools/tool_search.py) replaces every
+  # MCP/plugin tool in the model-facing tools array with three bridge tools
+  # (tool_search / tool_describe / tool_call) and defers the real schemas.
+  # `should_activate()` fires whenever AT LEAST ONE deferrable tool exists —
+  # threshold_pct / listing_max_tokens only bound how much of the catalog is
+  # LISTED, they do NOT gate activation. (Measured: threshold_pct=100 +
+  # listing_max_tokens=60000 — both clamp ceilings — still yields
+  # `activated=True tier=1 deferred_count=96`.) So a budget knob cannot fix
+  # this; only `enabled: off` can.
+  #
+  # Why that matters here: the concierge carries the management MCP
+  # (mcp_servers.molecule-platform, MOLECULE_MCP_MODE=management) — 54
+  # platform verbs inside a ~110-tool surface. Deferred tools are stripped
+  # from `agent.tools`, and agent_init.py derives
+  # `agent.valid_tool_names` from exactly that stripped set — yet their
+  # REAL names stay advertised in the tool_search bridge description's
+  # catalog listing. The model reads a real name off that listing, calls it
+  # directly, conversation_loop.py's plain set-membership check misses, and
+  # after 3 strikes the turn dies with "Model generated invalid tool call:
+  # mcp__molecule_platform__list_orgs". The strike budget is burned on
+  # orientation calls and provision_workspace is never reached — which is
+  # what makes staging-tenant-cd / e2e-smoke nondeterministic.
+  #
+  # UNCONDITIONAL (2026-08-06). This block used to be gated on IS_CONCIERGE,
+  # derived from whether /configs/prompts/concierge.md had been delivered. That
+  # made a fatal runtime capability — whether the agent can call ANY MCP tool —
+  # depend on an asset the control plane does not guarantee: molecule-core
+  # 87de7be0c documents a live hermes concierge whose /configs/prompts/ did not
+  # exist while /configs/config.yaml still declared
+  # `prompt_files: [prompts/concierge.md]`. On such a box the gate read 0, this
+  # stanza was never written, and the concierge's entire 92-tool surface was
+  # deferred: its A2A provision_workspace turn answered
+  # "Model generated invalid tool call: mcp__molecule__get_workspace_info" —
+  # a REAL id out of the `molecule` sidecar's 32 registered tools — four turns
+  # running, and staging-tenant-cd / e2e-smoke went RED. Measured on two live
+  # containers on the SAME image differing only in that file: persona present →
+  # no `tool_search activated` line; persona absent → "tool_search activated
+  # (tier 1): 18 core/visible tools kept, 92 deferred".
+  #
+  # Ordinary workspaces are exposed to the identical hazard (a live worker logs
+  # "18 core/visible tools kept, 38 deferred" — its `molecule` sidecar tools are
+  # deferred while the runtime's system prompt still documents them), so the
+  # scope carve-out bought nothing and cost determinism. The price of always-on
+  # eager disclosure is ~4.9k prompt tokens on a worker and ~13k on a concierge,
+  # against the 204,800-token window the fleet model reports.
+  echo "tools:"
+  echo "  tool_search:"
+  echo "    enabled: \"off\""
+  # --- Unattended-session approvals (issue #370) ---
+  # hermes gates the destructive session commands (/new, /reset, /clear,
+  # /undo) behind an interactive confirm — `approvals.
+  # destructive_slash_confirm`, default TRUE. That default assumes a human
+  # is watching the chat. A scheduled workspace has nobody to press the
+  # button, so `/new` parks on a confirm prompt and the session is never
+  # reset.
+  #
+  # That is the difference between a recoverable workspace and a dead one.
+  # When a hermes session exceeds the context window and compaction gives
+  # up, EVERY later turn dies on the same oversized transcript; `/new` is
+  # the only thing that clears it. Leaving the confirm on means the one
+  # recovery path is unreachable without an operator typing /approve by
+  # hand — which is exactly how workspace 90139d37 stayed dead from
+  # 2026-08-04 to 08-12 (see #370, and the auto-heal in executor.py that
+  # sends /new on overflow).
+  #
+  # Scope: this only removes the CONFIRM step, not the command. The
+  # destructive commands were always reachable; they just required a
+  # second interactive turn that an unattended lane cannot produce.
+  echo "approvals:"
+  echo "  destructive_slash_confirm: false"
+  # --- Scheduled-turn code execution (molecule-core#5194) ---
+  # Same unattended-lane problem as #370 above, one policy key over. On a
+  # cron-delivered turn hermes does NOT raise an approval and wait — it hard
+  # DENIES. `tools/approval.py` (0.19.0, lines 2501-2511 and the two call
+  # sites at 2712 / 3239):
+  #
+  #     mode = str(cfg_get(config, "approvals", "cron_mode", default="deny"))...
+  #     if mode in {"approve", "off", "allow", "yes"}: return "approve"
+  #     return "deny"
+  #
+  # We have never written `cron_mode`, so the built-in `deny` applied to every
+  # scheduled workspace the fleet has ever run. The agent is told "the user has
+  # NOT consented... Do NOT retry" and the turn ends having executed nothing.
+  # An agent whose entire job is scheduled work can think and cannot act.
+  #
+  # It is worse than a no-op: the blocked turn never completes, so the runtime
+  # lease goes idle and the watchdog cancels + re-queues every ~30s forever
+  # ("lease went idle — no tool activity for 1563.3s (TTL 900.0s)"), at WARNING,
+  # inside the container. Nothing surfaces. Deployment stays 1/1, plugins
+  # installed, schedules armed — indistinguishable from an agent with nothing
+  # to do. Measured on prod tenant `minori`, ws c7937b21, 2026-08-16.
+  #
+  # THE DEFAULT IS UNCHANGED. Absent the env var this writes `deny`, which is
+  # exactly what the built-in already does. What changes is that the policy
+  # becomes EXPRESSIBLE: an operator running a genuinely unattended scheduled
+  # agent sets HERMES_CRON_APPROVAL_MODE=allow on that workspace. Letting cron
+  # turns run code with no human in the loop is a real security decision, so it
+  # stays opt-in and per-workspace rather than becoming a fleet-wide default.
+  #
+  # Unrecognised values fail CLOSED to deny (the `mode in {...}` test above), so
+  # a typo yields a silently inert agent rather than an unintended grant. Warn
+  # loudly here, because that failure is otherwise invisible for a week.
+  _CRON_MODE="${HERMES_CRON_APPROVAL_MODE:-deny}"
+  case "$(printf '%s' "$_CRON_MODE" | tr '[:upper:]' '[:lower:]')" in
+    approve|off|allow|yes|deny) : ;;
+    *)
+      echo "[start.sh] WARNING: HERMES_CRON_APPROVAL_MODE='${_CRON_MODE}' is not one" >&2
+      echo "[start.sh]   of approve|off|allow|yes|deny. hermes fails closed to DENY," >&2
+      echo "[start.sh]   so scheduled turns will silently execute nothing." >&2
+      ;;
+  esac
+  echo "  cron_mode: \"${_CRON_MODE}\""
   # --- Molecule A2A platform plugin ---
   # Loaded into hermes via the hermes_agent.plugins entry point baked
   # into the image (see Dockerfile). When enabled, hermes opens a
@@ -395,6 +772,16 @@ fi
     # Operators can pin a custom URL via env if molecule-runtime is
     # extended to host /a2a/reply itself.
     DEFAULT_CALLBACK="http://${MOLECULE_A2A_CALLBACK_HOST:-127.0.0.1}:${MOLECULE_A2A_CALLBACK_PORT:-8646}/a2a/reply"
+    # hermes >= 0.19 makes EXTERNAL (entry-point) plugins opt-in: only
+    # names listed under plugins.enabled load; absent key = nothing
+    # loads, and the gateway logs NOTHING about the skipped plugin
+    # (first-boot hang 2026-07-23: molecule_a2a discovered but never
+    # loaded, :8645 never bound, adapter.setup() failed, boot's TOOL
+    # step waited forever). The name is the entry-point name from the
+    # plugin's pyproject (molecule_a2a), not the platform key.
+    echo "plugins:"
+    echo "  enabled:"
+    echo "    - molecule_a2a"
     echo "platforms:"
     echo "  molecule-a2a:"
     echo "    enabled: true"
@@ -427,9 +814,21 @@ fi
   # server started below. Class-A canvas regression — without this
   # block hermes is platform-blind even though every other plumbing
   # layer is correct.
-  echo "mcp_servers:"
-  echo "  molecule:"
-  echo "    url: \"http://127.0.0.1:${MOLECULE_MCP_PORT:-9100}/mcp\""
+  # Seed the base `molecule` MCP server through the SAME serializer
+  # molecule-runtime-prepare / adapter.py use (yaml.safe_dump, sort_keys=
+  # False) so this block is BYTE-IDENTICAL to what the runtime later
+  # rewrites (RFC rule 5). Hand-formatted YAML here — the old
+  # `echo "    url: \"...\""` emitted a QUOTED url, but safe_dump emits it
+  # UNQUOTED (`url: http://...`) — round-trips to DIFFERENT bytes; the
+  # reconcile watcher used to md5-diff that cosmetic delta and restart the
+  # gateway, killing the concierge greeting. We KEEP seeding it (rather than
+  # deferring entirely to runtime-prepare) because a runtime wheel WITHOUT
+  # molecule-runtime-prepare falls back to the post-launch watcher and would
+  # otherwise reach the mandatory `hermes mcp list` smoke below with NO
+  # mcp_servers.molecule -> boot refused. pyyaml is always present
+  # (molecule_runtime depends on it; adapter.py imports yaml); python3 is
+  # already used below for the MCP server.
+  MOLECULE_MCP_PORT="${MOLECULE_MCP_PORT:-9100}" python3 -c 'import os, sys, yaml; sys.stdout.write(yaml.safe_dump({"mcp_servers": {"molecule": {"url": "http://127.0.0.1:%s/mcp" % os.environ["MOLECULE_MCP_PORT"]}}}, sort_keys=False))'
 } >"$HERMES_CONFIG"
 chown agent:agent "$HERMES_CONFIG"
 
@@ -446,6 +845,11 @@ chown agent:agent "$HERMES_CONFIG"
 # (Permission denied on the >> redirect from the root parent shell).
 MCP_LOG="${HERMES_HOME}/molecule-mcp-server.log"
 install -m 644 -o agent -g agent /dev/null "$MCP_LOG"
+# Mirror the MCP server's file-only log to the container stdout (Dozzle). The
+# server is launched detached below with `>>"$MCP_LOG" 2>&1 &`; the boot
+# readiness smoke's `tail -40 "$MCP_LOG"` dumps and any file reader keep
+# working — the mirror only follows the file. See log-mirror.sh.
+mirror_log_to_stdout "$MCP_LOG"
 # CONFIGS_DIR=/configs is REQUIRED here, not optional: the `env HOME=/tmp`
 # form REPLACES the inherited environment, so even though /configs is now
 # agent-owned (chowned above), configs_dir.resolve()'s second branch
@@ -455,7 +859,8 @@ install -m 644 -o agent -g agent /dev/null "$MCP_LOG"
 # the MCP server's token resolution deterministic and self-documenting:
 # it takes configs_dir.resolve()'s FIRST (explicit-override) branch and
 # can never silently fall back to /tmp/.molecule-workspace again.
-nohup gosu agent env HOME=/tmp CONFIGS_DIR=/configs \
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+nohup ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs \
     python3 -m molecule_runtime.a2a_mcp_server --transport http --port 9100 \
     >>"$MCP_LOG" 2>&1 &
 MCP_PID=$!
@@ -496,6 +901,47 @@ if ! curl -fsS -X POST -H 'Content-Type: application/json' \
   exit 1
 fi
 
+# --- Pre-materialize the full MCP config BEFORE the gateway launches ---
+# hermes >= 0.19 discovers MCP servers EAGERLY at gateway startup. The runtime
+# writes the management/self MCP stanzas during its OWN boot-install +
+# adapter.setup(), which historically ran AFTER the gateway launched (the
+# gateway must be up before the runtime serves). So the gateway missed those
+# servers and needed a RESTART to pick them up — a ~90s unreachable boot
+# window on every fresh boot (core#4587: "hi" during boot -> connection
+# refused).
+#
+# `molecule-runtime-prepare` runs the SAME boot-install + adapter.setup() the
+# real serve runs, writing the complete mcp_servers block into config.yaml,
+# then exits WITHOUT registering/serving. Running it HERE — after the base
+# config is written (above), before the gateway launches (below) — lets the
+# gateway read a COMPLETE config on its FIRST boot, so the reconcile restart
+# never happens.
+#
+# BEST-EFFORT + FAIL-SAFE, by construction it can only ever REMOVE the restart,
+# never brick boot:
+#   * Capability-gated on the binary: a runtime wheel predating this feature
+#     simply lacks `molecule-runtime-prepare`, so we skip and fall back to the
+#     post-launch reconcile watcher (today's behavior, unchanged).
+#   * `timeout`-bounded so a hung prepare can never wedge boot.
+#   * A non-zero / timed-out result is logged and IGNORED — the reconcile
+#     watcher below stays as the safety net either way.
+# Run as the SAME unprivileged agent/env as the real `molecule-runtime` exec
+# (HOME=/tmp so config resolves to /tmp/.hermes -> /configs/.hermes) so the
+# pre-written block is byte-identical to what the real serve rewrites — the
+# hardened watcher then sees no genuine post-launch change and stays dormant.
+if command -v molecule-runtime-prepare >/dev/null 2>&1; then
+  echo "[start.sh] pre-materializing MCP config (molecule-runtime-prepare) before gateway launch"
+  # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+  if timeout 150 ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs MOLECULE_RUNTIME_PREPARE_ONLY=1 molecule-runtime-prepare >>"$LOG_FILE" 2>&1; then
+    echo "[start.sh] config pre-materialized — gateway will discover all MCP servers on first boot (no reconcile restart)"
+  else
+    _prep_rc=$?
+    echo "[start.sh] molecule-runtime-prepare did not complete (rc=${_prep_rc}); falling back to the post-launch reconcile watcher" >&2
+  fi
+else
+  echo "[start.sh] molecule-runtime-prepare not in this runtime wheel; using the post-launch reconcile watcher"
+fi
+
 # --- Start hermes gateway in the background ---
 # `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
 # /tmp so the lookup resolves to /tmp/.hermes/.env (writable; matches
@@ -504,7 +950,15 @@ fi
 # binary lookup only needs read.
 # Use bash -c (not -lc) since we no longer want the login-shell HOME-driven
 # defaults; we're explicitly setting PATH + HOME inline.
-nohup gosu agent env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+# BUSY_INPUT_MODE=queue: a message that arrives while a turn is running
+# (the first-boot greeting, a long tool chain) QUEUES and cascades as the
+# next turn instead of the default interrupt -- which aborted the running
+# turn and sent the caller the "Interrupting current task..." ack AS THEIR
+# ANSWER (the staging greeting e2e failure, 2026-07-20). Platform chat
+# wants strict turn ordering; the canvas Stop button cancels via the task
+# API, so no interrupt-by-chat capability is lost.
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+nohup ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     bash -c "cd /tmp && hermes gateway" \
     >>"$LOG_FILE" 2>&1 &
 GATEWAY_PID=$!
@@ -534,6 +988,14 @@ fi
 
 echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWAY_PID})"
 
+# --- MCP reconcile watcher (hermes >= 0.19 eager discovery) ---
+# Extracted to scripts/mcp-reconcile-watch.sh so the watcher's drain /
+# relaunch / multi-restart mechanics are hermetically unit-tested
+# (scripts/test-mcp-reconcile-watch.sh) and exercised per-PR. Full
+# rationale lives in that script's header. Backgrounded; survives the
+# exec of molecule-runtime below.
+MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LAUNCH_CMD="exec ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash -c 'cd /tmp && hermes gateway'" MCPWATCH_HEALTH_URL="http://127.0.0.1:${API_SERVER_PORT:-8642}/health" MCPWATCH_LOG_FILE="$LOG_FILE" MCPWATCH_MARKER="/tmp/.hermes/.clean_shutdown"   bash /usr/local/bin/mcp-reconcile-watch.sh &
+
 # --- Smoke: confirm hermes sees the molecule MCP server in `mcp list` ---
 # Belt-and-braces check: even if config.yaml has mcp_servers.molecule
 # written above, a yaml-parse error or a hermes-side regression could
@@ -542,7 +1004,8 @@ echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWA
 # Soft-fail (log + continue): if the smoke step itself errors (busy CLI,
 # transient stdin issue), we don't want to refuse boot — but a config
 # without `molecule` in it IS a real failure, so we exit non-zero on that.
-MCP_LIST_OUT=$(gosu agent env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+MCP_LIST_OUT=$(${AS_AGENT} env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     timeout 10 hermes mcp list 2>&1 || true)
 if echo "$MCP_LIST_OUT" | grep -q "^[[:space:]]*molecule[[:space:]]"; then
   echo "[start.sh] hermes mcp list shows 'molecule' wired"
@@ -571,4 +1034,10 @@ fi
 # Mirror the exact env used for the gosu'd MCP server at line ~359 so token
 # path resolution (configs_dir.resolve() explicit-override branch) stays
 # deterministic. This also fixes .platform_inbound_secret (same writer).
-exec gosu agent env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
+#
+# The runtime also owns declared-plugin source parsing, fetching, and atomic
+# installation before adapter setup. Runtime 0.4 rejects unsafe dot/path install
+# names and contains every resolved destination under /configs/plugins. Keep
+# plugin installation out of this privileged boot script.
+# shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+exec ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime

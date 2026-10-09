@@ -1,109 +1,113 @@
-# template-hermes
+# Molecule AI workspace template — Hermes
 
-Molecule AI workspace template that runs the **real Nous Research
-[hermes-agent](https://github.com/NousResearch/hermes-agent)** behind an
-A2A bridge.
+This repository builds the `hermes` workspace image used by Molecule AI. It
+runs Nous Research's upstream
+[`hermes-agent`](https://github.com/NousResearch/hermes-agent) gateway behind
+the common Molecule A2A runtime.
 
-## What's actually in the workspace
+The canonical source is this Gitea repository. Create workspaces through the
+canvas runtime picker; the old URL-based community-install examples are not a
+supported installation path.
 
-Both the Docker path and the SaaS bare-host path run the same stack:
-
-- **hermes-agent** — real upstream project, installed via
-  `scripts/install.sh` from NousResearch/hermes-agent. Gateway boots
-  with the OpenAI-compatible API server platform enabled on
-  `127.0.0.1:8642` (internal only).
-- **molecule_runtime** — A2A server + bridge adapter. Listens on
-  `:8000` and forwards every incoming message to the local
-  hermes-agent gateway. Canvas, plugins, skills installer see the
-  same A2A contract as any other runtime.
-
-## Two execution paths
-
-This template ships two entrypoints because the platform has two
-execution models — see
-[internal/product/designs/workspace-backends.md](https://git.moleculesai.app/molecule-ai/internal/src/branch/main/product/designs/workspace-backends.md)
-for the full story.
-
-| Path | Used by | Entry | Install recipe |
-|---|---|---|---|
-| Docker (1 container / workspace) | `docker compose up` local dev | `ENTRYPOINT ["start.sh"]` in `Dockerfile` | Image build: `RUN curl install.sh \| bash` in `Dockerfile` |
-| Bare host (1 EC2 / workspace) | SaaS production | `/opt/molecule-venv/bin/molecule-runtime` (CP user-data) | `install.sh` runs at workspace-provision time as `ubuntu` user |
-
-`start.sh` and `install.sh` do the same logical work (install
-hermes-agent, seed `~/.hermes/.env` + `config.yaml`, start `hermes
-gateway`, wait for `:8642`). They stay symmetric; when you change
-one, check the other.
-
-This template was rewritten in v2.0.0 — the previous version was a thin
-OpenAI-compat provider shim that shared the `hermes` name with the real
-project but had none of its agent capabilities (skills, memory, tools,
-self-improvement loop, multi-platform gateway). See
-[`docs/PLANNING.md`](./docs/PLANNING.md) for the full rewrite
-rationale.
-
-## Usage
-
-### In Molecule AI canvas
-
-Select this template when creating a new workspace — the canvas
-Runtime dropdown resolves `hermes` to `workspace-template:hermes`
-via `molecule-monorepo/workspace-server/internal/provisioner/provisioner.go`.
-
-### From a URL (community install)
+## Runtime shape
 
 ```text
-github://Molecule-AI/template-hermes
+Molecule A2A (:8000)
+        |
+        v
+HermesAgentProxyExecutor
+        |
+        v
+hermes-agent gateway (127.0.0.1:8642)
 ```
 
-## Required environment
+- `start.sh` prepares the container, starts `hermes gateway`, waits for its
+  health endpoint, then executes `molecule-runtime` as the `agent` user.
+- `adapter.py` provides `HermesAgentAdapter` and platform/plugin hooks.
+- `executor.py` proxies A2A turns to the loopback Hermes gateway.
+- `config.yaml` is the template's model/provider source. The files under
+  `internal/providers/` are a CI-checked registry projection.
 
-At least one provider key must be set, matching whichever model you
-select in the Config tab. hermes-agent picks the right one by
-prefix — you do **not** pick the provider yourself.
+`install.sh` remains as a tested compatibility hook for downstream host
+installers. It is not the current Molecule production delivery path; the
+published container uses `Dockerfile` and `start.sh`.
 
-| Env var              | Used for                                        |
-|----------------------|-------------------------------------------------|
-| `HERMES_API_KEY`     | Nous Portal (Hermes 3/4 direct)                 |
-| `OPENROUTER_API_KEY` | Anything via OpenRouter (200+ models)           |
-| `ANTHROPIC_API_KEY`  | Claude direct (native SDK inside hermes-agent)  |
-| `OPENAI_API_KEY`     | GPT direct                                      |
-| `GEMINI_API_KEY`     | Gemini direct (native SDK inside hermes-agent)  |
-| `MINIMAX_API_KEY`    | MiniMax direct                                  |
+## Configuration
 
-Set these as workspace-level secrets (`POST /settings/secrets`) — see
-`molecule-monorepo/docs/runbooks/saas-secrets.md` for the canonical
-flow.
+Select a model through the workspace configuration and provide the credential
+declared for that provider. `start.sh` renders the effective Hermes model and
+provider configuration and forwards only the supported credential variables.
+See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the current matrix.
 
-## Persisting skills and memory
+The current container renders Hermes state under `/tmp/.hermes`; platform
+history is reattached when a fresh gateway has no local transcript. Do not
+claim a different home-directory mount is the active persistence contract.
 
-`hermes-agent` writes to `~/.hermes` (`/home/agent/.hermes` in the
-container). Mount this path as a persistent volume if you want skills,
-memory, and cron schedules to survive workspace restarts — the
-platform's default Docker named volume does this automatically as long
-as the workspace isn't re-provisioned from scratch.
+## Important files
 
-## Files
+| Path | Purpose |
+|---|---|
+| `Dockerfile` | Builds the published workspace image |
+| `start.sh` | Supported container entrypoint |
+| `adapter.py` | Adapter and runtime integration |
+| `executor.py` | A2A-to-Hermes gateway bridge |
+| `config.yaml` | Template metadata, providers, models, and bridge settings |
+| `scripts/` | Provider/config helpers and their shell tests |
+| `tests/` | Adapter, release, provenance, and documentation contracts |
 
-| File                 | Purpose                                             |
-|----------------------|-----------------------------------------------------|
-| `Dockerfile`         | Docker-path: builds the image (hermes-agent + molecule_runtime) |
-| `start.sh`           | Docker-path entrypoint: boots hermes gateway, waits for :8642, exec's runtime |
-| `install.sh`         | Bare-host path (EC2/SaaS): runs at provision time as the runtime user. Installs hermes-agent + starts gateway in background. Called by CP user-data after pip-install of molecule_runtime, before molecule-runtime launches. |
-| `adapter.py`         | `HermesAgentAdapter(BaseAdapter)` — just a factory  |
-| `executor.py`        | `HermesAgentProxyExecutor` — A2A → hermes HTTP bridge |
-| `config.yaml`        | Template metadata + model list for the Config tab   |
-| `requirements.txt`   | Python deps for the bridge (molecule_runtime + httpx) |
-| `docs/PLANNING.md`   | Rewrite plan + rationale + phase breakdown          |
-| `docs/ARCHITECTURE.md` | How the bridge works, port map, failure modes     |
-| `docs/MIGRATION.md`  | Upgrade path from v1.x (the old adapter shim)       |
-| `docs/CONFIGURATION.md` | How to pick a model, rotate keys, tune hermes-agent |
+The current file contains `template_schema_version: 1`; change it only with a
+corresponding platform contract change and validation.
 
-## Schema version
+## Upstream freshness
 
-`template_schema_version: 1` — compatible with Molecule AI platform v1.x.
+The effective hermes engine is **stock upstream, installed from a pinned git
+commit**: `ARG HERMES_COMMIT` in the Dockerfile. That ARG is the whole
+reproducibility story, and it is a commit rather than a version for a reason
+worth knowing before you touch this: `~/.local/bin/hermes` is not the venv
+console script, it is a wrapper that execs `$HERMES_ROOT/hermes`, which puts
+the git **checkout** at `sys.path[0]` ahead of site-packages. The gateway runs
+the checkout. A wheel pin in site-packages is inert — which is what it was
+until 2026-09-03, while the checkout silently tracked whatever upstream `main`
+happened to be on build day.
+
+The upstream installer that clones and pins that checkout is vendored at
+`vendor/hermes-agent/install.sh` (a byte copy of `scripts/install.sh` at
+`HERMES_COMMIT`, checked by sha256 at build time) rather than downloaded, so a
+build does not depend on raw.githubusercontent.com. Moving `HERMES_COMMIT`
+means refreshing that copy; `vendor/hermes-agent/README.md` has the steps.
+
+The pin is currently an **unreleased upstream ref**, taken with owner
+authorisation: PyPI's newest `hermes-agent` is still 0.19.0 (2026-07-20) and
+the context-compaction and unattended-approval fixes the fleet needs exist only
+as git refs. `ARG HERMES_PYPI_FLOOR` records the lowest published release that
+would carry them, and the plan is to return to a tagged release once one
+exists.
+
+The Molecule A2A integration lives entirely in the
+[`hermes-platform-molecule-a2a`](https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a)
+plugin, which registers through upstream's `ctx.register_platform(...)`
+socket (NousResearch #17751). There is **no patched fork** — the interim
+`molecule-ai/hermes-agent` fork was retired on 2026-07-22 (#294) once the
+plugin migrated to the upstream API.
+
+A daily bot (`.gitea/workflows/upstream-sync.yml`, 06:17 UTC + manual
+dispatch) compares PyPI's latest `hermes-agent` against `HERMES_PYPI_FLOOR`.
+Below the floor it does nothing; at or above it, it files an issue with the
+checklist for returning to a published release. It deliberately does **not**
+auto-bump `HERMES_COMMIT` to newer git refs — every such bump is unreviewed
+third-party code entering a customer image, so the pin moves when someone
+decides it should. The bot only surfaces work; it never gates or lands
+anything.
+
+## Development and delivery
+
+See [`runbooks/local-dev-setup.md`](runbooks/local-dev-setup.md) for commands
+that mirror CI. Pull requests run static, shell, adapter-conformance, and image
+checks. A push to `main` invokes `publish-image`, which publishes to the Gitea
+OCI registry and runs the configured pin verification. Do not use a manual
+registry script or direct-main-push release procedure.
 
 ## License
 
-Business Source License 1.1 — © Molecule AI. `hermes-agent` itself is
-MIT-licensed by Nous Research and installed from its upstream repo at
-build time.
+Business Source License 1.1 — © Molecule AI. The upstream `hermes-agent`
+project is installed under its own license.
