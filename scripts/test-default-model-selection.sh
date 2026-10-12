@@ -147,7 +147,7 @@ check "HERMES_DEFAULT_MODEL wins" "$got" "zai/glm-4.6"
 
 # 6. No CP unified model at all → key-presence guess still fires (last resort).
 got=$(run_case 'MINIMAX_API_KEY=x')
-check "key-presence fallback still works (no CP model)" "$got" "minimax/MiniMax-M2.7-highspeed"
+check "key-presence fallback still works (no CP model)" "$got" "minimax/MiniMax-M3"
 
 # --- Platform-managed fail-loud guard (outcome-based) ---
 
@@ -178,7 +178,7 @@ check "legacy LLM_PROVIDER=platform alone does NOT fail loud" "$got" "0"
 got=$(run_case_rc 'MOLECULE_RESOLVED_PROVIDER=minimax MINIMAX_API_KEY=x')
 check "byok arm is unaffected by the guard (rc)" "$got" "0"
 got=$(run_case 'MOLECULE_RESOLVED_PROVIDER=minimax MINIMAX_API_KEY=x')
-check "byok arm resolves a priced model" "$got" "minimax/MiniMax-M2.7-highspeed"
+check "byok arm resolves a priced model" "$got" "minimax/MiniMax-M3"
 
 # 13. Finding-1 regression: platform arm + a pinned HERMES_INFERENCE_PROVIDER +
 #     a delivered CP MOLECULE_MODEL but NO explicit HERMES model. The inherit
