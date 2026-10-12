@@ -1032,6 +1032,8 @@ jobs:
       - if: github.event.pull_request.head.repo.fork != true
         run: bash scripts/test-derive-platform-llm.sh
       - if: github.event.pull_request.head.repo.fork != true
+        run: bash scripts/test-derive-minimax-bridge.sh
+      - if: github.event.pull_request.head.repo.fork != true
         run: bash scripts/test-install-prefix-strip.sh
       - if: github.event.pull_request.head.repo.fork != true
         run: bash scripts/test-load-workspace-config.sh
