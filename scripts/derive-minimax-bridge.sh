@@ -75,10 +75,11 @@ molecule_derive_minimax_bridge() {
     export HERMES_CUSTOM_BASE_URL="${MINIMAX_BASE_URL:-${_mm_base}}"
     export HERMES_CUSTOM_API_KEY="${_mm_key}"
     export HERMES_CUSTOM_API_MODE="chat_completions"
-    # MiniMax expects the BARE model id (MiniMax-M2.7-highspeed) once requests
-    # land on its OpenAI-compat surface, not the prefixed slug.
-    DEFAULT_MODEL="${DEFAULT_MODEL#minimax-cn/}"
-    DEFAULT_MODEL="${DEFAULT_MODEL#minimax/}"
+    # Both registered BYOK colon IDs and native slash IDs become the bare
+    # upstream model before switching to Hermes's custom provider.
+    case "${DEFAULT_MODEL}" in
+        minimax-cn[/:]*|minimax[/:]*) DEFAULT_MODEL="${DEFAULT_MODEL#*[/:]}" ;;
+    esac
     PROVIDER="custom"
 
     # NEVER print the key.

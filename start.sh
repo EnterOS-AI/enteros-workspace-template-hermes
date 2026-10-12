@@ -490,7 +490,7 @@ if [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ] &&
   elif [ -n "${OPENAI_API_KEY:-}" ]; then
     HERMES_DEFAULT_MODEL="openai/gpt-4o"
   elif [ -n "${MINIMAX_API_KEY:-}" ]; then
-    HERMES_DEFAULT_MODEL="minimax/MiniMax-M2.7-highspeed"
+    HERMES_DEFAULT_MODEL="minimax/MiniMax-M3"
   elif [ -n "${MINIMAX_CN_API_KEY:-}" ]; then
     HERMES_DEFAULT_MODEL="minimax-cn/abab6.5-chat"
   elif [ -n "${GEMINI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then

@@ -5,6 +5,11 @@ The active configuration is derived by `start.sh` from the workspace's
 environment. `config.yaml` in this repository defines the template defaults and
 the model/provider choices shown by the platform.
 
+The template defaults to platform-managed MiniMax M3 (`minimax/MiniMax-M3`),
+which uses the platform proxy and needs no personal MiniMax key. The separate
+`minimax:MiniMax-M3` choice uses `MINIMAX_API_KEY`. Existing explicit model
+selections keep their normal precedence.
+
 ## Model and provider precedence
 
 1. Platform-resolved model/provider values are authoritative when present.

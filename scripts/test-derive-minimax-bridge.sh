@@ -35,10 +35,36 @@ check "byok" \
   "custom|https://api.minimax.io/v1|chat_completions|MiniMax-M2.7-highspeed" \
   "$(run 'PROVIDER=minimax; MINIMAX_API_KEY=k; DEFAULT_MODEL=minimax/MiniMax-M2.7-highspeed')"
 
+echo "[test] registered colon M3 and native slash M3 send bare upstream IDs"
+for model in minimax:MiniMax-M3 minimax/MiniMax-M3 MiniMax-M3; do
+  check "$model" \
+    "custom|https://api.minimax.io/v1|chat_completions|MiniMax-M3" \
+    "$(run "PROVIDER=minimax; MINIMAX_API_KEY=k; DEFAULT_MODEL=$model")"
+done
+
+echo "[test] Docker and bare-host routing order preserves the bridged M3 ID"
+for caller in start.sh install.sh; do
+  actual=$(
+    DEFAULT_MODEL=minimax:MiniMax-M3
+    MINIMAX_API_KEY=k
+    MOLECULE_RESOLVED_PROVIDER=byok-minimax
+    HERMES_INFERENCE_MODEL="$DEFAULT_MODEL" . "$(dirname "$BRIDGE")/derive-provider.sh" >/dev/null
+    . "$(dirname "$BRIDGE")/derive-platform-llm.sh" >/dev/null
+    MOLECULE_BRIDGE_CALLER="$caller" . "$BRIDGE" >/dev/null
+    # Execute the entrypoint's actual final normalization block as well.
+    eval "$(sed -n '/^if \[ "${PROVIDER}" = "minimax" \]/,/^fi$/p' "$(dirname "$BRIDGE")/../$caller")" >/dev/null
+    printf '%s|%s|%s' "$PROVIDER" "$HERMES_CUSTOM_BASE_URL" "$DEFAULT_MODEL"
+  )
+  check "$caller colon M3" "custom|https://api.minimax.io/v1|MiniMax-M3" "$actual"
+done
+
 echo "[test] minimax-cn uses the CN endpoint + CN key"
 check "cn" \
   "custom|https://api.minimaxi.com/v1|chat_completions|abab6.5-chat" \
   "$(run 'PROVIDER=minimax-cn; MINIMAX_CN_API_KEY=k; DEFAULT_MODEL=minimax-cn/abab6.5-chat')"
+check "cn colon" \
+  "custom|https://api.minimaxi.com/v1|chat_completions|MiniMax-M3" \
+  "$(run 'PROVIDER=minimax-cn; MINIMAX_CN_API_KEY=k; DEFAULT_MODEL=minimax-cn:MiniMax-M3')"
 
 echo "[test] MOLECULE_PLATFORM_LLM_ACTIVE=1 is NOT bridged (platform proxy owns base_url)"
 check "platform_active" \
