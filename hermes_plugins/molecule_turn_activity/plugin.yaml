@@ -1,0 +1,8 @@
+name: molecule_turn_activity
+version: "1.0.0"
+description: >-
+  Touches MOLECULE_TOOL_ACTIVITY_FILE after every tool call so the Molecule
+  runtime's turn lease sees the gateway working.
+kind: standalone
+provides_hooks:
+  - post_tool_call

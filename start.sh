@@ -774,6 +774,11 @@ fi
   # on :8642 — both run side-by-side. The runtime adapter still uses
   # the api-server bridge today; switching to the plugin path is a
   # separate adapter.py change (post-demo).
+  echo "plugins:"
+  echo "  enabled:"
+  # Turn-lease liveness feed (runtime#417), installed further down. It is
+  # transport-independent, so it is enabled whether or not molecule-a2a is.
+  echo "    - molecule_turn_activity"
   if [ "${MOLECULE_A2A_PLATFORM_ENABLED:-true}" = "true" ]; then
     # Default the plugin's callback URL to the executor's reply
     # server (started by adapter.create_executor → executor.start()).
@@ -787,8 +792,6 @@ fi
     # loaded, :8645 never bound, adapter.setup() failed, boot's TOOL
     # step waited forever). The name is the entry-point name from the
     # plugin's pyproject (molecule_a2a), not the platform key.
-    echo "plugins:"
-    echo "  enabled:"
     echo "    - molecule_a2a"
     echo "platforms:"
     echo "  molecule-a2a:"
@@ -839,6 +842,38 @@ fi
   MOLECULE_MCP_PORT="${MOLECULE_MCP_PORT:-9100}" python3 -c 'import os, sys, yaml; sys.stdout.write(yaml.safe_dump({"mcp_servers": {"molecule": {"url": "http://127.0.0.1:%s/mcp" % os.environ["MOLECULE_MCP_PORT"]}}}, sort_keys=False))'
 } >"$HERMES_CONFIG"
 chown agent:agent "$HERMES_CONFIG"
+
+# --- Turn-lease liveness feed (runtime#417) ---
+# The runtime judges whether a turn is still working from the mtime of
+# MOLECULE_TOOL_ACTIVITY_FILE and exports that variable per turn, inside its
+# own process. The gateway that runs the tools is started once, below, so it
+# never had the variable and the lease read idle for the container's whole
+# life: the scheduler cancelled and re-queued every long turn every 30 s.
+# One path is fixed here and inherited by both the gateway and the runtime;
+# the molecule_turn_activity hermes plugin touches it after every tool call.
+# The runtime honours an explicit path in both kernel modes
+# (executor_helpers.tool_activity_file). A path set by the platform or an
+# operator wins. The default gets its own 0700 agent-owned directory because
+# the runtime chmods the file's parent directory to 0700.
+if [ -z "${MOLECULE_TOOL_ACTIVITY_FILE:-}" ]; then
+  MOLECULE_TOOL_ACTIVITY_FILE="/tmp/molecule-turn-lease/tool_activity"
+  install -d -m 700 -o agent -g agent "$(dirname "$MOLECULE_TOOL_ACTIVITY_FILE")"
+fi
+export MOLECULE_TOOL_ACTIVITY_FILE
+TURN_PLUGIN_SRC="/app/hermes_plugins/molecule_turn_activity"
+[ -d "$TURN_PLUGIN_SRC" ] || TURN_PLUGIN_SRC="$(dirname "$0")/hermes_plugins/molecule_turn_activity"
+TURN_PLUGIN_DST="${HERMES_HOME}/plugins/molecule_turn_activity"
+if [ -f "${TURN_PLUGIN_SRC}/__init__.py" ] && [ -f "${TURN_PLUGIN_SRC}/plugin.yaml" ]; then
+  install -d -o agent -g agent "${HERMES_HOME}/plugins" "$TURN_PLUGIN_DST"
+  install -m 644 -o agent -g agent \
+      "${TURN_PLUGIN_SRC}/plugin.yaml" "${TURN_PLUGIN_SRC}/__init__.py" "${TURN_PLUGIN_DST}/"
+  echo "[start.sh] turn-lease feed: plugin installed in ${TURN_PLUGIN_DST}," \
+       "MOLECULE_TOOL_ACTIVITY_FILE=${MOLECULE_TOOL_ACTIVITY_FILE}"
+else
+  echo "[start.sh] ERROR turn-lease feed plugin missing at ${TURN_PLUGIN_SRC}: the" \
+       "runtime turn lease will read idle while hermes runs tools, and the scheduler" \
+       "will cancel and re-queue long turns. Boot CONTINUES." >&2
+fi
 
 # --- Start the Molecule A2A MCP HTTP server ---
 # Exposes all Molecule platform tools (list_peers, delegate_task, recall_memory,
