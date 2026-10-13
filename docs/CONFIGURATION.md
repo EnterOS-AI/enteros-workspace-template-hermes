@@ -68,6 +68,33 @@ The boot path writes the native Hermes MCP descriptor for the loopback
 adapter registry and materializes compatible skills/rules before serving. Do
 not add a second shell plugin installer.
 
+## Memory and skill-review knobs
+
+Set these as workspace environment variables or secrets. Each is optional and
+unset keeps current behaviour. An invalid value is logged at WARNING during
+boot and ignored.
+
+| Variable | Effect | Accepted values |
+|---|---|---|
+| `HERMES_MEMORY_CHAR_LIMIT` | `memory.memory_char_limit` | integer `>= 1`; Hermes default `2200` |
+| `HERMES_USER_CHAR_LIMIT` | `memory.user_char_limit` | integer `>= 1`; Hermes default `1375` |
+| `HERMES_MEMORY_NUDGE_INTERVAL` | `memory.nudge_interval`, user turns between background memory reviews | integer `>= 0`, `0` turns the review off; Hermes default `10` |
+| `HERMES_SKILL_NUDGE_INTERVAL` | `skills.creation_nudge_interval`, tool iterations between background skill reviews | integer `>= 0`, `0` turns the review off; Hermes default `10` |
+
+`start.sh` writes the memory and skill keys into the generated
+`/tmp/.hermes/config.yaml`, which is the file the gateway reads. They apply to
+agents created after boot. A hand edit of that file is lost on restart because
+`start.sh` regenerates it.
+
+## Bundled Node.js
+
+The Hermes installer bundles `node`, `npm`, and `npx` in
+`/home/agent/.hermes/node/bin`. When `node` and `npx` are present there,
+`start.sh` prepends that directory to the gateway's `PATH`. The image also
+installs the same rule as `/etc/profile.d/hermes-node-path.sh`. The terminal
+tool runs commands from a login-shell snapshot, where Debian's `/etc/profile`
+replaces `PATH`, so this file is what puts Node.js on the terminal's `PATH`.
+
 ## State and continuity
 
 The current Hermes home is `/tmp/.hermes`, so gateway-local state is not the

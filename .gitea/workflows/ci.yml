@@ -374,6 +374,14 @@ jobs:
             echo "::error::image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
             exit 1
           fi
+          # hermes' terminal tool runs agent commands from a `bash -l` snapshot
+          # as the agent user with HOME=/tmp, and Debian's /etc/profile resets
+          # PATH there. The bundled node/npx must still resolve in that shell.
+          if ! LOGIN_NODE="$(docker run --rm --user 1000:1000 -e HOME=/tmp --entrypoint bash "$SMOKE_TAG" -lc 'command -v node && command -v npx' 2>&1)"; then
+            echo "::error::bundled node/npx do not resolve in an agent login shell, so the terminal tool cannot run node: ${LOGIN_NODE}"
+            exit 1
+          fi
+          echo "agent login shell resolves bundled node: ${LOGIN_NODE//$'\n'/ }"
           echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
@@ -1131,6 +1139,8 @@ jobs:
           tests/test_github_cli_present.py
           tests/test_context_overflow_autoheal.py
           tests/test_cron_approval_mode.py
+          tests/test_memory_skill_knobs.py
+          tests/test_bundled_node_path.py
           tests/test_executor_plugin_path.py
           tests/test_vendor_branding_neutralized.py
           tests/test_vendored_hermes_installer.py
