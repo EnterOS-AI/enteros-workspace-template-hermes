@@ -765,6 +765,43 @@ fi
       ;;
   esac
   echo "  cron_mode: \"${_CRON_MODE}\""
+  # --- Memory and skill-review knobs (issue #383) ---
+  # Unset writes nothing, so hermes keeps its defaults (2200 / 1375 chars, a
+  # background review every 10 turns; an interval of 0 turns that review off).
+  # Values must reach the YAML as bare decimal integers: agent_init passes the
+  # char limits to MemoryStore uncoerced, so a string breaks every memory
+  # operation, and PyYAML reads 010 as octal. Anything else is refused with a
+  # WARNING.
+  # skills_render later merges skills.external_dirs into this same mapping.
+  hermes_int_knob() {  # $1 = env var name, $2 = minimum; prints the value or nothing
+    local value="${!1:-}"
+    [ -n "$value" ] || return 0
+    case "$value" in
+      *[!0-9]*|0?*) ;;
+      *)
+        if [ "${#value}" -le 9 ] && [ "$value" -ge "$2" ]; then
+          printf '%s' "$value"
+          return 0
+        fi
+        ;;
+    esac
+    echo "[start.sh] WARNING: $1='${value}' is not a whole number >= $2 (no sign," \
+         "no leading zero); ignored, hermes keeps its built-in default." >&2
+  }
+  _MEMORY_CHARS="$(hermes_int_knob HERMES_MEMORY_CHAR_LIMIT 1)"
+  _USER_CHARS="$(hermes_int_knob HERMES_USER_CHAR_LIMIT 1)"
+  _MEMORY_NUDGE="$(hermes_int_knob HERMES_MEMORY_NUDGE_INTERVAL 0)"
+  _SKILL_NUDGE="$(hermes_int_knob HERMES_SKILL_NUDGE_INTERVAL 0)"
+  if [ -n "${_MEMORY_CHARS}${_USER_CHARS}${_MEMORY_NUDGE}" ]; then
+    echo "memory:"
+    [ -z "$_MEMORY_CHARS" ] || echo "  memory_char_limit: ${_MEMORY_CHARS}"
+    [ -z "$_USER_CHARS" ] || echo "  user_char_limit: ${_USER_CHARS}"
+    [ -z "$_MEMORY_NUDGE" ] || echo "  nudge_interval: ${_MEMORY_NUDGE}"
+  fi
+  if [ -n "$_SKILL_NUDGE" ]; then
+    echo "skills:"
+    echo "  creation_nudge_interval: ${_SKILL_NUDGE}"
+  fi
   # --- Molecule A2A platform plugin ---
   # Loaded into hermes via the hermes_agent.plugins entry point baked
   # into the image (see Dockerfile). When enabled, hermes opens a
@@ -985,6 +1022,21 @@ else
   echo "[start.sh] molecule-runtime-prepare not in this runtime wheel; using the post-launch reconcile watcher"
 fi
 
+# --- Bundled Node.js on the gateway PATH ---
+# The hermes installer's node/npm/npx live under /home/agent/.hermes/node/bin,
+# outside both this PATH and hermes' runtime HERMES_HOME. scripts/
+# hermes-node-path.sh prepends that dir only when node and npx are executable
+# there; the same file is the image's /etc/profile.d drop-in, which is what
+# reaches the terminal tool's login-shell commands.
+GATEWAY_PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+NODE_PATH_SCRIPT="/app/scripts/hermes-node-path.sh"
+[ -f "$NODE_PATH_SCRIPT" ] || NODE_PATH_SCRIPT="$(dirname "$0")/scripts/hermes-node-path.sh"
+if [ -f "$NODE_PATH_SCRIPT" ]; then
+  # shellcheck source=scripts/hermes-node-path.sh
+  GATEWAY_PATH="$(PATH="$GATEWAY_PATH"; . "$NODE_PATH_SCRIPT"; printf '%s' "$PATH")"
+fi
+echo "[start.sh] gateway PATH=${GATEWAY_PATH}"
+
 # --- Start hermes gateway in the background ---
 # `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
 # /tmp so the lookup resolves to /tmp/.hermes/.env (writable; matches
@@ -1001,7 +1053,7 @@ fi
 # wants strict turn ordering; the canvas Stop button cancels via the task
 # API, so no interrupt-by-chat capability is lost.
 # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
-nohup ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+nohup ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH="$GATEWAY_PATH" \
     bash -c "cd /tmp && hermes gateway" \
     >>"$LOG_FILE" 2>&1 &
 GATEWAY_PID=$!
@@ -1037,7 +1089,7 @@ echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWA
 # (scripts/test-mcp-reconcile-watch.sh) and exercised per-PR. Full
 # rationale lives in that script's header. Backgrounded; survives the
 # exec of molecule-runtime below.
-MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LAUNCH_CMD="exec ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH=/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash -c 'cd /tmp && hermes gateway'" MCPWATCH_HEALTH_URL="http://127.0.0.1:${API_SERVER_PORT:-8642}/health" MCPWATCH_LOG_FILE="$LOG_FILE" MCPWATCH_MARKER="/tmp/.hermes/.clean_shutdown"   bash /usr/local/bin/mcp-reconcile-watch.sh &
+MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LAUNCH_CMD="exec ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH=${GATEWAY_PATH} bash -c 'cd /tmp && hermes gateway'" MCPWATCH_HEALTH_URL="http://127.0.0.1:${API_SERVER_PORT:-8642}/health" MCPWATCH_LOG_FILE="$LOG_FILE" MCPWATCH_MARKER="/tmp/.hermes/.clean_shutdown"   bash /usr/local/bin/mcp-reconcile-watch.sh &
 
 # --- Smoke: confirm hermes sees the molecule MCP server in `mcp list` ---
 # Belt-and-braces check: even if config.yaml has mcp_servers.molecule
@@ -1048,7 +1100,7 @@ MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LA
 # transient stdin issue), we don't want to refuse boot — but a config
 # without `molecule` in it IS a real failure, so we exit non-zero on that.
 # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
-MCP_LIST_OUT=$(${AS_AGENT} env HOME=/tmp PATH="/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+MCP_LIST_OUT=$(${AS_AGENT} env HOME=/tmp PATH="$GATEWAY_PATH" \
     timeout 10 hermes mcp list 2>&1 || true)
 if echo "$MCP_LIST_OUT" | grep -q "^[[:space:]]*molecule[[:space:]]"; then
   echo "[start.sh] hermes mcp list shows 'molecule' wired"

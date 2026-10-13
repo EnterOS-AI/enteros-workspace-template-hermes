@@ -146,6 +146,11 @@ RUN chmod +x /usr/local/bin/start.sh /usr/local/bin/mcp-reconcile-watch.sh
 COPY scripts/molecule-askpass /usr/local/bin/molecule-askpass
 RUN chmod +x /usr/local/bin/molecule-askpass
 
+# hermes' terminal tool runs agent commands from a `bash -l` snapshot, and
+# Debian's /etc/profile overwrites PATH there, so the bundled Node.js only
+# reaches those commands through /etc/profile.d (see the script header).
+COPY scripts/hermes-node-path.sh /etc/profile.d/hermes-node-path.sh
+
 # --- Install the real Nous Research hermes-agent as the agent user ---
 # The installer lives under the agent's home (~/.hermes, symlinks the
 # `hermes` entrypoint into ~/.local/bin/). Running as root would place

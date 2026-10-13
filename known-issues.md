@@ -22,6 +22,18 @@ provider helper scripts. When multiple credentials exist, the resolved
 platform provider or an explicit `HERMES_INFERENCE_PROVIDER` avoids ambiguous
 auto-detection. See `docs/CONFIGURATION.md` for the supported variables.
 
+## Hermes no longer resets sessions on a timer
+
+Upstream commit `1d5d0594` ("stop time-triggered conversation rotation"),
+included in the pinned `HERMES_COMMIT`, made `session_reset:` in `config.yaml`
+and the `SESSION_IDLE_MINUTES` / `SESSION_RESET_HOUR` variables inert. A
+gateway conversation lasts until something sends `/new`. On a scheduled
+workspace nothing does, and a long-lived session drifts toward its own
+compacted history (#383). Writing `session_reset:` into the generated config
+does not change this. Use `HERMES_SESSION_RESET_MODE` and its companions
+(`docs/CONFIGURATION.md`), which make the executor send `/new` before the turn
+that crosses the boundary.
+
 ## Compatibility host installer
 
 `install.sh` is retained because downstream compatibility tests exercise it.
