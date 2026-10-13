@@ -38,8 +38,9 @@ Select a model through the workspace configuration and provide the credential
 declared for that provider. `start.sh` renders the effective Hermes model and
 provider configuration and forwards only the supported credential variables.
 See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the current matrix,
-including the optional memory (`HERMES_MEMORY_CHAR_LIMIT`,
-`HERMES_USER_CHAR_LIMIT`) and background-review
+including the optional session-reset (`HERMES_SESSION_RESET_*`,
+`HERMES_SESSION_IDLE_MINUTES`), memory (`HERMES_MEMORY_CHAR_LIMIT`,
+`HERMES_USER_CHAR_LIMIT`), and background-review
 (`HERMES_MEMORY_NUDGE_INTERVAL`, `HERMES_SKILL_NUDGE_INTERVAL`) knobs.
 
 The current container renders Hermes state under `/tmp/.hermes`; platform

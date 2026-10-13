@@ -68,7 +68,7 @@ The boot path writes the native Hermes MCP descriptor for the loopback
 adapter registry and materializes compatible skills/rules before serving. Do
 not add a second shell plugin installer.
 
-## Memory and skill-review knobs
+## Session, memory, and skill-review knobs
 
 Set these as workspace environment variables or secrets. Each is optional and
 unset keeps current behaviour. An invalid value is logged at WARNING during
@@ -76,6 +76,9 @@ boot and ignored.
 
 | Variable | Effect | Accepted values |
 |---|---|---|
+| `HERMES_SESSION_RESET_MODE` | Start a fresh Hermes session (Hermes' own `/new`) before the first turn past a boundary | `none` (default), `idle`, `daily`, `both` |
+| `HERMES_SESSION_RESET_HOUR` | Daily boundary, container local time (UTC in the platform image) | `0`-`23`; default `4` |
+| `HERMES_SESSION_IDLE_MINUTES` | Idle gap since the previous turn finished | integer `>= 1`; default `1440` |
 | `HERMES_MEMORY_CHAR_LIMIT` | `memory.memory_char_limit` | integer `>= 1`; Hermes default `2200` |
 | `HERMES_USER_CHAR_LIMIT` | `memory.user_char_limit` | integer `>= 1`; Hermes default `1375` |
 | `HERMES_MEMORY_NUDGE_INTERVAL` | `memory.nudge_interval`, user turns between background memory reviews | integer `>= 0`, `0` turns the review off; Hermes default `10` |
@@ -85,6 +88,12 @@ boot and ignored.
 `/tmp/.hermes/config.yaml`, which is the file the gateway reads. They apply to
 agents created after boot. A hand edit of that file is lost on restart because
 `start.sh` regenerates it.
+
+The session-reset knobs are applied by `executor.py`, not by Hermes. The pinned
+Hermes ignores `session_reset:` in `config.yaml` (see `known-issues.md`). A
+reset is never sent while another turn on the same chat is running, and the
+first turn after a container start only starts the clock. They apply to the
+plugin transport, which is the image default.
 
 ## Bundled Node.js
 

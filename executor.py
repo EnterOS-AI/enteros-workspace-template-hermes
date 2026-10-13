@@ -50,8 +50,11 @@ import json
 import logging
 import os
 import socket
+import time
 import uuid
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, Optional
 
 import httpx
 
@@ -324,6 +327,154 @@ def _reply_message_with_tool_trace(text: str, trace: list[dict[str, str]]):
     return msg
 
 
+# --- Scheduled session reset (issue #383) -----------------------------------
+# hermes no longer rotates a gateway conversation on a timer. Upstream
+# 1d5d0594 ("stop time-triggered conversation rotation", inside the pinned
+# v0.21.5) made `session_reset:` in config.yaml and SESSION_IDLE_MINUTES /
+# SESSION_RESET_HOUR inert: a conversation now lasts until someone sends /new.
+# On a scheduled workspace nobody does, so one session grows for days and the
+# agent starts imitating its own compacted history (#383: "nothing to do" with
+# zero tool calls after ~12 h of ticks, cured by a single /new). The same three
+# knobs are applied here instead, by sending hermes's own /new ahead of the
+# turn that crosses the boundary. Unset keeps today's behaviour: no resets.
+_SESSION_RESET_MODES = frozenset({"none", "idle", "daily", "both"})
+# hermes's former SessionResetPolicy defaults, so the knobs mean what they meant.
+_DEFAULT_SESSION_RESET_HOUR = 4
+_DEFAULT_SESSION_IDLE_MINUTES = 1440
+
+
+def _int_env_or_warn(name: str, default: int, low: int, high: Optional[int]) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value: Optional[int] = int(raw)
+    except ValueError:
+        value = None
+    if value is None or value < low or (high is not None and value > high):
+        accepted = f"{low}-{high}" if high is not None else f">= {low}"
+        logger.warning(
+            "%s=%r is not an integer in %s; using the default %d instead",
+            name, raw, accepted, default,
+        )
+        return default
+    return value
+
+
+def _last_daily_boundary(now: float, at_hour: int) -> float:
+    """Epoch of the most recent ``at_hour:00`` (container local time) <= now."""
+    local = datetime.fromtimestamp(now)
+    boundary = local.replace(hour=at_hour, minute=0, second=0, microsecond=0)
+    if boundary > local:
+        boundary -= timedelta(days=1)
+    return boundary.timestamp()
+
+
+@dataclass(frozen=True)
+class SessionResetPolicy:
+    mode: str = "none"
+    at_hour: int = _DEFAULT_SESSION_RESET_HOUR
+    idle_minutes: int = _DEFAULT_SESSION_IDLE_MINUTES
+
+    @classmethod
+    def from_env(cls) -> "SessionResetPolicy":
+        """Read HERMES_SESSION_RESET_MODE / _HOUR / HERMES_SESSION_IDLE_MINUTES.
+
+        An unrecognised value is never fatal: it is logged at WARNING and the
+        default is used, so a typo cannot stop the workspace from serving.
+        """
+        raw_mode = os.environ.get("HERMES_SESSION_RESET_MODE", "").strip()
+        mode = raw_mode.lower() or "none"
+        if mode not in _SESSION_RESET_MODES:
+            logger.warning(
+                "HERMES_SESSION_RESET_MODE=%r is not one of none|idle|daily|both; "
+                "hermes sessions will NOT be reset",
+                raw_mode,
+            )
+            mode = "none"
+        policy = cls(
+            mode=mode,
+            at_hour=_int_env_or_warn(
+                "HERMES_SESSION_RESET_HOUR", _DEFAULT_SESSION_RESET_HOUR, 0, 23
+            ),
+            idle_minutes=_int_env_or_warn(
+                "HERMES_SESSION_IDLE_MINUTES", _DEFAULT_SESSION_IDLE_MINUTES, 1, None
+            ),
+        )
+        if policy.mode != "none":
+            logger.info(
+                "hermes session reset policy: mode=%s at_hour=%d (container local "
+                "time) idle_minutes=%d",
+                policy.mode, policy.at_hour, policy.idle_minutes,
+            )
+        return policy
+
+    def reset_reason(
+        self, now: float, last_start: Optional[float], last_end: Optional[float]
+    ) -> Optional[str]:
+        """Why a turn starting at ``now`` needs a fresh session, or None.
+
+        ``idle``: the chat's previous turn finished more than ``idle_minutes``
+        ago. ``daily``: the previous turn started before the latest
+        ``at_hour`` boundary. The first turn this process sees on a chat never
+        resets: a container restart is not a boundary (hermes's own rule).
+        """
+        if self.mode == "none" or last_start is None:
+            return None
+        if (
+            self.mode in ("idle", "both")
+            and last_end is not None
+            and now - last_end > self.idle_minutes * 60
+        ):
+            return "idle"
+        if self.mode in ("daily", "both") and last_start < _last_daily_boundary(
+            now, self.at_hour
+        ):
+            return "daily"
+        return None
+
+
+class _SessionResetClock:
+    """Per-chat turn timestamps and in-flight counts for SessionResetPolicy."""
+
+    def __init__(
+        self, policy: SessionResetPolicy, clock: Callable[[], float] = time.time
+    ) -> None:
+        self.policy = policy
+        self._clock = clock
+        self._started: Dict[str, float] = {}
+        self._finished: Dict[str, float] = {}
+        self._in_flight: Dict[str, int] = {}
+
+    def begin(self, chat_id: str) -> Optional[str]:
+        """Record a turn start; return the reset reason if one is due first.
+
+        A turn that overlaps one already in flight on the chat is never reset
+        (/new would interrupt the running turn) and does not move the start
+        clock, so the next turn that starts alone still sees the boundary.
+        Synchronous on purpose: two deliveries racing on the event loop cannot
+        both see the chat idle.
+        """
+        if self._in_flight.get(chat_id):
+            self._in_flight[chat_id] += 1
+            return None
+        now = self._clock()
+        reason = self.policy.reset_reason(
+            now, self._started.get(chat_id), self._finished.get(chat_id)
+        )
+        self._started[chat_id] = now
+        self._in_flight[chat_id] = 1
+        return reason
+
+    def end(self, chat_id: str) -> None:
+        self._finished[chat_id] = self._clock()
+        remaining = self._in_flight.get(chat_id, 0) - 1
+        if remaining > 0:
+            self._in_flight[chat_id] = remaining
+        else:
+            self._in_flight.pop(chat_id, None)
+
+
 class HermesAgentProxyExecutor(AgentExecutor):
     """Forwards every A2A turn to hermes-agent."""
 
@@ -370,6 +521,12 @@ class HermesAgentProxyExecutor(AgentExecutor):
         self._reply_runner: Optional["web.AppRunner"] = None
         self._reply_site: Optional["web.TCPSite"] = None
         self._started: bool = False
+
+        # Scheduled session reset (issue #383). None = never reset (default).
+        reset_policy = SessionResetPolicy.from_env()
+        self._session_clock: Optional[_SessionResetClock] = (
+            _SessionResetClock(reset_policy) if reset_policy.mode != "none" else None
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle (called by adapter.create_executor)
@@ -477,9 +634,22 @@ class HermesAgentProxyExecutor(AgentExecutor):
             # volume) this can be revisited. See RFC #600 sibling
             # discussion in #497.
             history = self._extract_history_from_context(context)
-            await self._execute_via_plugin(
-                context, event_queue, prompt, history=history
-            )
+            clock = getattr(self, "_session_clock", None)
+            if clock is None:
+                await self._execute_via_plugin(
+                    context, event_queue, prompt, history=history
+                )
+                return
+            chat_id = self._derive_chat_id(context)
+            reason = clock.begin(chat_id)
+            try:
+                if reason:
+                    await self._scheduled_session_reset(context, chat_id, reason)
+                await self._execute_via_plugin(
+                    context, event_queue, prompt, history=history
+                )
+            finally:
+                clock.end(chat_id)
         else:
             # Legacy chat_completions path: /v1/chat/completions is
             # stateless by contract — it has no session store of its own,
@@ -582,6 +752,31 @@ class HermesAgentProxyExecutor(AgentExecutor):
             _reply_message_with_tool_trace(
                 text, _tool_trace_from_session_delta(session_snapshot)
             )
+        )
+
+    async def _scheduled_session_reset(
+        self, context: RequestContext, chat_id: str, reason: str
+    ) -> None:
+        """Put this turn on a fresh hermes session (see SessionResetPolicy).
+
+        A failed reset is logged by ``_reset_hermes_session`` and the turn
+        proceeds on the existing session: a missed reset must not cost the turn.
+        """
+        peer_id, peer_name = self._derive_peer_identity(context)
+        logger.info(
+            "session reset policy: %s boundary passed for chat_id=%s; sending /new "
+            "before this turn",
+            reason,
+            chat_id,
+        )
+        await self._reset_hermes_session(
+            chat_id=chat_id,
+            peer_id=peer_id,
+            peer_name=peer_name,
+            callback_url=(
+                f"http://{self._callback_host}:{self._callback_port}"
+                f"{_DEFAULT_CALLBACK_PATH}"
+            ),
         )
 
     async def _reset_hermes_session(
