@@ -74,6 +74,20 @@ Both paths have bounded wall-clock timeouts. The executor also exposes the
 Molecule MCP dispatcher so peer and workspace tools use the common runtime
 contract instead of a template-local implementation.
 
+## Turn liveness
+
+The runtime's turn lease (`molecule_runtime.turn_lease`) decides whether an
+in-flight turn is still working from the mtime of `MOLECULE_TOOL_ACTIVITY_FILE`.
+A trigger such as the scheduler cancels and re-queues a turn whose lease has
+gone idle. The tools run inside the `hermes gateway` process, which `start.sh`
+starts once, so `start.sh` fixes one path at boot
+(`/tmp/molecule-turn-lease/tool_activity` unless the variable is already set)
+and exports it to both the gateway and `molecule-runtime`. The
+`molecule_turn_activity` Hermes plugin in `hermes_plugins/` is installed into
+`$HERMES_HOME/plugins`, listed in `plugins.enabled`, and touches that file after
+every tool call. Activity is measured per tool call, so a single tool call that
+runs longer than the lease TTL (900 s by default) reads idle until it returns.
+
 ## Sources of truth
 
 | Concern | Source |
@@ -81,6 +95,7 @@ contract instead of a template-local implementation.
 | Boot, rendered Hermes config, provider env | `start.sh` and `scripts/*.sh` |
 | Adapter hooks and health selection | `adapter.py` |
 | Transport choice and turn behavior | `executor.py` |
+| Gateway-side tool-activity feed for the turn lease | `hermes_plugins/molecule_turn_activity/` |
 | Models/providers shown by the template | `config.yaml` |
 | Image publication and pin checks | `.gitea/workflows/publish-image.yml` |
 
