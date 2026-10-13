@@ -127,6 +127,8 @@ RUN set -eu; \
 COPY adapter.py .
 COPY __init__.py .
 COPY executor.py .
+# Gateway-side hermes plugins; start.sh installs them into $HERMES_HOME/plugins.
+COPY hermes_plugins/ /app/hermes_plugins/
 COPY scripts/ /app/scripts/
 COPY start.sh /usr/local/bin/start.sh
 COPY scripts/mcp-reconcile-watch.sh /usr/local/bin/mcp-reconcile-watch.sh
