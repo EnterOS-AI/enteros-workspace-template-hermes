@@ -38,13 +38,16 @@ def _render(out: pathlib.Path, **env: str) -> tuple[dict, str]:
     script = "\n".join(
         ["set -euo pipefail", 'DEFAULT_MODEL="m"', 'PROVIDER="custom"', block]
     )
-    # The block shells out to python3 + PyYAML for the MCP seed.
-    path = os.pathsep.join([os.path.dirname(sys.executable), os.environ.get("PATH", "")])
+    # The block shells out to python3 + PyYAML for the MCP seed, so inherit the
+    # environment (a setup-python interpreter needs its LD_LIBRARY_PATH) minus
+    # anything that steers start.sh, and put this interpreter first on PATH.
+    run_env = {k: v for k, v in os.environ.items() if not k.startswith(("HERMES_", "MOLECULE_"))}
+    run_env["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), os.environ.get("PATH", "")])
     proc = subprocess.run(
         ["bash", "-c", script],
         capture_output=True,
         text=True,
-        env={"PATH": path, **env},
+        env={**run_env, **env},
         cwd=REPO,
         check=False,
     )
