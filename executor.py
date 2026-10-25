@@ -229,9 +229,47 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     # logs. Keep both generations.
     "couldn't shrink it enough automatically",  # site_copy context_overflow + payload_too_large
     # Suffix the gateway appends to EVERY compression_exhausted reply when it
-    # auto-resets the session (gateway/run_turn.py; same text at 29112bef).
+    # auto-resets the session (gateway/run_turn.py; same text at 29112bef;
+    # locales/en.yaml auto_reset_context_exhausted at v0.22.5).
     "exceeded the maximum context size",
+    # The gateway's own fallback reply (locales/en.yaml context_overflow at
+    # v0.22.5, a literal in gateway/run.py at f97608f1). It carries no
+    # auto-reset suffix and the gateway resets nothing. It is NOT proof of an
+    # overflow: the gateway also sends it for a bare "400" error, or a 400/500
+    # exception, once a session has more than 50 history rows
+    # (gateway/run_turn.py is_context_overflow_failure_result,
+    # run_turn_persistence.py _hmwa_agent_error_reply), and almost every
+    # platform session is that long. See _GATEWAY_OVERFLOW_FALLBACK below.
+    "too long for me to read all at once",
 )
+
+# The part of that suffix that says the GATEWAY has already reset the session
+# on a compression-exhausted turn. hermes v0.22 keeps the messages queued
+# behind such a turn and runs them on the fresh session; a /new from us on top
+# would clear that queue and time those turns out. So the heal replays without
+# sending one when it sees this.
+_GATEWAY_AUTO_RESET_MARKER = "exceeded the maximum context size"
+
+# The suffix-less fallback above. Because it also stands for an ordinary
+# provider 400/500 on a long session, the heal first replays the turn on the
+# SAME session, and only resets when the replay gets the fallback again: a
+# reset on a transient error would wipe a healthy conversation for nothing.
+_GATEWAY_OVERFLOW_FALLBACK = "too long for me to read all at once"
+
+
+def _gateway_already_reset(text: str | None) -> bool:
+    """True when the overflow reply says the gateway reset the session itself."""
+    return _GATEWAY_AUTO_RESET_MARKER in (text or "").lower()
+
+
+def _is_ambiguous_overflow_fallback(text: str | None) -> bool:
+    """True for the gateway's fallback reply when nothing else marks an overflow."""
+    lowered = (text or "").lower()
+    if _GATEWAY_OVERFLOW_FALLBACK not in lowered:
+        return False
+    return not any(
+        p in lowered for p in _CONTEXT_OVERFLOW_PATTERNS if p != _GATEWAY_OVERFLOW_FALLBACK
+    )
 
 
 def _is_context_overflow(text: str | None) -> bool:
@@ -329,8 +367,9 @@ def _reply_message_with_tool_trace(text: str, trace: list[dict[str, str]]):
 
 # --- Scheduled session reset (issue #383) -----------------------------------
 # hermes no longer rotates a gateway conversation on a timer. Upstream
-# 1d5d0594 ("stop time-triggered conversation rotation", inside the pinned
-# v0.21.5) made `session_reset:` in config.yaml and SESSION_IDLE_MINUTES /
+# 1d5d0594 ("stop time-triggered conversation rotation", since v0.21.5 and
+# still retired at v0.22.5, hermes_cli/session_reset_retirement.py) made
+# `session_reset:` in config.yaml and SESSION_IDLE_MINUTES /
 # SESSION_RESET_HOUR inert: a conversation now lasts until someone sends /new.
 # On a scheduled workspace nobody does, so one session grows for days and the
 # agent starts imitating its own compacted history (#383: "nothing to do" with
@@ -710,14 +749,41 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # Bounded to a single attempt: a second overflow on an empty session
         # means THIS prompt is itself oversized, which no reset can fix, so
         # the overflow text is delivered rather than looping.
-        if _is_context_overflow(text):
-            logger.error(
-                "auto-heal: hermes context overflow on chat_id=%s — resetting "
-                "the session and retrying once. reply=%s",
+        #
+        # The gateway's suffix-less fallback is ambiguous (a provider 400/500
+        # on any long session gets the same text), so it first earns one
+        # replay on the SAME session; only a second fallback goes on to the
+        # reset below. Worst case: turn, replay, /new, replay.
+        if _is_ambiguous_overflow_fallback(text):
+            logger.warning(
+                "auto-heal: hermes overflow fallback on chat_id=%s — replaying "
+                "once on the same session before any reset. reply=%s",
                 chat_id,
                 text[:200],
             )
-            if await self._reset_hermes_session(
+            text = await self._dispatch_and_wait(
+                content=prompt,
+                chat_id=chat_id,
+                peer_id=peer_id,
+                peer_name=peer_name,
+                callback_url=callback_url,
+                history=history,
+                event_queue=event_queue,
+                source_type=source_type,
+            )
+            if text is None:
+                return
+        if _is_context_overflow(text):
+            already_reset = _gateway_already_reset(text)
+            logger.error(
+                "auto-heal: hermes context overflow on chat_id=%s — %s and "
+                "retrying once. reply=%s",
+                chat_id,
+                "the gateway already reset the session" if already_reset
+                else "resetting the session",
+                text[:200],
+            )
+            if already_reset or await self._reset_hermes_session(
                 chat_id=chat_id,
                 peer_id=peer_id,
                 peer_name=peer_name,

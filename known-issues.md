@@ -10,8 +10,10 @@ are available in git history but are not current operating guidance.
 
 ## Gateway readiness
 
-`start.sh` starts `hermes gateway` on loopback port 8642 and waits up to 120
-seconds for `/health`. A boot failure prints the gateway log tail. Diagnose the
+`start.sh` starts `hermes gateway` on loopback port 8642 and waits up to 420
+seconds for `/health` (the first boot of a new hermes on an existing volume
+migrates `state.db` first). It fails at once if the gateway exits. A boot
+failure prints the gateway log tail. Diagnose the
 gateway log and the provider configuration rendered by `start.sh`; do not run a
 second adapter process or patch a heartbeat interval.
 

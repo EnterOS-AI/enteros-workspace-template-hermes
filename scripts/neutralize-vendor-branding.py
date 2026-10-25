@@ -66,6 +66,17 @@ it rewrites EVERY copy it finds under the hermes root, and then it VERIFIES
 by re-importing the module the way the gateway does and asserting the value
 the gateway will actually see no longer carries the vendor token.
 
+SINCE v0.22 the layout differs but the rule is the same. There is no venv
+inside the checkout: ``~/.local/bin/hermes`` execs the checkout's launcher,
+which runs hermes' pinned Python with ``$HERMES_ROOT`` at ``sys.path[0]`` and
+then adds the package manager's dependency environment
+(``~/.hermes/installs/<key>/environments/<generation>/venv``) after it. That
+environment's editable install maps the packages to a build-time source copy
+(``<generation>/workspace``), the second copy. start.sh runs this script once
+per tree with ``--python`` set to the environment's interpreter, which it reads
+from ``/etc/hermes-pm-layout.env``; ``--python`` must be given since the old
+``<hermes-root>/venv`` default no longer exists.
+
 WHY AN APPENDED OVERRIDE RATHER THAN IN-PLACE SURGERY
 ------------------------------------------------------
 The constants are multi-line implicit-concatenation literals; rewriting them

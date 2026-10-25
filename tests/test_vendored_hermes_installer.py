@@ -112,12 +112,16 @@ def test_installer_runs_from_the_vendored_copy_after_its_checksum():
 
 
 def test_installer_arguments_are_unchanged():
-    """Vendoring changes where the script comes from, not what it installs."""
+    """Vendoring changes where the script comes from, not what it installs.
+
+    --force-commit is gone on purpose: the v0.22 installer removed the flag
+    and exits 1 on any unknown option, so passing it fails the build.
+    """
     destination, run = _installer_run()
-    assert (
-        f'bash {destination} --skip-setup --commit "${{HERMES_COMMIT}}" '
-        "--force-commit" in run
-    ), f"installer arguments changed: {run}"
+    args = run.split(f"bash {destination}", 1)[1].split(";", 1)[0].split()
+    assert args == ["--skip-setup", "--commit", '"${HERMES_COMMIT}"'], (
+        f"installer arguments changed: {run}"
+    )
 
 
 def test_pinned_digest_is_the_vendored_copy():

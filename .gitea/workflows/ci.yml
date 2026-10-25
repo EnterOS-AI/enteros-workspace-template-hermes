@@ -273,7 +273,9 @@ jobs:
     # where `docker build` fails non-deterministically. Mirror of the
     # codex sibling fix (template-codex#9) and internal#512.
     runs-on: docker-host
-    timeout-minutes: 15
+    # The image build stages hermes' toolchain and extras since v0.22, and the
+    # smoke test below runs a full A2A round trip in the built image.
+    timeout-minutes: 25
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -415,7 +417,8 @@ jobs:
     # where the privileged docker exec chain cannot work. Mirror of
     # template-codex#9 and internal#512.
     runs-on: docker-host
-    timeout-minutes: 15
+    # Builds the image too (--no-cache); see validate-runtime.
+    timeout-minutes: 25
     needs: validate-static
     env:
       MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
@@ -614,6 +617,90 @@ jobs:
             | tee "$MCP_E2E_LOG"
           docker rm "$MCP_VERIFY_CONTAINER" >/dev/null
           grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_E2E_LOG"
+          KEEP_T4_IMAGE=1
+      # hermes >= v0.22 runs from a package-manager environment that this
+      # image bridges into the runtime home (start.sh, Dockerfile ENV). Prove
+      # the shipped artifact end to end, fail-closed like the steps around it:
+      #   1. the REAL start.sh boot, on a throwaway /configs volume with no
+      #      platform: the installs link, both vendor-branding trees patched
+      #      and verified, the A2A plugin check, the gateway's /health and the
+      #      MCP smoke. molecule-runtime then stops on the missing
+      #      /configs/config.yaml, which a real workspace gets from the platform;
+      #   2. node/npx on the PATH molecule-runtime itself gets (it spawns the
+      #      management MCP with npx);
+      #   3. a full A2A round trip (scripts/e2e_full_chain.py) through this
+      #      image's hermes, plugin and executor, as the uid-1000 agent.
+      - name: Boot path and A2A round trip in the built image
+        if: github.event.pull_request.head.repo.fork != true
+        run: |
+          set -euo pipefail
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          BOOT_NAME="hermes-boot-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          BOOT_VOLUME="${BOOT_NAME}-configs"
+          KEEP_T4_IMAGE=0
+          cleanup_boot() {
+            docker rm -f "$BOOT_NAME" >/dev/null 2>&1 || true
+            docker volume rm -f "$BOOT_VOLUME" >/dev/null 2>&1 || true
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_boot EXIT
+          docker volume create "$BOOT_VOLUME" >/dev/null
+          docker run -d --name "$BOOT_NAME" -v "$BOOT_VOLUME:/configs" \
+            -e WORKSPACE_ID=00000000-0000-0000-0000-0000000c1b07 \
+            -e PLATFORM_URL=http://127.0.0.1:9 \
+            -e HERMES_DEFAULT_MODEL=custom/test-model \
+            -e HERMES_CUSTOM_BASE_URL=http://127.0.0.1:9/v1 \
+            -e HERMES_CUSTOM_API_KEY=sk-ci-boot-placeholder \
+            "$T4_TAG" >/dev/null
+          for _ in $(seq 1 300); do
+            if grep -q -E "gateway ready on|failed to reach /health|exited during boot" <<<"$(docker logs "$BOOT_NAME" 2>&1)"; then
+              break
+            fi
+            sleep 2
+          done
+          # The MCP smoke runs right after /health.
+          for _ in $(seq 1 30); do
+            if grep -q "hermes mcp list" <<<"$(docker logs "$BOOT_NAME" 2>&1)"; then break; fi
+            sleep 2
+          done
+          BOOT_LOG="$(docker logs "$BOOT_NAME" 2>&1)"
+          fail_boot() {
+            echo "::group::start.sh boot log (tail)"
+            tail -150 <<<"$BOOT_LOG"
+            echo "::endgroup::"
+            echo "::error::$1"
+            exit 1
+          }
+          for want in \
+            "upstream vendor self-identification neutralized in /home/agent/.hermes/hermes-agent" \
+            "upstream vendor self-identification neutralized in /home/agent/.hermes/installs/" \
+            "hermes gateway ready on" \
+            "hermes mcp list shows 'molecule' wired"; do
+            grep -qF "$want" <<<"$BOOT_LOG" || fail_boot "start.sh boot: missing \"$want\""
+          done
+          for forbid in \
+            "molecule_a2a plugin is not installed" \
+            "no dependency environment is committed" \
+            "is missing: hermes will refuse to start"; do
+            if grep -qF "$forbid" <<<"$BOOT_LOG"; then fail_boot "start.sh boot: \"$forbid\""; fi
+          done
+          LINK="$(docker run --rm -v "$BOOT_VOLUME:/configs" --entrypoint readlink "$T4_TAG" /configs/.hermes/installs)"
+          [ "$LINK" = /home/agent/.hermes/installs ] || fail_boot "/configs/.hermes/installs links to '$LINK'"
+          echo "start.sh boot: installs bridged, both trees neutralized, gateway healthy, MCP smoke passed"
+          RUNTIME_NODE="$(docker run --rm --user 1000:1000 -e HOME=/tmp --entrypoint sh "$T4_TAG" -c 'command -v node && command -v npx')" \
+            || fail_boot "node/npx are not on molecule-runtime's PATH (it launches the management MCP with npx)"
+          echo "molecule-runtime PATH resolves: ${RUNTIME_NODE//$'\n'/ }"
+          if ! E2E_OUT="$(docker run --rm --user 1000:1000 -e HOME=/home/agent --workdir /tmp \
+                --entrypoint python3 "$T4_TAG" /app/scripts/e2e_full_chain.py 2>&1)"; then
+            echo "::group::full-chain round trip in the image (output)"
+            echo "$E2E_OUT"
+            echo "::endgroup::"
+            echo "::error::the A2A full-chain round trip failed inside the built image"
+            exit 1
+          fi
+          grep -E "^OK: " <<<"$E2E_OUT" | tail -4 || true
           KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
         if: github.event.pull_request.head.repo.fork != true
@@ -924,8 +1011,14 @@ jobs:
     # shell-tests — the eager-MCP reconcile mechanics. No docker needed:
     # the gateway runs as a subprocess against a temp HERMES_HOME.
     name: Gateway live round-trip (pinned hermes)
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # docker-host, not ubuntu-latest: the Windows act_runners also advertise
+    # ubuntu-latest (see validate-runtime), and upstream's install.sh refuses a
+    # non-Linux/macOS host.
+    runs-on: docker-host
+    # The v0.22 installer also stages hermes' toolchain and builds its TUI and
+    # web UI, and the post-install selects the extras (a few minutes on a warm
+    # network) before the round trip runs.
+    timeout-minutes: 30
     needs: validate-static
     # review wf_3a7b849d #12: skip the WHOLE job on fork PRs so it reports
     # result="skipped" (not "success" from no-op'd steps) to the aggregates —
@@ -943,11 +1036,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # The image build runs vendor/hermes-agent/install.sh instead of
+      # downloading it (Dockerfile, above ARG HERMES_COMMIT). Compare it with
+      # upstream's scripts/install.sh at HERMES_COMMIT in an independent
+      # clone: equal git blob ids mean byte-identical files. A HERMES_COMMIT
+      # bump that does not refresh the vendored copy fails here, before the
+      # next step runs the copy.
+      - name: Vendored installer is upstream scripts/install.sh at HERMES_COMMIT
+        if: github.event.pull_request.head.repo.fork != true
+        run: |
+          set -euo pipefail
+          HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
+          test -n "$HERMES_COMMIT"
+          git clone -q --filter=blob:none --no-checkout \
+            https://github.com/NousResearch/hermes-agent.git /tmp/hermes-src
+          UPSTREAM_BLOB="$(git -C /tmp/hermes-src rev-parse "$HERMES_COMMIT:scripts/install.sh")"
+          VENDORED_BLOB="$(git hash-object vendor/hermes-agent/install.sh)"
+          if [ "$UPSTREAM_BLOB" != "$VENDORED_BLOB" ]; then
+            echo "::error::vendor/hermes-agent/install.sh is blob $VENDORED_BLOB, but scripts/install.sh at $HERMES_COMMIT is blob $UPSTREAM_BLOB. Refresh the copy (vendor/hermes-agent/README.md)."
+            exit 1
+          fi
+          echo "vendored installer == upstream scripts/install.sh at $HERMES_COMMIT (blob $VENDORED_BLOB)"
       - name: Install pinned hermes + a2a plugin + runtime deps
         if: github.event.pull_request.head.repo.fork != true
         run: |
           set -euo pipefail
           HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
+          HERMES_INSTALL_SH_SHA256=$(sed -n 's/^ARG HERMES_INSTALL_SH_SHA256=//p' Dockerfile | head -1)
           A2A_REF=$(sed -n 's/^ARG HERMES_PLATFORM_MOLECULE_A2A_REF=//p' Dockerfile | head -1)
           # review wf_3a7b849d #6: pin the runtime to .runtime-version, the
           # EXACT version the shipped image is built and asserted against
@@ -957,53 +1072,27 @@ jobs:
           # break in the pinned 0.4.x could ship green, and an unrelated newer
           # release could red every template PR.
           RUNTIME_VERSION=$(tr -d '[:space:]' < .runtime-version)
-          test -n "$HERMES_COMMIT" && test -n "$A2A_REF" && test -n "$RUNTIME_VERSION"
+          test -n "$HERMES_COMMIT" && test -n "$HERMES_INSTALL_SH_SHA256" && test -n "$A2A_REF" && test -n "$RUNTIME_VERSION"
           echo "pinned hermes-agent@$HERMES_COMMIT a2a-plugin@$A2A_REF runtime==$RUNTIME_VERSION"
-          # Install from the SAME immutable git ref the image pins (2026-09-03).
-          # It used to be `hermes-agent==$HERMES_VERSION` from PyPI; that pin
-          # named the wheel in site-packages, which the shipped image does not
-          # import (~/.local/bin/hermes puts the checkout at sys.path[0]) — so
-          # this gate was conformance-testing code the fleet does not run.
-          #
-          # It must be an EDITABLE install from a checkout, not `pip install
-          # <git-ref>`: upstream's build backend refuses to build a wheel or
-          # sdist at all ("Building wheels or sdists for hermes-agent is not
-          # supported. Hermes is distributed via the shell installer, Docker
-          # image, or Nix"), so the package form fails outright. This mirrors
-          # what install.sh does in the image (`uv pip install -e .` from the
-          # pinned checkout), which is also why the image was never affected.
-          git clone -q --filter=blob:none --no-checkout \
-            https://github.com/NousResearch/hermes-agent.git /tmp/hermes-src
-          git -C /tmp/hermes-src checkout -q --detach "$HERMES_COMMIT"
+          # Install hermes EXACTLY the way the image does (Dockerfile): the
+          # checksum-verified vendored installer at the pin, then
+          # scripts/hermes-post-install.sh. Since v0.22 the installer builds a
+          # package-manager environment on hermes' own pinned Python from
+          # uv.lock; the old `pip install -e` into this job's Python 3.11 would
+          # gate a dependency set and an interpreter the image does not run.
+          echo "${HERMES_INSTALL_SH_SHA256}  vendor/hermes-agent/install.sh" | sha256sum -c -
+          bash vendor/hermes-agent/install.sh --skip-setup --commit "$HERMES_COMMIT"
           # Same reasoning as the Dockerfile's assertion: verify the ref rather
-          # than trust the fetch, so this gate cannot silently test other code.
-          ACTUAL_COMMIT="$(git -C /tmp/hermes-src rev-parse HEAD)"
+          # than trust the installer, so this gate cannot silently test other code.
+          ACTUAL_COMMIT="$(git -C "$HOME/.hermes/hermes-agent" rev-parse HEAD)"
           if [ "$ACTUAL_COMMIT" != "$HERMES_COMMIT" ]; then
             echo "::error::hermes checkout is at $ACTUAL_COMMIT, expected $HERMES_COMMIT"
             exit 1
           fi
-          pip install -q -e /tmp/hermes-src
+          HERMES_PLATFORM_MOLECULE_A2A_REF="$A2A_REF" bash scripts/hermes-post-install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           pip install -q aiohttp
-          pip install -q "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${A2A_REF}#egg=hermes-platform-molecule-a2a"
           pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" "molecules-workspace-runtime==$RUNTIME_VERSION"
-      # The image build runs vendor/hermes-agent/install.sh instead of
-      # downloading it (Dockerfile, above ARG HERMES_COMMIT). The upstream
-      # clone from the previous step is at HERMES_COMMIT, so compare git blob
-      # ids: equal ids mean byte-identical files. A HERMES_COMMIT bump that
-      # does not refresh the vendored copy fails here.
-      - name: Vendored installer is upstream scripts/install.sh at HERMES_COMMIT
-        if: github.event.pull_request.head.repo.fork != true
-        run: |
-          set -euo pipefail
-          HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
-          test -n "$HERMES_COMMIT"
-          UPSTREAM_BLOB="$(git -C /tmp/hermes-src rev-parse "$HERMES_COMMIT:scripts/install.sh")"
-          VENDORED_BLOB="$(git hash-object vendor/hermes-agent/install.sh)"
-          if [ "$UPSTREAM_BLOB" != "$VENDORED_BLOB" ]; then
-            echo "::error::vendor/hermes-agent/install.sh is blob $VENDORED_BLOB, but scripts/install.sh at $HERMES_COMMIT is blob $UPSTREAM_BLOB. Refresh the copy (vendor/hermes-agent/README.md)."
-            exit 1
-          fi
-          echo "vendored installer == upstream scripts/install.sh at $HERMES_COMMIT (blob $VENDORED_BLOB)"
       - name: Run the full-chain round-trip against the pinned gateway
         if: github.event.pull_request.head.repo.fork != true
         run: |
@@ -1145,6 +1234,8 @@ jobs:
           tests/test_executor_plugin_path.py
           tests/test_vendor_branding_neutralized.py
           tests/test_vendored_hermes_installer.py
+          tests/test_hermes_pm_runtime_bridge.py
+          tests/test_mcp_bare_python_pin.py
           tests/test_start_sh_tmpdir.py
           tests/test_turn_activity_plugin.py
           -v

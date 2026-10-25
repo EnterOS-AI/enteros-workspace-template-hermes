@@ -97,9 +97,11 @@ plugin transport, which is the image default.
 
 ## Bundled Node.js
 
-The Hermes installer bundles `node`, `npm`, and `npx` in
-`/home/agent/.hermes/node/bin`. When `node` and `npx` are present there,
-`start.sh` prepends that directory to the gateway's `PATH`. The image also
+Hermes' package manager installs Node.js and npm into its tool store
+(`~/.hermes/tools`); `scripts/hermes-post-install.sh` links their `node`,
+`npm`, and `npx` into `/home/agent/.hermes/node/bin` at build time. When `node`
+and `npx` are present there, `start.sh` prepends that directory to the
+gateway's `PATH`. The image also
 installs the same rule as `/etc/profile.d/hermes-node-path.sh`. The terminal
 tool runs commands from a login-shell snapshot, where Debian's `/etc/profile`
 replaces `PATH`, so this file is what puts Node.js on the terminal's `PATH`.

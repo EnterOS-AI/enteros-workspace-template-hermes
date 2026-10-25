@@ -17,10 +17,31 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig, RuntimeCapabilities
 
 logger = logging.getLogger(__name__)
+
+# hermes >= v0.22 runs from a package-manager environment and puts that
+# environment's bin dir first on the gateway's PATH. hermes steps a stdio MCP
+# server's bare command past its OWN bin dirs (tools/mcp_tool_config.py,
+# _is_hermes_managed_bin_dir), but recognises them only under its active home,
+# and this image's environment lives outside it (/home/agent/.hermes vs the
+# /configs volume). So a bare `python`/`python3` would start hermes' Python
+# 3.14, which has none of the platform's packages, where before v0.22 it found
+# this interpreter. Plugin manifests built from the SDK templates use exactly
+# `command: python`. Every hermes MCP stanza is written through
+# register_mcp_server_hook, so pinning it here keeps the file stable.
+_BARE_PYTHON_COMMANDS = frozenset({"python", "python3"})
+
+
+def _pin_bare_python_command(spec: dict) -> dict:
+    """Return ``spec`` with a bare python command replaced by this interpreter."""
+    command = spec.get("command") if isinstance(spec, dict) else None
+    if isinstance(command, str) and command.strip() in _BARE_PYTHON_COMMANDS:
+        return {**spec, "command": sys.executable}
+    return spec
 
 
 class HermesAgentAdapter(BaseAdapter):
@@ -332,6 +353,7 @@ class HermesAgentAdapter(BaseAdapter):
         # invokes this hook DIRECTLY. No-op for non-management names; idempotent +
         # descriptor-wins. Matches BaseAdapter.register_mcp_server_hook.
         spec = inject_privileged_env(name, spec)
+        spec = _pin_bare_python_command(spec)
 
         from pathlib import Path
 

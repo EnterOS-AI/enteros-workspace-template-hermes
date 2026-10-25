@@ -30,6 +30,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo util-linux docker.io \
     && rm -rf /var/lib/apt/lists/*
 
+# Shared libraries and fonts for the browser and computer-use tools.
+# hermes >= v0.22 stages its own pinned Chromium (agent-browser) and
+# cua-driver through its package manager, which downloads the binaries only.
+# The pre-0.22 installer got these packages as a side effect of running
+# Playwright's `install --with-deps` through the agent's passwordless sudo, so
+# they were never declared here. Without them the browser tool cannot start
+# Chromium (24 libraries missing on this base) and cua-driver fails its own
+# install check on libX11/libXi/libxkbcommon and is left out of the image.
+#   - the library list is the `ldd | grep "not found"` set of the pinned
+#     chrome and cua-driver binaries on this base (the same list upstream's
+#     own Dockerfile declares);
+#   - xvfb and the fonts match what the pre-0.22 image shipped, so pages
+#     render the same (CJK and emoji included).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+    libcairo2 libcups2t64 libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 \
+    libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 \
+    libxfixes3 libxi6 libxkbcommon0 libxrandr2 \
+    xvfb fonts-liberation fonts-noto-color-emoji fonts-wqy-zenhei \
+    fonts-ipafont-gothic fonts-tlwg-loma-otf fonts-freefont-ttf fonts-unifont \
+    && rm -rf /var/lib/apt/lists/*
+
 # --- GitHub CLI (issue #371) ---
 # `gh` is a RUNTIME DEPENDENCY of this image, not a convenience. The
 # seo-agent workspace class is built entirely on it: its SETUP.md runs
@@ -159,40 +181,32 @@ COPY scripts/hermes-node-path.sh /etc/profile.d/hermes-node-path.sh
 #                  but the installer treats this as "run anyway" by
 #                  default; passing it explicitly avoids surprises).
 #   --commit SHA → upstream's own first-class checkout pin (install.sh
-#                  `--commit`, validated as a hex SHA then `git checkout
-#                  --detach`). See HERMES_COMMIT below for WHY this is the
-#                  pin that matters.
-#   --force-commit → defensive, and worth understanding. install.sh SUPPRESSES
-#                  a `--commit` that would move an EXISTING install backwards
-#                  (so a stale desktop bootstrap binary cannot rewind a
-#                  current checkout): if the pin is an ancestor of HEAD it
-#                  logs "Ignoring --commit ...: the checkout is already
-#                  newer" and EXITS 0. Our pin IS an ancestor of main, so
-#                  that is the branch to worry about — an ignored pin looks
-#                  exactly like a successful one from the outside.
-#                  Observed on a clean build of this Dockerfile: the
-#                  installer takes the plain "Pinning checkout to commit ..."
-#                  path and reports "HEAD is now at 29112bef0 chore: release
-#                  v0.21.0", i.e. the suppressing branch is not reached and
-#                  --force-commit changes nothing there. It is passed anyway
-#                  because that outcome depends on clone shape and on whether
-#                  a checkout already exists, neither of which this Dockerfile
-#                  should have to reason about. The `rev-parse` assertion
-#                  below is what actually makes the pin trustworthy: it fails
-#                  the build if the checkout is not at HERMES_COMMIT, whatever
-#                  path the installer took to get there.
+#                  `--commit`: the commit must be on `main`, the clone is
+#                  blobless and only the pin is checked out, detached). An
+#                  explicit --commit also outranks the installer's default of
+#                  installing the latest stable release. See HERMES_COMMIT
+#                  below for WHY this is the pin that matters.
+# There is no --force-commit any more. Up to v0.21.x it overrode the
+# installer's refusal to move an existing checkout backwards; the v0.22
+# installer dropped the flag and exits 1 on it ("unknown option"). A fresh
+# build has no checkout to move, and the `rev-parse` assertion below is still
+# what makes the pin trustworthy: it fails the build if the checkout is not at
+# HERMES_COMMIT, whatever path the installer took to get there.
 #
-# THE PIN THAT ACTUALLY DECIDES WHAT RUNS (2026-09-03)
-# ----------------------------------------------------
-# ~/.local/bin/hermes is NOT the venv console script. It is a wrapper that
-# clears PYTHONPATH/PYTHONHOME and execs
-#   $HERMES_ROOT/venv/bin/python $HERMES_ROOT/hermes "$@"
-# Running a script at $HERMES_ROOT puts $HERMES_ROOT at sys.path[0], AHEAD of
-# site-packages. So the gateway imports the git CHECKOUT, not the wheel.
-# Confirmed live on enteros-minori / enteros-ws-c7937b219232: /proc/138/cmdline
-# is exactly that argv pair. scripts/neutralize-vendor-branding.py documents
-# the same finding from the other end (it must patch the checkout to have any
-# effect at all).
+# THE PIN THAT ACTUALLY DECIDES WHAT RUNS (2026-09-03, layout of v0.22)
+# ---------------------------------------------------------------------
+# ~/.local/bin/hermes execs the checkout's own launcher,
+# $HERMES_ROOT/.hermes/bin/hermes. That launcher runs hermes' pinned Python
+# (~/.hermes/tools/python-*) with $HERMES_ROOT inserted at sys.path[0], then
+# selects the dependency environment hermes' package manager built
+# (~/.hermes/installs/<install key>/environments/<generation>/venv) and puts
+# its site-packages AFTER the checkout. So the gateway imports the git
+# CHECKOUT. The environment also carries an editable install bound to a
+# build-time copy of the source (<generation>/workspace); that copy is not on
+# the gateway's import path, but scripts/neutralize-vendor-branding.py patches
+# it too. Before v0.22 the wrapper ran $HERMES_ROOT/venv/bin/python
+# $HERMES_ROOT/hermes with the same sys.path[0] effect (confirmed live on
+# enteros-minori / enteros-ws-c7937b219232: /proc/138/cmdline).
 #
 # This layer used to curl install.sh from `main` and let the installer clone
 # `main` unpinned, then force-reinstall a PyPI wheel over site-packages. The
@@ -226,15 +240,20 @@ COPY scripts/hermes-node-path.sh /etc/profile.d/hermes-node-path.sh
 #
 # The installer's own network steps are unchanged: it still clones the
 # checkout from github.com (with its own retries) and pins it with --commit,
-# and the rev-parse assertion below still decides whether the pin held.
-ARG HERMES_COMMIT=f97608f178d1ffeca59860195ab7da295f7c8e5f
-ARG HERMES_INSTALL_SH_SHA256=2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af
+# and the rev-parse assertion below still decides whether the pin held. Since
+# v0.22 it then hands the checkout to hermes' package manager, which
+# downloads its pinned, sha256-checked toolchain into ~/.hermes/tools (Python,
+# uv, Node, npm, ripgrep, ffmpeg, Chromium + agent-browser, cua-driver),
+# builds the dependency environment from uv.lock, and builds the TUI and web
+# UI. The base packages for Chromium and cua-driver are declared above.
+ARG HERMES_COMMIT=bf0203a794a07aac3ff764972ab9087baa4e4f4e
+ARG HERMES_INSTALL_SH_SHA256=99cb3691d55019c6973a7acb775a915648666cc24e483ca827a1cdbb3531a674
 COPY --chown=agent:agent vendor/hermes-agent/install.sh /tmp/hermes-install.sh
 USER agent
 WORKDIR /home/agent
 RUN set -eu; \
     echo "${HERMES_INSTALL_SH_SHA256}  /tmp/hermes-install.sh" | sha256sum -c -; \
-    bash /tmp/hermes-install.sh --skip-setup --commit "${HERMES_COMMIT}" --force-commit; \
+    bash /tmp/hermes-install.sh --skip-setup --commit "${HERMES_COMMIT}"; \
     rm -f /tmp/hermes-install.sh
 # Never trust an installer to have honoured a flag: the installer treats an
 # ignored --commit as a WARNING and still exits 0. Assert the checkout is
@@ -248,18 +267,38 @@ RUN set -eu; \
       exit 1; \
     fi; \
     echo "hermes checkout pinned at $actual"
-# hermes installer symlinks ~/.hermes/hermes-agent/venv/bin/hermes into
-# ~/.local/bin/hermes, so ~/.local/bin is the only PATH entry we need.
-ENV PATH="/home/agent/.local/bin:${PATH}"
+# The installer publishes ~/.local/bin/hermes (it execs the checkout's
+# launcher); scripts/hermes-post-install.sh (below) links node/npm/npx and
+# cua-driver there too, as the pre-0.22 installer did.
+#
+# The gateway runs with HOME=/tmp and HERMES_HOME=/tmp/.hermes, a link onto the
+# /configs volume (start.sh), but pm resolves its tool store under the ACTIVE
+# home: /tmp/.hermes/tools, which is empty. hermes then finds no node/npx for
+# MCP servers and no Chromium for the browser tool. HERMES_RUNTIME_DIR is pm's
+# override for where the store lives; upstream's own image sets it the same
+# way.
+#
+# HERMES_DISABLE_LAZY_INSTALLS=1 is our decision, NOT upstream's: upstream's
+# image leaves lazy installs on. pm reads the flag (pm/install.py
+# lazy_installs_allowed, hermes_cli/venv_sync.py prepare_launch), so no launch
+# runs a dependency sync, an update completion or an on-demand install. Any of
+# those builds a NEW environment generation, which would not contain the A2A
+# plugin this image installs by hand, and the next gateway start would lose
+# the platform transport (follow-up: make the plugin pm-managed). The SDKs a
+# workspace used to get on first use are baked by hermes-post-install.sh.
+# The dependency selection itself is per home (<HERMES_HOME>/installs); start.sh
+# links the one built here into the volume on every boot.
+ENV PATH="/home/agent/.local/bin:${PATH}" \
+    HERMES_RUNTIME_DIR=/home/agent/.hermes/tools \
+    HERMES_DISABLE_LAZY_INSTALLS=1
 
 # --- Molecule A2A platform plugin (post-demo: native push parity) ---
-# Two refs are installed into the same venv that the upstream installer
-# created above:
+# Two refs end up in the dependency environment the upstream installer built:
 #
 #   1. hermes-agent itself is NOT installed here any more. The upstream
-#      installer above already did `uv pip install -e .[all]` from the
-#      checkout it pinned to HERMES_COMMIT, and the checkout is what the
-#      gateway imports (see the sys.path[0] note above). The old
+#      installer above already built the environment (editable, `all` extra)
+#      from the checkout it pinned to HERMES_COMMIT, and the checkout is what
+#      the gateway imports (see the sys.path[0] note above). The old
 #      `--force-reinstall hermes-agent==${HERMES_VERSION}` line pinned the
 #      one copy nothing imports; keeping it would reintroduce exactly the
 #      wheel-vs-checkout skew this change removes. FORK RETIRED (2026-07-22):
@@ -279,13 +318,20 @@ ENV PATH="/home/agent/.local/bin:${PATH}"
 # is an UNRELEASED third-party ref, taken with owner authorisation. The
 # upstream-sync workflow compares PyPI's latest against this floor and files
 # the "you can go back to a published release now" PR when one appears.
-ARG HERMES_PYPI_FLOOR=0.21.5
-ARG HERMES_PLATFORM_MOLECULE_A2A_REF=93d43d772470eb3ddc781858dc5629f3464eed99
-# The hermes installer uses uv to create the venv and doesn't seed pip
-# into it. Bootstrap pip first via ensurepip, then install the plugin.
-RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && \
-    /home/agent/.hermes/hermes-agent/venv/bin/python3 -m pip install --no-cache-dir \
-      "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${HERMES_PLATFORM_MOLECULE_A2A_REF}#egg=hermes-platform-molecule-a2a"
+ARG HERMES_PYPI_FLOOR=0.22.5
+ARG HERMES_PLATFORM_MOLECULE_A2A_REF=f08bc9dff29d12c5f11800faa98404f507cd5dc5
+# scripts/hermes-post-install.sh (shared with CI's gateway-live-roundtrip, so
+# the gate runs this exact install; its header has the detail):
+#   - selects the optional dependency extras that replace first-use installs;
+#   - links pm's node/npm/npx into ~/.hermes/node/bin (OUR stable Node bin dir:
+#     start.sh, /etc/profile.d and the management-MCP pre-bake below read it)
+#     and into ~/.local/bin;
+#   - fails unless agent-browser, Chromium and cua-driver are installed and run;
+#   - installs the A2A plugin into the committed environment and proves hermes'
+#     plugin discovery sees it.
+# Every path comes from pm; a layout pm does not report fails the build.
+RUN HERMES_PLATFORM_MOLECULE_A2A_REF="${HERMES_PLATFORM_MOLECULE_A2A_REF}" \
+    bash /app/scripts/hermes-post-install.sh
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
 # The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
@@ -295,7 +341,7 @@ RUN /home/agent/.hermes/hermes-agent/venv/bin/python3 -m ensurepip --upgrade && 
 # the base runtime (molecule_runtime, pinned to the SDK contract
 # management_mcp_server block) — this template just DELEGATES to it (ADR-004: SDK
 # contract -> base-runtime default -> per-adapter override-if-needed; no per-template
-# bake fork). hermes ships node under ~/.hermes/node/bin (not global), so we point
+# bake fork). Node is not global here (~/.hermes/node/bin, above), so we point
 # the helper at it via MOLECULE_PREBAKE_NODE_BIN — the one sanctioned override. The
 # helper's build-time OFFLINE self-check fails the image if the bake is broken.
 RUN MOLECULE_PREBAKE_NODE_BIN=/home/agent/.hermes/node/bin \
@@ -303,6 +349,21 @@ RUN MOLECULE_PREBAKE_NODE_BIN=/home/agent/.hermes/node/bin \
 
 USER root
 WORKDIR /app
+
+# start.sh needs hermes' interpreters at boot (the vendor-branding neutralizer,
+# the A2A plugin check). It asks pm again then, as the agent under the runtime
+# home, so a later environment generation is seen; these build-time values are
+# the fallback. Assigned before printf so a path pm cannot report fails the
+# build instead of writing an empty value.
+RUN set -eu; \
+    set -- /home/agent/.hermes/tools/python-*/bin/python3; \
+    layout() { gosu agent env HOME=/home/agent "$1" -I /app/scripts/hermes-pm-layout.py /home/agent/.hermes/hermes-agent "$2"; }; \
+    store_python="$(layout "$1" store-python)"; \
+    agent_python="$(layout "$1" env-python)"; \
+    source_snapshot="$(layout "$1" source-snapshot)"; \
+    printf 'HERMES_STORE_PYTHON=%s\nHERMES_AGENT_PYTHON=%s\nHERMES_SOURCE_SNAPSHOT=%s\n' \
+      "$store_python" "$agent_python" "$source_snapshot" > /etc/hermes-pm-layout.env; \
+    cat /etc/hermes-pm-layout.env
 
 ENV ADAPTER_MODULE=adapter \
     HERMES_API_BASE=http://127.0.0.1:8642/v1 \

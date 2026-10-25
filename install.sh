@@ -56,9 +56,8 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 # --- Install hermes-agent (only if not already present) ---
-# Installer places `hermes` at ~/.local/bin/hermes (symlink to
-# ~/.hermes/hermes-agent/venv/bin/hermes). --skip-setup avoids the
-# interactive wizard.
+# Installer places `hermes` at ~/.local/bin/hermes (a wrapper around the
+# checkout's own launcher). --skip-setup avoids the interactive wizard.
 if ! command -v hermes >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/hermes" ]; then
   echo "[install.sh] installing hermes-agent from NousResearch..."
   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \

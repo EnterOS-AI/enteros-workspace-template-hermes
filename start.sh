@@ -164,7 +164,26 @@ HERMES_HOME="/tmp/.hermes"
 install -d -o agent -g agent /configs/.hermes
 rm -rf /tmp/.hermes 2>/dev/null || true
 ln -sfn /configs/.hermes /tmp/.hermes
-# hermes at f97608f1 (absent at 29112bef) points TMPDIR/TMP/TEMP at
+# hermes >= v0.22 keeps the selection of its dependency environment PER HOME,
+# under <HERMES_HOME>/installs/<install key>, and refuses to start a home that
+# has none: "no dependency environment is committed for this install; run
+# `hermes pm repair`". The image built that state under the build-time home,
+# /home/agent/.hermes; the gateway's home is this volume. Link the baked state
+# in on every boot, so a new image's environment is the one selected. A real
+# directory in its place is state a hermes process created for this home by
+# itself; it is derived data, so it is replaced rather than kept.
+HERMES_BUILD_INSTALLS=/home/agent/.hermes/installs
+if [ -d "$HERMES_BUILD_INSTALLS" ]; then
+  if [ -d /configs/.hermes/installs ] && [ ! -L /configs/.hermes/installs ]; then
+    rm -rf /configs/.hermes/installs
+  fi
+  ln -sfn "$HERMES_BUILD_INSTALLS" /configs/.hermes/installs
+  chown -h agent:agent /configs/.hermes/installs
+else
+  echo "[start.sh] ERROR ${HERMES_BUILD_INSTALLS} is missing: hermes will refuse to" \
+       "start (no committed dependency environment). Boot CONTINUES." >&2
+fi
+# hermes at f97608f1 (absent at 29112bef, unchanged at v0.22.5) points TMPDIR/TMP/TEMP at
 # $HERMES_HOME/cache/scratch on import unless one of them is already set
 # (hermes_constants.apply_scratch_tmp_env). $HERMES_HOME is the symlink onto
 # the persisted /configs volume made just above, so without this every
@@ -288,32 +307,57 @@ fi
 #      graft directly above); keeping both in one file means one place to read.
 # The helper is idempotent, so (2) does not accumulate edits.
 #
-# It rewrites EVERY copy of agent/prompt_builder.py under the hermes root (the
-# image ships two non-identical copies: the installer's checkout tree and the
-# venv site-packages wheel) and then RE-IMPORTS the module the way the gateway
-# does to prove the value the gateway will see actually changed. Patching a copy
-# nothing imports is a vacuous fix.
+# It rewrites EVERY copy of agent/prompt_builder.py under the root it is given
+# and then RE-IMPORTS the module from that root with hermes' own interpreter to
+# prove the value the importer sees actually changed. Patching a copy nothing
+# imports is a vacuous fix. Since v0.22 there are two trees: the checkout (the
+# gateway's sys.path[0], the live copy) and the source copy the dependency
+# environment's editable install maps (not on the gateway's path; patched too
+# so no other import route can bring the byline back). The interpreter and the
+# copy's location come from /etc/hermes-pm-layout.env, written at build time.
 #
 # Non-fatal by construction: a bad byline is not worth a dead workspace. A
 # failure is logged loudly and CI catches the same condition
 # (tests/test_vendor_branding_neutralized.py) before it reaches a customer.
 HERMES_UPSTREAM_ROOT="${HERMES_UPSTREAM_ROOT:-/home/agent/.hermes/hermes-agent}"
-if [ -d "$HERMES_UPSTREAM_ROOT" ]; then
-  if python3 /app/scripts/neutralize-vendor-branding.py \
-       --hermes-root "$HERMES_UPSTREAM_ROOT"; then
-    echo "[start.sh] upstream vendor self-identification neutralized"
-  else
-    echo "[start.sh] ERROR scripts/neutralize-vendor-branding.py failed (rc=$?)." \
-         "The upstream HERMES_AGENT_HELP_GUIDANCE / DEFAULT_AGENT_IDENTITY" \
-         "constants are still in the system prompt, so this agent will tell" \
-         "users it runs on Nous Research's Hermes Agent product and point them" \
-         "at nousresearch.com docs. Boot CONTINUES." >&2
-  fi
-else
-  echo "[start.sh] ERROR upstream install ${HERMES_UPSTREAM_ROOT} not found;" \
-       "vendor self-identification NOT neutralized — the agent will tell users" \
-       "it runs on Nous Research's Hermes Agent product. Boot CONTINUES." >&2
+HERMES_STORE_PYTHON=""
+HERMES_AGENT_PYTHON=""
+HERMES_SOURCE_SNAPSHOT=""
+if [ -r /etc/hermes-pm-layout.env ]; then
+  # shellcheck disable=SC1091 -- written by the Dockerfile.
+  . /etc/hermes-pm-layout.env
 fi
+# Ask pm which environment the gateway will select NOW: as the agent, under the
+# runtime home (the installs link above), the way the gateway resolves it. The
+# build-time values stay as the fallback.
+hermes_pm_layout() {  # $1 = key; prints the path or nothing
+  [ -n "$HERMES_STORE_PYTHON" ] || return 1
+  # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+  ${AS_AGENT} env HOME=/tmp "$HERMES_STORE_PYTHON" -I /app/scripts/hermes-pm-layout.py \
+    "$HERMES_UPSTREAM_ROOT" "$1" 2>/dev/null
+}
+if live_value="$(hermes_pm_layout env-python)"; then HERMES_AGENT_PYTHON="$live_value"; fi
+if live_value="$(hermes_pm_layout source-snapshot)"; then HERMES_SOURCE_SNAPSHOT="$live_value"; fi
+for neutralize_root in "$HERMES_UPSTREAM_ROOT" "$HERMES_SOURCE_SNAPSHOT"; do
+  [ -n "$neutralize_root" ] || continue
+  if [ ! -d "$neutralize_root" ]; then
+    echo "[start.sh] ERROR upstream tree ${neutralize_root} not found;" \
+         "vendor self-identification NOT neutralized there — the agent may tell" \
+         "users it runs on Nous Research's Hermes Agent product. Boot CONTINUES." >&2
+    continue
+  fi
+  if python3 /app/scripts/neutralize-vendor-branding.py \
+       --hermes-root "$neutralize_root" \
+       ${HERMES_AGENT_PYTHON:+--python "$HERMES_AGENT_PYTHON"}; then
+    echo "[start.sh] upstream vendor self-identification neutralized in ${neutralize_root}"
+  else
+    echo "[start.sh] ERROR scripts/neutralize-vendor-branding.py failed (rc=$?) for" \
+         "${neutralize_root}. The upstream HERMES_AGENT_HELP_GUIDANCE /" \
+         "DEFAULT_AGENT_IDENTITY constants are still in the system prompt, so this" \
+         "agent will tell users it runs on Nous Research's Hermes Agent product and" \
+         "point them at nousresearch.com docs. Boot CONTINUES." >&2
+  fi
+done
 
 # --- Install log files atomically (race-free) ---
 # Regression fix re-applied 2026-05-15: a previous build (image
@@ -765,6 +809,15 @@ fi
       ;;
   esac
   echo "  cron_mode: \"${_CRON_MODE}\""
+  # --- Ended-session pruning ---
+  # hermes up to v0.21 pruned ended sessions older than sessions.retention_days
+  # (default 90) on its own; v0.22 turned sessions.auto_prune off by default
+  # and instead ASKS once the disk holding state.db runs low. The question goes
+  # to a home channel or a desktop/TUI session, which an A2A workspace has
+  # none of, so nobody would ever answer and state.db on the /configs volume
+  # would grow without bound. Keep the pre-0.22 behaviour.
+  echo "sessions:"
+  echo "  auto_prune: true"
   # --- Memory and skill-review knobs (issue #383) ---
   # Unset writes nothing, so hermes keeps its defaults (2200 / 1375 chars, a
   # background review every 10 turns; an interval of 0 turns that review off).
@@ -1023,8 +1076,8 @@ else
 fi
 
 # --- Bundled Node.js on the gateway PATH ---
-# The hermes installer's node/npm/npx live under /home/agent/.hermes/node/bin,
-# outside both this PATH and hermes' runtime HERMES_HOME. scripts/
+# The image links hermes' node/npm/npx into /home/agent/.hermes/node/bin
+# (scripts/hermes-post-install.sh), which is outside this PATH. scripts/
 # hermes-node-path.sh prepends that dir only when node and npx are executable
 # there; the same file is the image's /etc/profile.d drop-in, which is what
 # reaches the terminal tool's login-shell commands.
@@ -1036,6 +1089,22 @@ if [ -f "$NODE_PATH_SCRIPT" ]; then
   GATEWAY_PATH="$(PATH="$GATEWAY_PATH"; . "$NODE_PATH_SCRIPT"; printf '%s' "$PATH")"
 fi
 echo "[start.sh] gateway PATH=${GATEWAY_PATH}"
+
+# --- The A2A plugin must be in hermes' dependency environment ---
+# The image installs it into the committed environment by hand
+# (scripts/hermes-post-install.sh); hermes' package manager does not know
+# about it, so any environment pm builds later would not contain it, and
+# hermes skips a plugin it cannot find without saying so. The symptom is
+# :8645 never binding and adapter.setup() failing much later. Name the cause.
+if [ "${MOLECULE_A2A_PLATFORM_ENABLED:-true}" = "true" ] && [ -n "$HERMES_AGENT_PYTHON" ]; then
+  if ! "$HERMES_AGENT_PYTHON" -I -c 'import sys
+from importlib.metadata import entry_points
+sys.exit(0 if "molecule_a2a" in {e.name for e in entry_points(group="hermes_agent.plugins")} else 1)'; then
+    echo "[start.sh] ERROR the molecule_a2a plugin is not installed in hermes'" \
+         "dependency environment (${HERMES_AGENT_PYTHON}); the A2A platform will not" \
+         "start. Boot CONTINUES." >&2
+  fi
+fi
 
 # --- Start hermes gateway in the background ---
 # `hermes gateway` reads ~/.hermes/.env at startup. We override HOME to
@@ -1062,7 +1131,15 @@ GATEWAY_PID=$!
 # Max 120s — enough for a cold gateway boot including first-time DB
 # migrations and session-store init. Longer waits should surface as a
 # provisioning failure upstream rather than silently holding the container.
-READY_TIMEOUT=120
+# 420 s, not the 120 s this used to be: the first boot of a new hermes on an
+# existing /configs volume migrates state.db before /health answers. v0.22's
+# schema 30 -> 32 step builds a new index over the whole messages table
+# (upstream allows that phase 600 s for multi-GB databases). Measured: 10 s on
+# 142,700 messages / 646 MB, the size of the largest production state.db. 420 s
+# keeps the whole boot inside config.yaml's provision_timeout_seconds (720).
+# The loop still fails at once if the gateway exits, so only a live, migrating
+# gateway waits.
+READY_TIMEOUT=420
 for _ in $(seq 1 $READY_TIMEOUT); do
   if curl -fsS "http://127.0.0.1:${API_SERVER_PORT:-8642}/health" >/dev/null 2>&1; then
     break

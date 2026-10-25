@@ -1,9 +1,10 @@
 # shellcheck shell=sh
-# Put the Node.js that the hermes installer bundles on PATH. Sourced, never run.
+# Put the Node.js that the hermes install ships on PATH. Sourced, never run.
 #
-# The installer unpacks node/npm/npx under the BUILD-time hermes home,
-# /home/agent/.hermes/node/bin. At runtime HERMES_HOME is /tmp/.hermes, so
-# hermes' own managed-node lookup ($HERMES_HOME/node/bin) misses it.
+# hermes' package manager installs node and npm into its tool store; the image
+# build links node/npm/npx into /home/agent/.hermes/node/bin
+# (scripts/hermes-post-install.sh). hermes finds its own Node through the
+# package manager, but the agent's shell commands only see PATH.
 #
 # Two consumers, one rule:
 #   * start.sh sources it to build the PATH it gives the hermes gateway.
