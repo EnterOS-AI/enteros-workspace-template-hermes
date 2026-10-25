@@ -15,14 +15,22 @@ peer-message routing:
     ← execute() emits text on event_queue
 
 Pre-reqs:
-    - Patched hermes-agent fork installed in
-      ``~/.hermes/hermes-agent/venv``
-    - The molecule-a2a plugin pip-installed in the same venv
-    - This template's executor.py + adapter.py importable
+    - hermes installed the way the image installs it:
+      ``bash vendor/hermes-agent/install.sh --skip-setup --commit <HERMES_COMMIT>``
+      then ``scripts/hermes-post-install.sh`` (the molecule-a2a plugin into
+      hermes' dependency environment)
+    - This template's executor.py + adapter.py importable, with the pinned
+      molecules-workspace-runtime installed in the interpreter running this
+
+The gateway runs under a throwaway HOME/HERMES_HOME, like the image's gateway
+runs under the /configs volume, so this applies the same bridge start.sh
+applies: ``<HERMES_HOME>/installs`` links to the install's own, and
+HERMES_RUNTIME_DIR / HERMES_DISABLE_LAZY_INSTALLS=1 are set, unless the caller
+already set them. Without it hermes >= v0.22 refuses to start ("no dependency
+environment is committed for this install").
 
 Run:
-    /Users/hongming/.hermes/hermes-agent/venv/bin/python3 \
-        scripts/e2e_full_chain.py
+    python3 scripts/e2e_full_chain.py     # HERMES_BIN defaults to ~/.local/bin/hermes
 """
 
 from __future__ import annotations
@@ -45,9 +53,10 @@ from unittest.mock import MagicMock
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-DEFAULT_HERMES_BIN = str(
-    Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes"
-)
+DEFAULT_HERMES_BIN = str(Path.home() / ".local" / "bin" / "hermes")
+# The data root the installer used; it holds hermes' tool store and the
+# selection of its dependency environment.
+INSTALL_HOME = Path(os.environ.get("HERMES_INSTALL_HOME", Path.home() / ".hermes"))
 
 
 def _free_port() -> int:
@@ -260,6 +269,12 @@ async def _amain() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="hermes-fullchain-"))
     hermes_home = tmp / ".hermes"
     hermes_home.mkdir()
+    # start.sh's bridge (see the module docstring), applied to this home.
+    if (INSTALL_HOME / "installs").is_dir():
+        (hermes_home / "installs").symlink_to(INSTALL_HOME / "installs", target_is_directory=True)
+        os.environ.setdefault("HERMES_RUNTIME_DIR", str(INSTALL_HOME / "tools"))
+        os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
+        print(f"OK: bridged {hermes_home}/installs -> {INSTALL_HOME / 'installs'}")
     probe = tmp / "probe.txt"
     probe.write_text("e2e probe\n")
     observed["probe"] = str(probe)

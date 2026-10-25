@@ -430,13 +430,17 @@ def test_no_product_brand_literal_is_hardcoded():
 # site-packages, so the checkout's SHA — not any wheel version — identifies the
 # code whose constants this patch anchors on.
 #
-# f97608f1 = upstream tag v2026.9.24 (pyproject version 0.21.5).
+# bf0203a7 = upstream tag v0.22.5. Re-checked for this pin: agent/
+# prompt_builder.py still defines exactly these three vendor constants, each
+# byte-identical to its f97608f1 (v0.21.5) value (compared with ast), and
+# agent/system_prompt.py still appends them in the same two places; no other
+# constant in either module carries a vendor token.
 # Bumping the pin without re-checking the anchors is exactly how this patch
 # would silently become a no-op, so the bump has to come through here. It
 # already earned its keep once: moving off 0.19.0 introduced a THIRD vendor
 # constant (HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS) that the neutralizer did not
 # know about, and rewrote DEFAULT_AGENT_IDENTITY wholesale.
-VERIFIED_HERMES_COMMIT = "f97608f178d1ffeca59860195ab7da295f7c8e5f"
+VERIFIED_HERMES_COMMIT = "bf0203a794a07aac3ff764972ab9087baa4e4f4e"
 
 
 def test_upstream_pin_matches_the_commit_this_patch_was_verified_against():
@@ -486,13 +490,9 @@ def test_pin_is_immutable_and_reproducible():
     assert "--commit \"${HERMES_COMMIT}\"" in body, (
         "the installer is no longer pinned with --commit; it would clone main"
     )
-    assert "--force-commit" in body, (
-        "--force-commit is gone. install.sh SUPPRESSES a --commit that would "
-        "move an existing install backwards and still exits 0, and our pin is "
-        "an ancestor of main — so that branch, if it is ever reached, ignores "
-        "the pin silently. Keep the flag; the rev-parse assertion below is the "
-        "backstop."
-    )
+    # No --force-commit: the v0.22 installer removed it and exits 1 on it
+    # (tests/test_vendored_hermes_installer.py pins the exact arguments). The
+    # rev-parse assertion is what makes the pin hold either way.
     assert "rev-parse HEAD" in body, (
         "the build-time assertion that the checkout is actually at "
         "HERMES_COMMIT is gone; an ignored --commit would ship unnoticed"

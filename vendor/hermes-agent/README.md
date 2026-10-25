@@ -6,9 +6,9 @@ pins in `ARG HERMES_COMMIT`. The image build runs this copy instead of
 downloading it from raw.githubusercontent.com. The comment above
 `ARG HERMES_COMMIT` in the Dockerfile explains why.
 
-upstream_commit: f97608f178d1ffeca59860195ab7da295f7c8e5f
+upstream_commit: bf0203a794a07aac3ff764972ab9087baa4e4f4e
 upstream_path: scripts/install.sh
-git_blob: 4e68442551a510573d9997ed678091e83b225773
+git_blob: 0477b981b8de0aeb2a3ff1c0c371df212e37b7e1
 
 Do not edit `install.sh`. Three checks hold it to upstream:
 

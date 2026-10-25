@@ -47,6 +47,9 @@ _OVERFLOW_TEXTS = [
     # Gateway auto-reset suffix (gateway/run_turn.py @f97608f1) on a body that
     # carries none of the other phrases (compression-timeout variant):
     "Context compression timed out without reducing this conversation. No messages were dropped. Start a fresh session with /new, or check auxiliary.compression before retrying /compress.\n\n\U0001f504 Session auto-reset \u2014 the conversation exceeded the maximum context size and could not be compressed further. Your next message will start a fresh session.",
+    # The gateway's fallback reply, no suffix (locales/en.yaml context_overflow
+    # @bf0203a7; the same literal in gateway/run.py @f97608f1):
+    "\u26a0\ufe0f This conversation has grown too long for me to read all at once. Use /compress to shorten the history, or /new to start a fresh conversation.",
 ]
 
 # Failures that must NOT be treated as overflow. Resetting on any of these
@@ -85,6 +88,7 @@ _REQUIRED_PHRASES = [
     "request payload too large",
     "couldn't shrink it enough automatically",
     "exceeded the maximum context size",
+    "too long for me to read all at once",
 ]
 
 
@@ -192,6 +196,30 @@ def test_overflow_triggers_reset_then_retry(monkeypatch):
         "expected the turn, then the reset, then a replay of the same turn"
     )
     assert len(queue.events) == 1, "exactly one reply is delivered to the caller"
+
+
+def test_overflow_the_gateway_already_reset_is_replayed_without_new(monkeypatch):
+    """The gateway's auto-reset suffix means the session is fresh already.
+
+    hermes v0.22 keeps follow-ups queued behind the exhausted turn and runs
+    them on the fresh session; a /new on top would clear them. Replay only.
+    """
+    overflow = (
+        "Context compression timed out without reducing this conversation.\n\n"
+        "\U0001f504 Session auto-reset — the conversation exceeded the maximum "
+        "context size and could not be compressed further. Your next message "
+        "will start a fresh session."
+    )
+    inst, sent, _source_types = _executor_with_scripted_replies(
+        monkeypatch, [overflow, "here is the real answer"],
+    )
+    queue = _FakeQueue()
+    _run(inst, queue)
+
+    assert sent == ["do the work", "do the work"], (
+        "expected the turn and one replay, with no /new in between"
+    )
+    assert len(queue.events) == 1
 
 
 def test_healthy_turn_does_not_reset(monkeypatch):

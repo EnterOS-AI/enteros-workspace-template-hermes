@@ -67,12 +67,24 @@ corresponding platform contract change and validation.
 The effective hermes engine is **stock upstream, installed from a pinned git
 commit**: `ARG HERMES_COMMIT` in the Dockerfile. That ARG is the whole
 reproducibility story, and it is a commit rather than a version for a reason
-worth knowing before you touch this: `~/.local/bin/hermes` is not the venv
-console script, it is a wrapper that execs `$HERMES_ROOT/hermes`, which puts
-the git **checkout** at `sys.path[0]` ahead of site-packages. The gateway runs
-the checkout. A wheel pin in site-packages is inert — which is what it was
-until 2026-09-03, while the checkout silently tracked whatever upstream `main`
-happened to be on build day.
+worth knowing before you touch this: `~/.local/bin/hermes` execs the
+checkout's own launcher, which runs hermes' pinned Python with the git
+**checkout** at `sys.path[0]` ahead of the dependency environment. The
+gateway runs the checkout. A wheel pin in site-packages is inert — which is
+what it was until 2026-09-03, while the checkout silently tracked whatever
+upstream `main` happened to be on build day.
+
+Since v0.22 the installer hands the checkout to hermes' package manager (pm),
+which downloads a pinned, sha256-checked toolchain (Python, uv, Node, npm,
+Chromium, ...) into `~/.hermes/tools` and builds the dependency environment
+from `uv.lock` under `~/.hermes/installs/<install key>/`. pm keeps that
+selection per hermes home, and the gateway's home is the `/configs` volume,
+not the build-time home, so the image bridges the two: `start.sh` links
+`<HERMES_HOME>/installs` to the baked one on every boot, and the image sets
+`HERMES_RUNTIME_DIR` (where the tool store is) and
+`HERMES_DISABLE_LAZY_INSTALLS=1` (no dependency sync or download at launch;
+upstream's own image sets both). `scripts/hermes-pm-layout.py` asks pm for
+every path the build needs instead of guessing directory names.
 
 The upstream installer that clones and pins that checkout is vendored at
 `vendor/hermes-agent/install.sh` (a byte copy of `scripts/install.sh` at

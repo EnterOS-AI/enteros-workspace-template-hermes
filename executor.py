@@ -229,9 +229,28 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     # logs. Keep both generations.
     "couldn't shrink it enough automatically",  # site_copy context_overflow + payload_too_large
     # Suffix the gateway appends to EVERY compression_exhausted reply when it
-    # auto-resets the session (gateway/run_turn.py; same text at 29112bef).
+    # auto-resets the session (gateway/run_turn.py; same text at 29112bef;
+    # locales/en.yaml auto_reset_context_exhausted at v0.22.5).
     "exceeded the maximum context size",
+    # The gateway's own fallback reply (locales/en.yaml context_overflow at
+    # v0.22.5, a literal in gateway/run.py at f97608f1). It is returned when a
+    # turn classed as overflow has no usable text, and for a 400/500 on a long
+    # history. It carries no auto-reset suffix and the gateway resets nothing,
+    # so without this pattern the workspace stays wedged.
+    "too long for me to read all at once",
 )
+
+# The part of that suffix that says the GATEWAY has already reset the session
+# on a compression-exhausted turn. hermes v0.22 keeps the messages queued
+# behind such a turn and runs them on the fresh session; a /new from us on top
+# would clear that queue and time those turns out. So the heal replays without
+# sending one when it sees this.
+_GATEWAY_AUTO_RESET_MARKER = "exceeded the maximum context size"
+
+
+def _gateway_already_reset(text: str | None) -> bool:
+    """True when the overflow reply says the gateway reset the session itself."""
+    return _GATEWAY_AUTO_RESET_MARKER in (text or "").lower()
 
 
 def _is_context_overflow(text: str | None) -> bool:
@@ -329,8 +348,9 @@ def _reply_message_with_tool_trace(text: str, trace: list[dict[str, str]]):
 
 # --- Scheduled session reset (issue #383) -----------------------------------
 # hermes no longer rotates a gateway conversation on a timer. Upstream
-# 1d5d0594 ("stop time-triggered conversation rotation", inside the pinned
-# v0.21.5) made `session_reset:` in config.yaml and SESSION_IDLE_MINUTES /
+# 1d5d0594 ("stop time-triggered conversation rotation", since v0.21.5 and
+# still retired at v0.22.5, hermes_cli/session_reset_retirement.py) made
+# `session_reset:` in config.yaml and SESSION_IDLE_MINUTES /
 # SESSION_RESET_HOUR inert: a conversation now lasts until someone sends /new.
 # On a scheduled workspace nobody does, so one session grows for days and the
 # agent starts imitating its own compacted history (#383: "nothing to do" with
@@ -711,13 +731,16 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # means THIS prompt is itself oversized, which no reset can fix, so
         # the overflow text is delivered rather than looping.
         if _is_context_overflow(text):
+            already_reset = _gateway_already_reset(text)
             logger.error(
-                "auto-heal: hermes context overflow on chat_id=%s — resetting "
-                "the session and retrying once. reply=%s",
+                "auto-heal: hermes context overflow on chat_id=%s — %s and "
+                "retrying once. reply=%s",
                 chat_id,
+                "the gateway already reset the session" if already_reset
+                else "resetting the session",
                 text[:200],
             )
-            if await self._reset_hermes_session(
+            if already_reset or await self._reset_hermes_session(
                 chat_id=chat_id,
                 peer_id=peer_id,
                 peer_name=peer_name,

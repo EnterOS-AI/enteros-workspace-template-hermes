@@ -273,7 +273,9 @@ jobs:
     # where `docker build` fails non-deterministically. Mirror of the
     # codex sibling fix (template-codex#9) and internal#512.
     runs-on: docker-host
-    timeout-minutes: 15
+    # The image build stages hermes' toolchain and extras since v0.22, and the
+    # smoke test below runs a full A2A round trip in the built image.
+    timeout-minutes: 25
     needs: validate-static
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -382,6 +384,35 @@ jobs:
             exit 1
           fi
           echo "agent login shell resolves bundled node: ${LOGIN_NODE//$'\n'/ }"
+          # hermes >= v0.22 runs from a package-manager environment, so the
+          # paths start.sh feeds the vendor-branding neutralizer
+          # (/etc/hermes-pm-layout.env) are build-time facts of THIS image. Run
+          # it exactly as start.sh does, in both trees: a layout change that
+          # leaves the patch unverifiable fails here, not in a customer's
+          # system prompt.
+          if ! NEUTRALIZE_OUT="$(docker run --rm --entrypoint bash "$SMOKE_TAG" -c '
+                set -e; . /etc/hermes-pm-layout.env
+                for root in /home/agent/.hermes/hermes-agent "$HERMES_SOURCE_SNAPSHOT"; do
+                  python3 /app/scripts/neutralize-vendor-branding.py --hermes-root "$root" --python "$HERMES_AGENT_PYTHON"
+                done' 2>&1)"; then
+            echo "::error::vendor-branding neutralizer failed in the built image: ${NEUTRALIZE_OUT}"
+            exit 1
+          fi
+          echo "vendor-branding neutralizer verified in the built image"
+          # A real A2A round trip through THIS image's hermes, plugin and
+          # executor (scripts/e2e_full_chain.py, with start.sh's runtime-home
+          # bridge), as the uid-1000 agent. gateway-live-roundtrip runs the
+          # same harness against a runner install; this proves the shipped
+          # artifact.
+          if ! E2E_OUT="$(docker run --rm --user 1000:1000 -e HOME=/home/agent --workdir /tmp \
+                --entrypoint python3 "$SMOKE_TAG" /app/scripts/e2e_full_chain.py 2>&1)"; then
+            echo "::group::full-chain round trip in the image (output)"
+            echo "$E2E_OUT"
+            echo "::endgroup::"
+            echo "::error::the A2A full-chain round trip failed inside the built image"
+            exit 1
+          fi
+          echo "$E2E_OUT" | tail -3
           echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
@@ -415,7 +446,8 @@ jobs:
     # where the privileged docker exec chain cannot work. Mirror of
     # template-codex#9 and internal#512.
     runs-on: docker-host
-    timeout-minutes: 15
+    # Builds the image too (--no-cache); see validate-runtime.
+    timeout-minutes: 25
     needs: validate-static
     env:
       MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
@@ -925,7 +957,9 @@ jobs:
     # the gateway runs as a subprocess against a temp HERMES_HOME.
     name: Gateway live round-trip (pinned hermes)
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # The v0.22 installer also stages hermes' toolchain and builds its TUI and
+    # web UI (about 3 minutes on a warm network) before the round trip runs.
+    timeout-minutes: 25
     needs: validate-static
     # review wf_3a7b849d #12: skip the WHOLE job on fork PRs so it reports
     # result="skipped" (not "success" from no-op'd steps) to the aggregates —
@@ -943,11 +977,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # The image build runs vendor/hermes-agent/install.sh instead of
+      # downloading it (Dockerfile, above ARG HERMES_COMMIT). Compare it with
+      # upstream's scripts/install.sh at HERMES_COMMIT in an independent
+      # clone: equal git blob ids mean byte-identical files. A HERMES_COMMIT
+      # bump that does not refresh the vendored copy fails here, before the
+      # next step runs the copy.
+      - name: Vendored installer is upstream scripts/install.sh at HERMES_COMMIT
+        if: github.event.pull_request.head.repo.fork != true
+        run: |
+          set -euo pipefail
+          HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
+          test -n "$HERMES_COMMIT"
+          git clone -q --filter=blob:none --no-checkout \
+            https://github.com/NousResearch/hermes-agent.git /tmp/hermes-src
+          UPSTREAM_BLOB="$(git -C /tmp/hermes-src rev-parse "$HERMES_COMMIT:scripts/install.sh")"
+          VENDORED_BLOB="$(git hash-object vendor/hermes-agent/install.sh)"
+          if [ "$UPSTREAM_BLOB" != "$VENDORED_BLOB" ]; then
+            echo "::error::vendor/hermes-agent/install.sh is blob $VENDORED_BLOB, but scripts/install.sh at $HERMES_COMMIT is blob $UPSTREAM_BLOB. Refresh the copy (vendor/hermes-agent/README.md)."
+            exit 1
+          fi
+          echo "vendored installer == upstream scripts/install.sh at $HERMES_COMMIT (blob $VENDORED_BLOB)"
       - name: Install pinned hermes + a2a plugin + runtime deps
         if: github.event.pull_request.head.repo.fork != true
         run: |
           set -euo pipefail
           HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
+          HERMES_INSTALL_SH_SHA256=$(sed -n 's/^ARG HERMES_INSTALL_SH_SHA256=//p' Dockerfile | head -1)
           A2A_REF=$(sed -n 's/^ARG HERMES_PLATFORM_MOLECULE_A2A_REF=//p' Dockerfile | head -1)
           # review wf_3a7b849d #6: pin the runtime to .runtime-version, the
           # EXACT version the shipped image is built and asserted against
@@ -957,53 +1013,27 @@ jobs:
           # break in the pinned 0.4.x could ship green, and an unrelated newer
           # release could red every template PR.
           RUNTIME_VERSION=$(tr -d '[:space:]' < .runtime-version)
-          test -n "$HERMES_COMMIT" && test -n "$A2A_REF" && test -n "$RUNTIME_VERSION"
+          test -n "$HERMES_COMMIT" && test -n "$HERMES_INSTALL_SH_SHA256" && test -n "$A2A_REF" && test -n "$RUNTIME_VERSION"
           echo "pinned hermes-agent@$HERMES_COMMIT a2a-plugin@$A2A_REF runtime==$RUNTIME_VERSION"
-          # Install from the SAME immutable git ref the image pins (2026-09-03).
-          # It used to be `hermes-agent==$HERMES_VERSION` from PyPI; that pin
-          # named the wheel in site-packages, which the shipped image does not
-          # import (~/.local/bin/hermes puts the checkout at sys.path[0]) — so
-          # this gate was conformance-testing code the fleet does not run.
-          #
-          # It must be an EDITABLE install from a checkout, not `pip install
-          # <git-ref>`: upstream's build backend refuses to build a wheel or
-          # sdist at all ("Building wheels or sdists for hermes-agent is not
-          # supported. Hermes is distributed via the shell installer, Docker
-          # image, or Nix"), so the package form fails outright. This mirrors
-          # what install.sh does in the image (`uv pip install -e .` from the
-          # pinned checkout), which is also why the image was never affected.
-          git clone -q --filter=blob:none --no-checkout \
-            https://github.com/NousResearch/hermes-agent.git /tmp/hermes-src
-          git -C /tmp/hermes-src checkout -q --detach "$HERMES_COMMIT"
+          # Install hermes EXACTLY the way the image does (Dockerfile): the
+          # checksum-verified vendored installer at the pin, then
+          # scripts/hermes-post-install.sh. Since v0.22 the installer builds a
+          # package-manager environment on hermes' own pinned Python from
+          # uv.lock; the old `pip install -e` into this job's Python 3.11 would
+          # gate a dependency set and an interpreter the image does not run.
+          echo "${HERMES_INSTALL_SH_SHA256}  vendor/hermes-agent/install.sh" | sha256sum -c -
+          bash vendor/hermes-agent/install.sh --skip-setup --commit "$HERMES_COMMIT"
           # Same reasoning as the Dockerfile's assertion: verify the ref rather
-          # than trust the fetch, so this gate cannot silently test other code.
-          ACTUAL_COMMIT="$(git -C /tmp/hermes-src rev-parse HEAD)"
+          # than trust the installer, so this gate cannot silently test other code.
+          ACTUAL_COMMIT="$(git -C "$HOME/.hermes/hermes-agent" rev-parse HEAD)"
           if [ "$ACTUAL_COMMIT" != "$HERMES_COMMIT" ]; then
             echo "::error::hermes checkout is at $ACTUAL_COMMIT, expected $HERMES_COMMIT"
             exit 1
           fi
-          pip install -q -e /tmp/hermes-src
+          HERMES_PLATFORM_MOLECULE_A2A_REF="$A2A_REF" bash scripts/hermes-post-install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           pip install -q aiohttp
-          pip install -q "git+https://git.moleculesai.app/molecule-ai/hermes-platform-molecule-a2a.git@${A2A_REF}#egg=hermes-platform-molecule-a2a"
           pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" "molecules-workspace-runtime==$RUNTIME_VERSION"
-      # The image build runs vendor/hermes-agent/install.sh instead of
-      # downloading it (Dockerfile, above ARG HERMES_COMMIT). The upstream
-      # clone from the previous step is at HERMES_COMMIT, so compare git blob
-      # ids: equal ids mean byte-identical files. A HERMES_COMMIT bump that
-      # does not refresh the vendored copy fails here.
-      - name: Vendored installer is upstream scripts/install.sh at HERMES_COMMIT
-        if: github.event.pull_request.head.repo.fork != true
-        run: |
-          set -euo pipefail
-          HERMES_COMMIT=$(sed -n 's/^ARG HERMES_COMMIT=//p' Dockerfile | head -1)
-          test -n "$HERMES_COMMIT"
-          UPSTREAM_BLOB="$(git -C /tmp/hermes-src rev-parse "$HERMES_COMMIT:scripts/install.sh")"
-          VENDORED_BLOB="$(git hash-object vendor/hermes-agent/install.sh)"
-          if [ "$UPSTREAM_BLOB" != "$VENDORED_BLOB" ]; then
-            echo "::error::vendor/hermes-agent/install.sh is blob $VENDORED_BLOB, but scripts/install.sh at $HERMES_COMMIT is blob $UPSTREAM_BLOB. Refresh the copy (vendor/hermes-agent/README.md)."
-            exit 1
-          fi
-          echo "vendored installer == upstream scripts/install.sh at $HERMES_COMMIT (blob $VENDORED_BLOB)"
       - name: Run the full-chain round-trip against the pinned gateway
         if: github.event.pull_request.head.repo.fork != true
         run: |
@@ -1145,6 +1175,7 @@ jobs:
           tests/test_executor_plugin_path.py
           tests/test_vendor_branding_neutralized.py
           tests/test_vendored_hermes_installer.py
+          tests/test_hermes_pm_runtime_bridge.py
           tests/test_start_sh_tmpdir.py
           tests/test_turn_activity_plugin.py
           -v

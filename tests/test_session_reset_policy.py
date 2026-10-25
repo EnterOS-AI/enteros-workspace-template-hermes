@@ -1,7 +1,7 @@
 """Scheduled hermes session reset (issue #383).
 
 hermes stopped rotating gateway conversations on a timer upstream (1d5d0594,
-inside the pinned v0.21.5): ``session_reset:`` in config.yaml and the
+since v0.21.5 and still at v0.22.5): ``session_reset:`` in config.yaml and the
 SESSION_IDLE_MINUTES / SESSION_RESET_HOUR variables are ignored, so writing
 them from start.sh would be a dead knob. The executor applies the policy
 instead, by sending hermes's own ``/new`` ahead of the turn that crosses the
