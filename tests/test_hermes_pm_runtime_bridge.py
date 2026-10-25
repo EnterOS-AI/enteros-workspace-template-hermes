@@ -7,7 +7,8 @@ gateway runs with HOME=/tmp, its home on the /configs volume, where pm finds
 neither: without the bridge it exits with "no dependency environment is
 committed for this install", and without HERMES_RUNTIME_DIR it finds no Node
 for MCP servers. These tests hold the bridge's pieces in place; the image
-build and CI's in-image round trip (validate-runtime) prove it end to end.
+build and CI's in-image boot and round trip (t4-conformance) prove it end to
+end.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO / "Dockerfile"
 START_SH = REPO / "start.sh"
 E2E = REPO / "scripts" / "e2e_full_chain.py"
+POST_INSTALL = REPO / "scripts" / "hermes-post-install.sh"
 _BLOCK_RE = re.compile(r"^\{$\n(.*?)^\} >\"\$HERMES_CONFIG\"$", re.M | re.S)
 _INSTALLS_BLOCK_RE = re.compile(
     r"^HERMES_BUILD_INSTALLS=/home/agent/\.hermes/installs$\n.*?^fi$", re.M | re.S
@@ -55,13 +57,29 @@ def test_image_points_pm_at_the_baked_store_and_forbids_lazy_installs():
 
 def test_extras_are_selected_before_the_plugin_is_installed():
     """Enabling extras builds a new environment; the plugin must go in after."""
-    runs = [ln for ln in _dockerfile_instructions() if ln.startswith("RUN ")]
-    extras = [i for i, ln in enumerate(runs) if "hermes pm install" in ln and "--extra" in ln]
-    plugin = [i for i, ln in enumerate(runs) if "hermes-post-install.sh" in ln]
-    assert extras and plugin, "the extras step or the plugin post-install step is gone"
+    code = _code_lines(POST_INSTALL)
+    extras = [i for i, ln in enumerate(code) if "pm install" in ln]
+    plugin = [i for i, ln in enumerate(code) if "uv\" pip install" in ln]
+    assert extras and plugin, "the extras step or the plugin install is gone"
     assert max(extras) < min(plugin), (
         "an extras install after the plugin builds an environment without it"
     )
+    assert any("hermes-post-install.sh" in ln for ln in _dockerfile_instructions()
+               if ln.startswith("RUN ")), "the image no longer runs the shared post-install"
+    assert not any("pm install" in ln for ln in _dockerfile_instructions()
+                   if ln.startswith("RUN ")), (
+        "an extras step in the Dockerfile is not what CI's gateway-live-roundtrip installs"
+    )
+
+
+def test_post_install_fails_on_missing_optional_tools_and_links_node():
+    """pm leaves optional tools out with a warning; the build must not."""
+    src = POST_INSTALL.read_text(encoding="utf-8")
+    assert "for tool in agent-browser chromium cua-driver; do" in src
+    assert '--version >/dev/null' in src
+    # molecule-runtime finds npx for the management MCP only through PATH.
+    assert 'ln -sfn "$target" "$local_bin/$tool"' in src
+    assert 'local_bin="$HOME/.local/bin"' in src
 
 
 def test_start_sh_links_the_baked_state_before_the_gateway_starts():

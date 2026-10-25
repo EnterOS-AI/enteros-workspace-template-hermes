@@ -222,6 +222,42 @@ def test_overflow_the_gateway_already_reset_is_replayed_without_new(monkeypatch)
     assert len(queue.events) == 1
 
 
+_FALLBACK = (
+    "⚠️ This conversation has grown too long for me to read all at once. "
+    "Use /compress to shorten the history, or /new to start a fresh conversation."
+)
+
+
+def test_ambiguous_fallback_is_replayed_on_the_same_session_first(monkeypatch):
+    """The fallback also stands for a provider 400/500 on a long session.
+
+    A reset there would wipe a healthy conversation for nothing, so the turn
+    is replayed once on the same session; a normal reply ends the heal.
+    """
+    inst, sent, _source_types = _executor_with_scripted_replies(
+        monkeypatch, [_FALLBACK, "here is the real answer"],
+    )
+    queue = _FakeQueue()
+    _run(inst, queue)
+
+    assert sent == ["do the work", "do the work"], "no /new before the replay"
+    assert len(queue.events) == 1
+
+
+def test_repeated_fallback_goes_on_to_reset_then_one_replay(monkeypatch):
+    """A second fallback means the session itself is the problem."""
+    inst, sent, _source_types = _executor_with_scripted_replies(
+        monkeypatch,
+        [_FALLBACK, _FALLBACK, "Session reset! Starting fresh.", "here is the real answer"],
+    )
+    queue = _FakeQueue()
+    _run(inst, queue)
+
+    assert sent == ["do the work", "do the work", "/new", "do the work"]
+    assert sent.count("/new") == 1
+    assert len(queue.events) == 1
+
+
 def test_healthy_turn_does_not_reset(monkeypatch):
     """No reset on a normal reply — the heal must not touch healthy sessions."""
     inst, sent, _source_types = _executor_with_scripted_replies(monkeypatch, ["all done"])

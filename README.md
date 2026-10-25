@@ -81,9 +81,12 @@ from `uv.lock` under `~/.hermes/installs/<install key>/`. pm keeps that
 selection per hermes home, and the gateway's home is the `/configs` volume,
 not the build-time home, so the image bridges the two: `start.sh` links
 `<HERMES_HOME>/installs` to the baked one on every boot, and the image sets
-`HERMES_RUNTIME_DIR` (where the tool store is) and
-`HERMES_DISABLE_LAZY_INSTALLS=1` (no dependency sync or download at launch;
-upstream's own image sets both). `scripts/hermes-pm-layout.py` asks pm for
+`HERMES_RUNTIME_DIR` (where the tool store is, as upstream's own image does)
+and `HERMES_DISABLE_LAZY_INSTALLS=1`. The latter is our choice, not upstream's:
+any dependency sync or on-demand install builds a new environment that would
+not contain the A2A plugin this image installs by hand, so the optional SDKs a
+workspace used to get on first use are baked instead
+(`scripts/hermes-post-install.sh`). `scripts/hermes-pm-layout.py` asks pm for
 every path the build needs instead of guessing directory names.
 
 The upstream installer that clones and pins that checkout is vendored at

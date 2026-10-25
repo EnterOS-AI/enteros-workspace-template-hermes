@@ -320,12 +320,24 @@ fi
 # failure is logged loudly and CI catches the same condition
 # (tests/test_vendor_branding_neutralized.py) before it reaches a customer.
 HERMES_UPSTREAM_ROOT="${HERMES_UPSTREAM_ROOT:-/home/agent/.hermes/hermes-agent}"
+HERMES_STORE_PYTHON=""
 HERMES_AGENT_PYTHON=""
 HERMES_SOURCE_SNAPSHOT=""
 if [ -r /etc/hermes-pm-layout.env ]; then
   # shellcheck disable=SC1091 -- written by the Dockerfile.
   . /etc/hermes-pm-layout.env
 fi
+# Ask pm which environment the gateway will select NOW: as the agent, under the
+# runtime home (the installs link above), the way the gateway resolves it. The
+# build-time values stay as the fallback.
+hermes_pm_layout() {  # $1 = key; prints the path or nothing
+  [ -n "$HERMES_STORE_PYTHON" ] || return 1
+  # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+  ${AS_AGENT} env HOME=/tmp "$HERMES_STORE_PYTHON" -I /app/scripts/hermes-pm-layout.py \
+    "$HERMES_UPSTREAM_ROOT" "$1" 2>/dev/null
+}
+if live_value="$(hermes_pm_layout env-python)"; then HERMES_AGENT_PYTHON="$live_value"; fi
+if live_value="$(hermes_pm_layout source-snapshot)"; then HERMES_SOURCE_SNAPSHOT="$live_value"; fi
 for neutralize_root in "$HERMES_UPSTREAM_ROOT" "$HERMES_SOURCE_SNAPSHOT"; do
   [ -n "$neutralize_root" ] || continue
   if [ ! -d "$neutralize_root" ]; then
@@ -1119,12 +1131,15 @@ GATEWAY_PID=$!
 # Max 120s — enough for a cold gateway boot including first-time DB
 # migrations and session-store init. Longer waits should surface as a
 # provisioning failure upstream rather than silently holding the container.
-# 600 s, not the 120 s this used to be: the first boot of a new hermes on an
+# 420 s, not the 120 s this used to be: the first boot of a new hermes on an
 # existing /configs volume migrates state.db before /health answers. v0.22's
-# schema 30 -> 32 step builds a new index over the whole messages table, and
-# upstream itself allows that phase 600 s ("multi-GB DBs"). The loop still
-# fails at once if the gateway exits, so only a live, migrating gateway waits.
-READY_TIMEOUT=600
+# schema 30 -> 32 step builds a new index over the whole messages table
+# (upstream allows that phase 600 s for multi-GB databases). Measured: 10 s on
+# 142,700 messages / 646 MB, the size of the largest production state.db. 420 s
+# keeps the whole boot inside config.yaml's provision_timeout_seconds (720).
+# The loop still fails at once if the gateway exits, so only a live, migrating
+# gateway waits.
+READY_TIMEOUT=420
 for _ in $(seq 1 $READY_TIMEOUT); do
   if curl -fsS "http://127.0.0.1:${API_SERVER_PORT:-8642}/health" >/dev/null 2>&1; then
     break

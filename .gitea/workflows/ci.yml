@@ -384,35 +384,6 @@ jobs:
             exit 1
           fi
           echo "agent login shell resolves bundled node: ${LOGIN_NODE//$'\n'/ }"
-          # hermes >= v0.22 runs from a package-manager environment, so the
-          # paths start.sh feeds the vendor-branding neutralizer
-          # (/etc/hermes-pm-layout.env) are build-time facts of THIS image. Run
-          # it exactly as start.sh does, in both trees: a layout change that
-          # leaves the patch unverifiable fails here, not in a customer's
-          # system prompt.
-          if ! NEUTRALIZE_OUT="$(docker run --rm --entrypoint bash "$SMOKE_TAG" -c '
-                set -e; . /etc/hermes-pm-layout.env
-                for root in /home/agent/.hermes/hermes-agent "$HERMES_SOURCE_SNAPSHOT"; do
-                  python3 /app/scripts/neutralize-vendor-branding.py --hermes-root "$root" --python "$HERMES_AGENT_PYTHON"
-                done' 2>&1)"; then
-            echo "::error::vendor-branding neutralizer failed in the built image: ${NEUTRALIZE_OUT}"
-            exit 1
-          fi
-          echo "vendor-branding neutralizer verified in the built image"
-          # A real A2A round trip through THIS image's hermes, plugin and
-          # executor (scripts/e2e_full_chain.py, with start.sh's runtime-home
-          # bridge), as the uid-1000 agent. gateway-live-roundtrip runs the
-          # same harness against a runner install; this proves the shipped
-          # artifact.
-          if ! E2E_OUT="$(docker run --rm --user 1000:1000 -e HOME=/home/agent --workdir /tmp \
-                --entrypoint python3 "$SMOKE_TAG" /app/scripts/e2e_full_chain.py 2>&1)"; then
-            echo "::group::full-chain round trip in the image (output)"
-            echo "$E2E_OUT"
-            echo "::endgroup::"
-            echo "::error::the A2A full-chain round trip failed inside the built image"
-            exit 1
-          fi
-          echo "$E2E_OUT" | tail -3
           echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
@@ -646,6 +617,90 @@ jobs:
             | tee "$MCP_E2E_LOG"
           docker rm "$MCP_VERIFY_CONTAINER" >/dev/null
           grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_E2E_LOG"
+          KEEP_T4_IMAGE=1
+      # hermes >= v0.22 runs from a package-manager environment that this
+      # image bridges into the runtime home (start.sh, Dockerfile ENV). Prove
+      # the shipped artifact end to end, fail-closed like the steps around it:
+      #   1. the REAL start.sh boot, on a throwaway /configs volume with no
+      #      platform: the installs link, both vendor-branding trees patched
+      #      and verified, the A2A plugin check, the gateway's /health and the
+      #      MCP smoke. molecule-runtime then stops on the missing
+      #      /configs/config.yaml, which a real workspace gets from the platform;
+      #   2. node/npx on the PATH molecule-runtime itself gets (it spawns the
+      #      management MCP with npx);
+      #   3. a full A2A round trip (scripts/e2e_full_chain.py) through this
+      #      image's hermes, plugin and executor, as the uid-1000 agent.
+      - name: Boot path and A2A round trip in the built image
+        if: github.event.pull_request.head.repo.fork != true
+        run: |
+          set -euo pipefail
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          BOOT_NAME="hermes-boot-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          BOOT_VOLUME="${BOOT_NAME}-configs"
+          KEEP_T4_IMAGE=0
+          cleanup_boot() {
+            docker rm -f "$BOOT_NAME" >/dev/null 2>&1 || true
+            docker volume rm -f "$BOOT_VOLUME" >/dev/null 2>&1 || true
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_boot EXIT
+          docker volume create "$BOOT_VOLUME" >/dev/null
+          docker run -d --name "$BOOT_NAME" -v "$BOOT_VOLUME:/configs" \
+            -e WORKSPACE_ID=00000000-0000-0000-0000-0000000c1b07 \
+            -e PLATFORM_URL=http://127.0.0.1:9 \
+            -e HERMES_DEFAULT_MODEL=custom/test-model \
+            -e HERMES_CUSTOM_BASE_URL=http://127.0.0.1:9/v1 \
+            -e HERMES_CUSTOM_API_KEY=sk-ci-boot-placeholder \
+            "$T4_TAG" >/dev/null
+          for _ in $(seq 1 300); do
+            if grep -q -E "gateway ready on|failed to reach /health|exited during boot" <<<"$(docker logs "$BOOT_NAME" 2>&1)"; then
+              break
+            fi
+            sleep 2
+          done
+          # The MCP smoke runs right after /health.
+          for _ in $(seq 1 30); do
+            if grep -q "hermes mcp list" <<<"$(docker logs "$BOOT_NAME" 2>&1)"; then break; fi
+            sleep 2
+          done
+          BOOT_LOG="$(docker logs "$BOOT_NAME" 2>&1)"
+          fail_boot() {
+            echo "::group::start.sh boot log (tail)"
+            tail -150 <<<"$BOOT_LOG"
+            echo "::endgroup::"
+            echo "::error::$1"
+            exit 1
+          }
+          for want in \
+            "upstream vendor self-identification neutralized in /home/agent/.hermes/hermes-agent" \
+            "upstream vendor self-identification neutralized in /home/agent/.hermes/installs/" \
+            "hermes gateway ready on" \
+            "hermes mcp list shows 'molecule' wired"; do
+            grep -qF "$want" <<<"$BOOT_LOG" || fail_boot "start.sh boot: missing \"$want\""
+          done
+          for forbid in \
+            "molecule_a2a plugin is not installed" \
+            "no dependency environment is committed" \
+            "is missing: hermes will refuse to start"; do
+            if grep -qF "$forbid" <<<"$BOOT_LOG"; then fail_boot "start.sh boot: \"$forbid\""; fi
+          done
+          LINK="$(docker run --rm -v "$BOOT_VOLUME:/configs" --entrypoint readlink "$T4_TAG" /configs/.hermes/installs)"
+          [ "$LINK" = /home/agent/.hermes/installs ] || fail_boot "/configs/.hermes/installs links to '$LINK'"
+          echo "start.sh boot: installs bridged, both trees neutralized, gateway healthy, MCP smoke passed"
+          RUNTIME_NODE="$(docker run --rm --user 1000:1000 -e HOME=/tmp --entrypoint sh "$T4_TAG" -c 'command -v node && command -v npx')" \
+            || fail_boot "node/npx are not on molecule-runtime's PATH (it launches the management MCP with npx)"
+          echo "molecule-runtime PATH resolves: ${RUNTIME_NODE//$'\n'/ }"
+          if ! E2E_OUT="$(docker run --rm --user 1000:1000 -e HOME=/home/agent --workdir /tmp \
+                --entrypoint python3 "$T4_TAG" /app/scripts/e2e_full_chain.py 2>&1)"; then
+            echo "::group::full-chain round trip in the image (output)"
+            echo "$E2E_OUT"
+            echo "::endgroup::"
+            echo "::error::the A2A full-chain round trip failed inside the built image"
+            exit 1
+          fi
+          grep -E "^OK: " <<<"$E2E_OUT" | tail -4 || true
           KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + assert host-root reach AND token agent-ownership
         if: github.event.pull_request.head.repo.fork != true
@@ -956,10 +1011,14 @@ jobs:
     # shell-tests — the eager-MCP reconcile mechanics. No docker needed:
     # the gateway runs as a subprocess against a temp HERMES_HOME.
     name: Gateway live round-trip (pinned hermes)
-    runs-on: ubuntu-latest
+    # docker-host, not ubuntu-latest: the Windows act_runners also advertise
+    # ubuntu-latest (see validate-runtime), and upstream's install.sh refuses a
+    # non-Linux/macOS host.
+    runs-on: docker-host
     # The v0.22 installer also stages hermes' toolchain and builds its TUI and
-    # web UI (about 3 minutes on a warm network) before the round trip runs.
-    timeout-minutes: 25
+    # web UI, and the post-install selects the extras (a few minutes on a warm
+    # network) before the round trip runs.
+    timeout-minutes: 30
     needs: validate-static
     # review wf_3a7b849d #12: skip the WHOLE job on fork PRs so it reports
     # result="skipped" (not "success" from no-op'd steps) to the aggregates —
@@ -1176,6 +1235,7 @@ jobs:
           tests/test_vendor_branding_neutralized.py
           tests/test_vendored_hermes_installer.py
           tests/test_hermes_pm_runtime_bridge.py
+          tests/test_mcp_bare_python_pin.py
           tests/test_start_sh_tmpdir.py
           tests/test_turn_activity_plugin.py
           -v

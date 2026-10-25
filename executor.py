@@ -233,10 +233,13 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     # locales/en.yaml auto_reset_context_exhausted at v0.22.5).
     "exceeded the maximum context size",
     # The gateway's own fallback reply (locales/en.yaml context_overflow at
-    # v0.22.5, a literal in gateway/run.py at f97608f1). It is returned when a
-    # turn classed as overflow has no usable text, and for a 400/500 on a long
-    # history. It carries no auto-reset suffix and the gateway resets nothing,
-    # so without this pattern the workspace stays wedged.
+    # v0.22.5, a literal in gateway/run.py at f97608f1). It carries no
+    # auto-reset suffix and the gateway resets nothing. It is NOT proof of an
+    # overflow: the gateway also sends it for a bare "400" error, or a 400/500
+    # exception, once a session has more than 50 history rows
+    # (gateway/run_turn.py is_context_overflow_failure_result,
+    # run_turn_persistence.py _hmwa_agent_error_reply), and almost every
+    # platform session is that long. See _GATEWAY_OVERFLOW_FALLBACK below.
     "too long for me to read all at once",
 )
 
@@ -247,10 +250,26 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 # sending one when it sees this.
 _GATEWAY_AUTO_RESET_MARKER = "exceeded the maximum context size"
 
+# The suffix-less fallback above. Because it also stands for an ordinary
+# provider 400/500 on a long session, the heal first replays the turn on the
+# SAME session, and only resets when the replay gets the fallback again: a
+# reset on a transient error would wipe a healthy conversation for nothing.
+_GATEWAY_OVERFLOW_FALLBACK = "too long for me to read all at once"
+
 
 def _gateway_already_reset(text: str | None) -> bool:
     """True when the overflow reply says the gateway reset the session itself."""
     return _GATEWAY_AUTO_RESET_MARKER in (text or "").lower()
+
+
+def _is_ambiguous_overflow_fallback(text: str | None) -> bool:
+    """True for the gateway's fallback reply when nothing else marks an overflow."""
+    lowered = (text or "").lower()
+    if _GATEWAY_OVERFLOW_FALLBACK not in lowered:
+        return False
+    return not any(
+        p in lowered for p in _CONTEXT_OVERFLOW_PATTERNS if p != _GATEWAY_OVERFLOW_FALLBACK
+    )
 
 
 def _is_context_overflow(text: str | None) -> bool:
@@ -730,6 +749,30 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # Bounded to a single attempt: a second overflow on an empty session
         # means THIS prompt is itself oversized, which no reset can fix, so
         # the overflow text is delivered rather than looping.
+        #
+        # The gateway's suffix-less fallback is ambiguous (a provider 400/500
+        # on any long session gets the same text), so it first earns one
+        # replay on the SAME session; only a second fallback goes on to the
+        # reset below. Worst case: turn, replay, /new, replay.
+        if _is_ambiguous_overflow_fallback(text):
+            logger.warning(
+                "auto-heal: hermes overflow fallback on chat_id=%s — replaying "
+                "once on the same session before any reset. reply=%s",
+                chat_id,
+                text[:200],
+            )
+            text = await self._dispatch_and_wait(
+                content=prompt,
+                chat_id=chat_id,
+                peer_id=peer_id,
+                peer_name=peer_name,
+                callback_url=callback_url,
+                history=history,
+                event_queue=event_queue,
+                source_type=source_type,
+            )
+            if text is None:
+                return
         if _is_context_overflow(text):
             already_reset = _gateway_already_reset(text)
             logger.error(

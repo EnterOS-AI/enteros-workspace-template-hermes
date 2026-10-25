@@ -267,37 +267,25 @@ RUN set -eu; \
       exit 1; \
     fi; \
     echo "hermes checkout pinned at $actual"
-# Optional dependency extras, baked. The installer selects only `all`
-# (cron, pty, mcp, uvloop, sms, acp, google, web, youtube). Up to v0.21 every
-# other SDK was pip-installed on first use; v0.22 routes those through pm,
-# and the runtime below forbids that (HERMES_DISABLE_LAZY_INSTALLS=1): a lazy
-# install builds a NEW environment generation, which would not contain the
-# A2A plugin installed further down, so the next gateway start would lose the
-# platform transport. Every SDK a workspace can reach at runtime is therefore
-# selected here, before the plugin goes in:
-#   - model providers: anthropic (also the Anthropic-compatible kimi-coding
-#     and zai endpoints), bedrock, vertex, azure-identity, mistral;
-#   - web search backends: exa, firecrawl, parallel-web, ddgs;
-#   - fal (image generation), edge-tts (the default TTS backend);
-#   - doc-extract (document reading), computer-use (cua-driver backend).
-# pm records the selection, so it is also the baseline of any later
-# environment.
-RUN /home/agent/.local/bin/hermes pm install \
-      --extra anthropic --extra bedrock --extra vertex --extra azure-identity \
-      --extra mistral --extra exa --extra firecrawl --extra parallel-web \
-      --extra ddgs --extra fal --extra edge-tts --extra doc-extract \
-      --extra computer-use
 # The installer publishes ~/.local/bin/hermes (it execs the checkout's
-# launcher), so ~/.local/bin is the only PATH entry hermes itself needs.
+# launcher); scripts/hermes-post-install.sh (below) links node/npm/npx and
+# cua-driver there too, as the pre-0.22 installer did.
 #
 # The gateway runs with HOME=/tmp and HERMES_HOME=/tmp/.hermes, a link onto the
 # /configs volume (start.sh), but pm resolves its tool store under the ACTIVE
 # home: /tmp/.hermes/tools, which is empty. hermes then finds no node/npx for
 # MCP servers and no Chromium for the browser tool. HERMES_RUNTIME_DIR is pm's
 # override for where the store lives; upstream's own image sets it the same
-# way. HERMES_DISABLE_LAZY_INSTALLS=1 is the flag upstream's image sets too:
-# no dependency sync, update completion or tool download at launch, so a boot
-# never reaches the network for hermes' own dependencies or rewrites them.
+# way.
+#
+# HERMES_DISABLE_LAZY_INSTALLS=1 is our decision, NOT upstream's: upstream's
+# image leaves lazy installs on. pm reads the flag (pm/install.py
+# lazy_installs_allowed, hermes_cli/venv_sync.py prepare_launch), so no launch
+# runs a dependency sync, an update completion or an on-demand install. Any of
+# those builds a NEW environment generation, which would not contain the A2A
+# plugin this image installs by hand, and the next gateway start would lose
+# the platform transport (follow-up: make the plugin pm-managed). The SDKs a
+# workspace used to get on first use are baked by hermes-post-install.sh.
 # The dependency selection itself is per home (<HERMES_HOME>/installs); start.sh
 # links the one built here into the volume on every boot.
 ENV PATH="/home/agent/.local/bin:${PATH}" \
@@ -331,13 +319,16 @@ ENV PATH="/home/agent/.local/bin:${PATH}" \
 # upstream-sync workflow compares PyPI's latest against this floor and files
 # the "you can go back to a published release now" PR when one appears.
 ARG HERMES_PYPI_FLOOR=0.22.5
-ARG HERMES_PLATFORM_MOLECULE_A2A_REF=2740078c90b51727f5d09a792c25484f4739d0a9
+ARG HERMES_PLATFORM_MOLECULE_A2A_REF=f08bc9dff29d12c5f11800faa98404f507cd5dc5
 # scripts/hermes-post-install.sh (shared with CI's gateway-live-roundtrip, so
-# the gate runs this exact install) puts the plugin into the committed
-# dependency environment with pm's uv and --no-deps, proves hermes' plugin
-# discovery sees it, and links pm's node/npm/npx into ~/.hermes/node/bin: OUR
-# stable Node bin dir, which start.sh and /etc/profile.d put on PATH
-# (scripts/hermes-node-path.sh) and the management-MCP pre-bake below reads.
+# the gate runs this exact install; its header has the detail):
+#   - selects the optional dependency extras that replace first-use installs;
+#   - links pm's node/npm/npx into ~/.hermes/node/bin (OUR stable Node bin dir:
+#     start.sh, /etc/profile.d and the management-MCP pre-bake below read it)
+#     and into ~/.local/bin;
+#   - fails unless agent-browser, Chromium and cua-driver are installed and run;
+#   - installs the A2A plugin into the committed environment and proves hermes'
+#     plugin discovery sees it.
 # Every path comes from pm; a layout pm does not report fails the build.
 RUN HERMES_PLATFORM_MOLECULE_A2A_REF="${HERMES_PLATFORM_MOLECULE_A2A_REF}" \
     bash /app/scripts/hermes-post-install.sh
@@ -359,17 +350,19 @@ RUN MOLECULE_PREBAKE_NODE_BIN=/home/agent/.hermes/node/bin \
 USER root
 WORKDIR /app
 
-# start.sh runs scripts/neutralize-vendor-branding.py on every boot, as root
-# with HOME=/root, where pm cannot resolve the agent's install. Record the two
-# paths it needs once, here, as the installing user. Assigned before printf so
-# a path pm cannot report fails the build instead of writing an empty value.
+# start.sh needs hermes' interpreters at boot (the vendor-branding neutralizer,
+# the A2A plugin check). It asks pm again then, as the agent under the runtime
+# home, so a later environment generation is seen; these build-time values are
+# the fallback. Assigned before printf so a path pm cannot report fails the
+# build instead of writing an empty value.
 RUN set -eu; \
     set -- /home/agent/.hermes/tools/python-*/bin/python3; \
     layout() { gosu agent env HOME=/home/agent "$1" -I /app/scripts/hermes-pm-layout.py /home/agent/.hermes/hermes-agent "$2"; }; \
+    store_python="$(layout "$1" store-python)"; \
     agent_python="$(layout "$1" env-python)"; \
     source_snapshot="$(layout "$1" source-snapshot)"; \
-    printf 'HERMES_AGENT_PYTHON=%s\nHERMES_SOURCE_SNAPSHOT=%s\n' "$agent_python" "$source_snapshot" \
-      > /etc/hermes-pm-layout.env; \
+    printf 'HERMES_STORE_PYTHON=%s\nHERMES_AGENT_PYTHON=%s\nHERMES_SOURCE_SNAPSHOT=%s\n' \
+      "$store_python" "$agent_python" "$source_snapshot" > /etc/hermes-pm-layout.env; \
     cat /etc/hermes-pm-layout.env
 
 ENV ADAPTER_MODULE=adapter \

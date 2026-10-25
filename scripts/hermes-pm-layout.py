@@ -15,8 +15,12 @@ resolves the same data root the install used:
 Keys, one absolute path printed per key, in order:
     env-python       interpreter of the committed dependency environment
     source-snapshot  the source copy that environment's editable install maps
+    store-python     hermes' own interpreter (the one running this script)
     uv               pm's uv
     node, npm, npx   pm's Node.js toolchain
+    agent-browser, chromium, cua-driver
+                     pm's optional default tools (pm leaves them out with only
+                     a warning when they fail to install)
 
 Exits non-zero, naming the key, when pm reports nothing or the path is
 missing, so a layout change fails the image build instead of shipping.
@@ -37,9 +41,11 @@ def resolve(root: Path, key: str) -> Path | None:
         if venv is None:
             return None
         return venv_python(venv) if key == "env-python" else venv.parent / "workspace"
+    if key == "store-python":
+        return Path(sys.executable)
     if key == "uv":
         return uv_launcher("uv")
-    if key in ("node", "npm"):
+    if key in ("node", "npm", "agent-browser", "chromium", "cua-driver"):
         package = installed_package(key)
         return package.binary if package is not None else None
     if key == "npx":
