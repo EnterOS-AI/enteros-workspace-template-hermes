@@ -98,33 +98,56 @@ plugin transport, which is the image default.
 ## Turn supervision
 
 On the plugin transport a turn lasts until Hermes answers it. While any
-message is waiting for its answer, the workspace reports busy: the heartbeat's
+message is running or waiting, the workspace reports busy: the heartbeat's
 `active_tasks` and `is_busy`, which the idle digest, the scheduler and the
-platform read before they send another autonomous wake. These knobs bound a
-turn. Set them as workspace environment variables or secrets; an invalid value
-is logged at WARNING and the default is used.
+platform read before they send another autonomous wake.
+
+The executor gives Hermes one message per chat at a time. A message that
+arrives while a turn runs waits in the executor, in arrival order, and reaches
+Hermes once the running turn is answered. Left to Hermes' own queue it would
+run inside the running turn and be answered under that turn's id (hermes#393),
+and Hermes' `/stop` would leave it queued to run next. A command a person sends
+mid-turn that Hermes answers inline (`/stop`, `/new`, `/reset`, `/approve`,
+`/deny`, `/status`, `/usage`, `/help`) skips the wait; the first three end the
+running turn.
+
+These knobs bound a turn. Set them as workspace environment variables or
+secrets; an invalid value is logged at WARNING and the default is used.
 
 | Variable | Effect | Default |
 |---|---|---|
-| `HERMES_TURN_STALL_SECONDS` | Give up on a turn after this long with no sign of life from the gateway: no reply, no other send for the chat, no tool call. A live run is never that quiet (see `HERMES_AGENT_NOTIFY_INTERVAL`), so this catches a crashed or wedged gateway. | the runtime's turn-lease TTL: `MOLECULE_TURN_LEASE_TTL_SECONDS`, else `A2A_COMPLETION_IDLE_TIMEOUT_SECONDS`, else `900` |
-| `HERMES_TURN_MAX_SECONDS` | Stop a turn that has been running this long, however busy: send Hermes' `/stop`, which ends the run and clears the messages queued behind it, and answer every one of them. `0` turns the cap off. | the runtime's absolute turn cap: `MOLECULE_MAX_TURN_SECONDS`, else 4 × the stall default (`3600`) |
+| `HERMES_TURN_REPLY_DEADLINE_SECONDS` | Answer the caller of a person's or a peer's turn that is still running (or still waiting) after this long, and let the turn go on. The platform stops waiting for an A2A answer at 30 minutes and then queues the request to be delivered again, which would run the work twice, so keep this below that. `0` turns it off. | `1500` |
+| `HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS` | The same for the runtime's own wakes. Their senders give up sooner: the delegation harvester after 120 s, the idle digest after 300 s. `0` turns it off. | `60` |
+| `HERMES_TURN_STALL_SECONDS` | Give up on the running turn after this long with no sign of life from the gateway: no reply, no other send for the chat, no tool call. A live run is never that quiet (see `HERMES_AGENT_NOTIFY_INTERVAL`), so this catches a crashed or wedged gateway. | the runtime's turn-lease TTL: `MOLECULE_TURN_LEASE_TTL_SECONDS`, else `A2A_COMPLETION_IDLE_TIMEOUT_SECONDS`, else `900` |
+| `HERMES_TURN_MAX_SECONDS` | Stop the running turn after it has run this long, however busy, by sending Hermes' `/stop`. The next waiting message goes to Hermes once `/stop` is answered. `0` turns the cap off. | the runtime's absolute turn cap: `MOLECULE_MAX_TURN_SECONDS`, else 4 × the stall default (`3600`) |
+| `HERMES_TURN_QUEUE_MAX` | How many messages may wait behind the running turn on one chat. One more is refused with the runtime's own backpressure reply. | `32` |
 | `HERMES_AGENT_NOTIFY_INTERVAL` | Seconds between the gateway's "still working" sends during a turn, the liveness signal inside one long tool call. Keep it well under the stall window; the executor warns at boot when it is not. | `60` (set by `start.sh`; upstream Hermes defaults to `180`) |
-| `HERMES_TURN_POLL_SECONDS` | How often the executor checks running turns and the tool-activity file | `1` |
+| `HERMES_TURN_POLL_SECONDS` | How often the executor checks the running turns and the tool-activity file | `1` |
 | `HERMES_CONTROL_REPLY_SECONDS` | How long the executor waits for Hermes to answer `/new` or `/stop` | `120` |
-| `HERMES_DROP_SELF_PINGS_WHEN_BUSY` | Fast-ack and drop a routine self-wake (idle digest, cron, scheduler, delegation harvester) that arrives while a turn runs, as the runtime's native executor does. `0` forwards it, and Hermes queues it behind the running turn. | `1` |
-| `HERMES_REPLY_RECORRELATE` | Deliver an answer that Hermes anchors to an already-answered message (hermes#393: the last message drained in one run is answered under the id that opened the run) to the oldest unanswered message on the chat. `0` treats it as a late reply. | `1` |
+| `HERMES_DROP_SELF_PINGS_WHEN_BUSY` | Fast-ack and drop a routine self-wake (idle digest, cron, scheduler, goal nudge, lifecycle wake) that arrives while a turn runs or waits, as the runtime's native executor does. Delegation results are never dropped: a Hermes turn has no other copy of them. `0` makes routine wakes wait their turn as well. | `1` |
 
 What a caller sees:
 
+- A turn still running at its reply deadline: the caller gets an interim
+  reply. A person sees `[hermes is still working on this after …s; its answer
+  will appear in this chat when it is ready]`; a peer is told the answer cannot
+  be returned to its request; the runtime's own wake gets `[autonomous turn
+  still running after …s; …]`, which the idle digest never shows in chat. The
+  turn keeps running and the workspace stays busy.
+- The answer that arrives after that is a late reply. A person's goes to the
+  canvas chat through `/notify`. An idle-digest wake's goes through the
+  digest's reply forwarder, which drops `(idle)` and other housekeeping text.
+  Any other late answer (a peer's turn, a scheduler tick, delegation results,
+  a platform wake) is logged and not relayed: none of those senders shows the
+  answer to a person, and the agent reports delegation results with its own
+  tools.
 - A turn the executor gave up on returns `[hermes plugin reply timeout: …]`,
-  naming the stall window or the cap.
-- An answer that arrives after that is a late reply. It goes to the canvas
-  chat through `/notify` for a person's turn, and through the idle digest's
-  reply forwarder for an autonomous turn (which drops `(idle)` and other
-  housekeeping text). For a peer's turn it is dropped: the peer already got
-  its timeout.
+  naming the stall window or the cap. When a person was already given the
+  interim reply, that text goes to the chat instead.
+- A message refused because `HERMES_TURN_QUEUE_MAX` messages are already
+  waiting gets `{"status":"busy","retry":true}`.
 - A routine self-wake dropped while busy is answered with
-  `[autonomous wake skipped — …]`, which the idle digest never shows in chat.
+  `[autonomous wake skipped — …]`.
 
 Each tool call Hermes makes is reported to the platform as an `agent_log`
 activity row, the canvas tool chip. The `molecule_turn_activity` Hermes plugin

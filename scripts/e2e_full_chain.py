@@ -125,6 +125,7 @@ async def _stub_llm_server(port: int, observed: dict):
         reply = f"echo[{last_user}]"
         tool_call = None
         observed.setdefault("user_texts", []).append(last_user)
+        observed.setdefault("requests", []).append((time.monotonic(), last_user))
         last_user_at = max(
             (i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1
         )
@@ -284,12 +285,20 @@ class _LogTap(logging.Handler):
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
         self.lines: List[str] = []
+        self.times: List[float] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         self.lines.append(record.getMessage())
+        self.times.append(time.monotonic())
 
     def matching(self, pattern: str) -> List[str]:
         return [ln for ln in self.lines if re.search(pattern, ln)]
+
+    def first_at(self, pattern: str) -> float | None:
+        """When a line matching ``pattern`` was first logged, or None."""
+        return next(
+            (at for at, ln in zip(self.times, self.lines) if re.search(pattern, ln)), None
+        )
 
 
 async def _until(predicate, timeout: float) -> bool:
@@ -304,9 +313,11 @@ async def _until(predicate, timeout: float) -> bool:
 class _CapturingQueue:
     def __init__(self):
         self.events: List[Any] = []
+        self.at: List[float] = []
 
     async def enqueue_event(self, event: Any) -> None:
         self.events.append(event)
+        self.at.append(time.monotonic())
 
 
 def _texts(queue: "_CapturingQueue") -> List[str]:
@@ -334,6 +345,13 @@ async def _turn_supervision_scenarios(
     def sleeps(tag):
         return [s for s in observed.get("sleeps", []) if s[0] == tag]
 
+    def reached_model(fragment):
+        """When the gateway first asked the model about ``fragment``, or None."""
+        return next((at for at, text in observed.get("requests", []) if fragment in text), None)
+
+    def relayed(fragment):
+        return [n for n in observed.get("notified", []) if fragment in str(n.get("message", ""))]
+
     def idle():
         return heartbeat.active_tasks == 0 and not any_turn_in_flight()
 
@@ -341,7 +359,8 @@ async def _turn_supervision_scenarios(
     # activity file until the call returns, so only the gateway's own
     # "still working" sends can keep the turn alive. The old executor gave up
     # on every turn at 600 s whatever it was doing.
-    policy(stall_seconds=8.0, max_seconds=0.0)
+    policy(stall_seconds=8.0, max_seconds=0.0, self_reply_deadline_seconds=2.0)
+    mark = len(tap.lines)
     long_q = _CapturingQueue()
     started = time.monotonic()
     long_turn = asyncio.create_task(
@@ -354,8 +373,11 @@ async def _turn_supervision_scenarios(
                 f"in_flight={any_turn_in_flight()}")
     print("OK: busy reported while the turn runs (active_tasks=1, is_busy)")
 
-    # B. A routine self-wake that lands mid-turn is fast-acked and dropped.
-    # Production queued 32 of these behind one turn and ran them for hours.
+    # B. Self-wakes that land mid-turn. A routine one (the idle digest) is
+    # fast-acked and dropped: production queued 32 of these behind one turn and
+    # ran them for hours. Delegation results are the agent's only copy of them,
+    # so they wait their turn instead, and the harvester is answered at the
+    # self-turn deadline, before its own 120 s request gives up.
     wake_q = _CapturingQueue()
     wake_at = time.monotonic()
     await asyncio.wait_for(
@@ -369,6 +391,29 @@ async def _turn_supervision_scenarios(
         return f"a self-idle wake during a turn was not fast-acked: {_texts(wake_q)!r}"
     print(f"OK: a self-idle wake during the turn was fast-acked in {time.monotonic() - wake_at:.2f}s")
 
+    harvest_q = _CapturingQueue()
+    harvest_at = time.monotonic()
+    try:
+        await asyncio.wait_for(
+            executor.execute(
+                _ctx("Delegation results are ready: e2e-harvest", task_id="t-harvest",
+                     source_type="self-harvester"),
+                harvest_q,
+            ),
+            10,
+        )
+    except asyncio.TimeoutError:
+        return "the harvester's wake was not answered at the self-turn deadline"
+    harvest_waited = time.monotonic() - harvest_at
+    if len(_texts(harvest_q)) != 1 or not _texts(harvest_q)[0].startswith("[autonomous "):
+        return f"harvester wake answer: {_texts(harvest_q)!r}"
+    if reached_model("e2e-harvest") is not None:
+        return "the delegation results reached the model while another turn held the gateway"
+    print(
+        "OK: delegation results that arrived mid-turn were queued, and the harvester was "
+        f"answered in {harvest_waited:.1f}s (self-turn deadline 2 s)"
+    )
+
     try:
         await asyncio.wait_for(long_turn, 60)
     except asyncio.TimeoutError:
@@ -378,12 +423,13 @@ async def _turn_supervision_scenarios(
         return f"long turn answer: {_texts(long_q)!r}"
     if elapsed < 11:
         return f"the long turn finished too fast to prove anything ({elapsed:.1f}s)"
+    # The long turn is the only one this scenario's caller waited out.
     progress = [
         int(m.group(1))
-        for m in (re.search(r"\((\d+) progress sends\)", ln) for ln in tap.lines)
+        for m in (re.search(r"answered after .*\((\d+) progress sends\)", ln) for ln in tap.lines[mark:])
         if m
     ]
-    if not progress or progress[-1] < 1:
+    if not progress or progress[0] < 1:
         return f"no gateway progress sends reached the executor during a {elapsed:.0f}s turn"
     if any("e2e-wake" in text for text in observed.get("user_texts", [])):
         return "the dropped self-wake reached the model anyway"
@@ -398,89 +444,174 @@ async def _turn_supervision_scenarios(
             record = f"<unreadable: {exc}>"
         return (f"the gateway's tool call never became an activity row: chips={chips!r} "
                 f"activity file={record!r}")
-    if not await _until(idle, 5):
-        return f"busy not released after the turn: active_tasks={heartbeat.active_tasks}"
     print(
         f"OK: a single 12 s tool call outlived the 8 s stall window ({elapsed:.1f}s, "
-        f"{progress[-1]} progress sends); its tool call became an activity row; busy released"
+        f"{progress[0]} progress sends); its tool call became an activity row"
     )
 
-    # C. hermes#393: a message queued behind a running turn gets its own answer.
+    # The queued delegation results run once the long turn is answered, as a
+    # turn of their own. Their answer is the agent's business: it reports
+    # results with its own tools, so nothing is relayed to the chat.
+    if not await _until(lambda: reached_model("e2e-harvest") is not None, 30):
+        return "the queued delegation results never reached the model"
+    if reached_model("e2e-harvest") < long_q.at[0]:
+        return "the delegation results reached the model before the running turn was answered"
+    if not await _until(lambda: tap.matching(r"late reply .* source=self-harvester — not relayed"), 30):
+        return "the delegation-results turn was never answered"
+    if relayed("e2e-harvest"):
+        return "a delegation-results answer was relayed to the user's chat"
+    if not await _until(idle, 5):
+        return f"busy not released after the turns: active_tasks={heartbeat.active_tasks}"
+    print("OK: the queued delegation results then ran as their own turn; busy released")
+
+    # C. hermes#393. A message sent while a turn ran used to wait in hermes' own
+    # queue, run inside that turn, and come back under the running turn's id.
+    # Now it waits here, reaches the gateway once the running turn is answered,
+    # and gets its own answer. A command sent mid-turn still goes straight
+    # through, and hermes answers it under its own id.
     policy(stall_seconds=30.0, max_seconds=0.0)
-    x_q, y_q = _CapturingQueue(), _CapturingQueue()
+    x_q, y_q, status_q = _CapturingQueue(), _CapturingQueue(), _CapturingQueue()
     x = asyncio.create_task(executor.execute(_ctx("[e2e:sleep:4:1] X", task_id="t-x"), x_q))
     if not await _until(lambda: sleeps("X"), 30):
         return "X's tool call never started"
     y = asyncio.create_task(executor.execute(_ctx("reply with Y-OK", task_id="t-y"), y_q))
+    status_at = time.monotonic()
+    try:
+        await asyncio.wait_for(executor.execute(_ctx("/status", task_id="t-status"), status_q), 10)
+    except asyncio.TimeoutError:
+        return "/status sent mid-turn was not answered while the turn ran"
+    status_in = time.monotonic() - status_at
+    status_text = (_texts(status_q) or [""])[0]
+    if x.done() or not status_text.strip() or "hermes plugin" in status_text:
+        return f"/status mid-turn: answer={_texts(status_q)!r} X done={x.done()}"
     try:
         await asyncio.wait_for(asyncio.gather(x, y), 60)
     except asyncio.TimeoutError:
         return f"X/Y did not both finish: X={_texts(x_q)!r} Y={_texts(y_q)!r}"
     if _texts(x_q) != ["slept:X"] or _texts(y_q) != ["echo[reply with Y-OK]"]:
         return f"queued message answers misrouted: X={_texts(x_q)!r} Y={_texts(y_q)!r}"
+    y_reached = reached_model("reply with Y-OK")
+    if y_reached is None or y_reached < x_q.at[0]:
+        return "Y reached the model before X was answered"
+    if not await _until(idle, 5):
+        return "busy not released after X and Y"
     print(
-        "OK: a message queued behind a running turn got its own answer "
-        f"({len(tap.matching('re-correlated'))} misanchored send(s) re-correlated)"
+        "OK: a message sent mid-turn waited for the running turn, then got its own answer; "
+        f"/status sent mid-turn was answered in {status_in:.1f}s ({status_text[:40]!r}…)"
     )
 
-    # D. The turn cap ends a real run: /stop, no more tool calls, the gateway
-    # free for the next message at once.
+    # D. The cap ends a real run, and the message waiting behind it still gets
+    # a run of its own: /stop goes out, the run makes no more tool calls, and the
+    # waiting message reaches the gateway once /stop is answered.
     policy(stall_seconds=30.0, max_seconds=4.0)
-    cap_q = _CapturingQueue()
+    cap_q, after_q = _CapturingQueue(), _CapturingQueue()
+    capped = asyncio.create_task(
+        executor.execute(_ctx("[e2e:sleep:3:10] capped", task_id="t-cap"), cap_q)
+    )
+    if not await _until(lambda: sleeps("capped"), 30):
+        return "the capped turn never started"
+    after = asyncio.create_task(executor.execute(_ctx("after cap", task_id="t-after"), after_q))
     try:
-        await asyncio.wait_for(
-            executor.execute(_ctx("[e2e:sleep:3:10] capped", task_id="t-cap"), cap_q), 30
-        )
+        await asyncio.wait_for(capped, 30)
     except asyncio.TimeoutError:
         return "the turn cap did not end a 30 s turn"
     if len(_texts(cap_q)) != 1 or "turn cap" not in _texts(cap_q)[0]:
         return f"capped turn answer: {_texts(cap_q)!r}"
-    if not await _until(lambda: tap.matching(r"/stop on .* answered"), 20):
+    stop_answered = tap.first_at(r"/stop on .* answered")
+    if stop_answered is None:
         return "the gateway never answered /stop"
     calls_at_stop = len(sleeps("capped"))
+    try:
+        await asyncio.wait_for(after, 20)
+    except asyncio.TimeoutError:
+        return "the message waiting behind the capped turn was never answered"
+    if _texts(after_q) != ["echo[after cap]"]:
+        return f"message waiting behind the cap: {_texts(after_q)!r}"
+    after_reached = reached_model("after cap")
+    if after_reached is None or after_reached < stop_answered:
+        return "the waiting message reached the gateway before /stop was answered"
     await asyncio.sleep(8)
     if len(sleeps("capped")) > calls_at_stop + 1:  # the call in flight may still complete
         return f"the capped run kept calling tools after /stop: {sleeps('capped')!r}"
-    policy(stall_seconds=30.0, max_seconds=0.0)
-    after_q = _CapturingQueue()
-    after_at = time.monotonic()
-    try:
-        await asyncio.wait_for(executor.execute(_ctx("after cap", task_id="t-after"), after_q), 20)
-    except asyncio.TimeoutError:
-        return "the gateway was still busy after /stop"
-    if _texts(after_q) != ["echo[after cap]"]:
-        return f"message after the cap: {_texts(after_q)!r}"
+    if relayed("slept:capped"):
+        return "the stopped run still delivered an answer"
     if not await _until(idle, 5):
         return "busy not released after the capped turn"
     print(
-        "OK: the turn cap sent /stop, the run made no further tool calls, and the next "
-        f"message was answered in {time.monotonic() - after_at:.1f}s"
+        "OK: the turn cap sent /stop, the run made no further tool calls, and the message "
+        "waiting behind it got its own answer once /stop was answered"
     )
 
-    # E. A gateway that dies mid-turn: the turn is abandoned one stall window later.
+    # F. A turn that outlasts its caller. The platform gives up on an A2A
+    # request at 30 minutes and delivers it again, so the caller is answered
+    # first; the turn runs on, the workspace stays busy, and the answer is
+    # relayed to the chat when it comes.
+    policy(stall_seconds=30.0, max_seconds=0.0, reply_deadline_seconds=3.0)
+    slow_q = _CapturingQueue()
+    slow_at = time.monotonic()
+    try:
+        await asyncio.wait_for(
+            executor.execute(_ctx("[e2e:sleep:3:2] slow", task_id="t-slow"), slow_q), 15
+        )
+    except asyncio.TimeoutError:
+        return "the caller was not answered at the reply deadline"
+    answered_in = time.monotonic() - slow_at
+    if len(_texts(slow_q)) != 1 or "still working on this" not in _texts(slow_q)[0]:
+        return f"reply-deadline answer: {_texts(slow_q)!r}"
+    if answered_in > 6:
+        return f"the caller waited {answered_in:.1f}s past a 3 s reply deadline"
+    if heartbeat.active_tasks != 1 or not any_turn_in_flight():
+        return "busy was released when the caller was answered, before the turn ended"
+    if not await _until(lambda: relayed("slept:slow"), 30):
+        return f"the turn's late answer never reached the chat: notified={observed.get('notified')!r}"
+    if not await _until(idle, 5):
+        return "busy not released after the late answer"
+    print(
+        f"OK: the caller was answered at the 3 s reply deadline ({answered_in:.1f}s); the "
+        "turn ran on as busy and its answer was relayed to the chat"
+    )
+
+    # E. A gateway that dies mid-turn: the turn is abandoned one stall window
+    # later, and the message waiting behind it fails at once rather than
+    # waiting out a stall window of its own.
     policy(stall_seconds=4.0, max_seconds=0.0)
-    doomed_q = _CapturingQueue()
+    doomed_q, behind_q = _CapturingQueue(), _CapturingQueue()
     doomed = asyncio.create_task(
         executor.execute(_ctx("[e2e:sleep:30:1] doomed", task_id="t-doomed"), doomed_q)
     )
     if not await _until(lambda: sleeps("doomed"), 30):
         return "the doomed turn never started"
+    behind = asyncio.create_task(
+        executor.execute(_ctx("behind doomed", task_id="t-behind"), behind_q)
+    )
+    await asyncio.sleep(0.5)
+    if behind.done() or reached_model("behind doomed") is not None:
+        return f"the second message did not wait behind the running turn: {_texts(behind_q)!r}"
     proc.kill()
     proc.wait(timeout=10)
     killed_at = time.monotonic()
     try:
-        await asyncio.wait_for(doomed, 30)
+        await asyncio.wait_for(asyncio.gather(doomed, behind), 30)
     except asyncio.TimeoutError:
-        return "a turn on a dead gateway was never abandoned"
-    waited = time.monotonic() - killed_at
+        return (f"turns on a dead gateway were not settled: doomed={_texts(doomed_q)!r} "
+                f"behind={_texts(behind_q)!r}")
+    waited = doomed_q.at[0] - killed_at
     if len(_texts(doomed_q)) != 1 or "no activity from the hermes gateway" not in _texts(doomed_q)[0]:
         return f"dead-gateway turn answer: {_texts(doomed_q)!r}"
+    if len(_texts(behind_q)) != 1 or "POST error" not in _texts(behind_q)[0]:
+        return f"the message behind the dead turn: {_texts(behind_q)!r}"
+    behind_after = behind_q.at[0] - doomed_q.at[0]
+    if behind_after > 2:
+        return f"the message behind the dead turn waited {behind_after:.1f}s more"
     if not await _until(idle, 5):
-        return "busy not released after the dead-gateway turn"
-    print(f"OK: a turn on a killed gateway was abandoned {waited:.1f}s after the kill (stall window 4 s)")
-    late = observed.get("notified", [])
-    if late:
-        print(f"     late replies relayed to /notify during the run: {[n.get('message', '')[:60] for n in late]!r}")
+        return "busy not released after the dead-gateway turns"
+    print(
+        f"OK: a turn on a killed gateway was abandoned {waited:.1f}s after the kill (stall "
+        f"window 4 s); the message behind it failed {behind_after:.1f}s later"
+    )
+    if observed.get("notified"):
+        print("     relayed to /notify during the run: "
+              f"{[n.get('message', '')[:60] for n in observed['notified']]!r}")
     return None
 
 
@@ -767,8 +898,10 @@ async def _amain() -> int:
     print("  → executor reply server → execute() emits on event_queue")
     print("  + hermes tool call → molecule_turn_activity → runtime turn lease")
     print("  + turn supervision: busy for the whole turn, a 12 s tool call past an 8 s")
-    print("    stall window, self-wakes dropped mid-turn, queued replies routed (#393),")
-    print("    the cap's /stop ending a real run, a killed gateway abandoned")
+    print("    stall window, routine self-wakes dropped and delegation results queued,")
+    print("    one message at a time per chat (#393) with commands answered mid-turn,")
+    print("    the cap's /stop ending a real run, the reply deadline with a late relay,")
+    print("    a killed gateway abandoned without stranding the message behind it")
     return 0
 
 

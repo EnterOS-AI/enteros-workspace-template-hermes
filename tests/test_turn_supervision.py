@@ -87,13 +87,15 @@ class _Queue:
 class FakeGateway:
     """Stands in for the hermes plugin: records /a2a/inbound and lets a test
     send back to the executor's callback the way the plugin's send() does.
-    Answers /stop like hermes does unless told otherwise."""
+    Answers /stop like hermes does unless told otherwise; refuses (HTTP 500)
+    any content listed in ``refuse``."""
 
     def __init__(self, *, answer_stop: bool = True) -> None:
         self.port = _free_port()
         self.inbound: List[Dict[str, Any]] = []
         self.callback_url: Optional[str] = None
         self.answer_stop = answer_stop
+        self.refuse: set = set()
         self._runner: Optional[web.AppRunner] = None
         self._tasks: List[asyncio.Task] = []
 
@@ -112,6 +114,8 @@ class FakeGateway:
 
     async def _handle(self, request: web.Request) -> web.Response:
         body = await request.json()
+        if body["content"] in self.refuse:
+            return web.json_response({"ok": False}, status=500)
         self.inbound.append(body)
         self.callback_url = body["callback_url"]
         if body["content"] == "/stop" and self.answer_stop:
@@ -133,6 +137,9 @@ class FakeGateway:
         async with ClientSession(timeout=ClientTimeout(total=5)) as s:
             async with s.post(self.callback_url, json=body) as r:
                 return r.status, await r.json()
+
+    async def answer(self, content: str, reply: str):
+        return await self.send(reply, reply_to=self.message_id(content))
 
 
 class FakePlatform:
@@ -175,10 +182,11 @@ def _clean_runtime_state(monkeypatch):
 
     for name in (
         "PLATFORM_URL", "MOLECULE_WORKSPACE_ID", "MOLECULE_TOOL_ACTIVITY_FILE",
-        "HERMES_SESSION_RESET_MODE", "HERMES_REPLY_RECORRELATE",
-        "HERMES_DROP_SELF_PINGS_WHEN_BUSY", "MOLECULE_TURN_LEASE_TTL_SECONDS",
-        "A2A_COMPLETION_IDLE_TIMEOUT_SECONDS", "MOLECULE_MAX_TURN_SECONDS",
-        "HERMES_TURN_STALL_SECONDS", "HERMES_TURN_MAX_SECONDS",
+        "HERMES_SESSION_RESET_MODE", "HERMES_DROP_SELF_PINGS_WHEN_BUSY",
+        "MOLECULE_TURN_LEASE_TTL_SECONDS", "A2A_COMPLETION_IDLE_TIMEOUT_SECONDS",
+        "MOLECULE_MAX_TURN_SECONDS", "HERMES_TURN_STALL_SECONDS",
+        "HERMES_TURN_MAX_SECONDS", "HERMES_TURN_REPLY_DEADLINE_SECONDS",
+        "HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS", "HERMES_TURN_QUEUE_MAX",
     ):
         monkeypatch.delenv(name, raising=False)
     get_inbox().reset_for_tests()
@@ -207,9 +215,14 @@ def _executor(monkeypatch, gateway: FakeGateway, *, heartbeat=None, **env: str):
     )
 
 
-async def _dispatched(gateway: FakeGateway, content: str) -> str:
-    assert await _until(lambda: content in gateway.contents()), gateway.contents()
+async def _dispatched(gateway: FakeGateway, content: str, timeout: float = 5.0) -> str:
+    assert await _until(lambda: content in gateway.contents(), timeout), gateway.contents()
     return gateway.message_id(content)
+
+
+async def _not_dispatched(gateway: FakeGateway, content: str, wait: float = 0.3) -> None:
+    await asyncio.sleep(wait)
+    assert content not in gateway.contents(), gateway.contents()
 
 
 # --- policy -----------------------------------------------------------------------
@@ -219,28 +232,38 @@ def test_policy_defaults_follow_the_runtime_turn_lease(monkeypatch):
     monkeypatch.setenv("MOLECULE_TURN_LEASE_TTL_SECONDS", "120")
     policy = executor_mod.TurnSupervisionPolicy.from_env()
     assert (policy.stall_seconds, policy.max_seconds) == (120.0, 480.0)
+    # Under the platform's 30-minute A2A ceiling, and under the runtime's
+    # shortest self-wake timeout (the delegation harvester's 120 s).
+    assert policy.reply_deadline_seconds == 1500.0 < 1800
+    assert policy.self_reply_deadline_seconds == 60.0 < 120
+    assert policy.queue_max == 32
 
     monkeypatch.setenv("MOLECULE_MAX_TURN_SECONDS", "999")
     assert executor_mod.TurnSupervisionPolicy.from_env().max_seconds == 999.0
 
     monkeypatch.setenv("HERMES_TURN_STALL_SECONDS", "45")
     monkeypatch.setenv("HERMES_TURN_MAX_SECONDS", "0")
+    monkeypatch.setenv("HERMES_TURN_REPLY_DEADLINE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_TURN_QUEUE_MAX", "4")
     policy = executor_mod.TurnSupervisionPolicy.from_env()
     assert (policy.stall_seconds, policy.max_seconds) == (45.0, 0.0)
+    assert (policy.reply_deadline_seconds, policy.queue_max) == (0.0, 4)
 
 
 def test_bad_knob_values_fall_back_to_defaults(monkeypatch, caplog):
     monkeypatch.setenv("HERMES_TURN_STALL_SECONDS", "soon")
     monkeypatch.setenv("HERMES_TURN_POLL_SECONDS", "0")
     monkeypatch.setenv("HERMES_TURN_MAX_SECONDS", "-5")
+    monkeypatch.setenv("HERMES_TURN_QUEUE_MAX", "0")
     with caplog.at_level("WARNING"):
         policy = executor_mod.TurnSupervisionPolicy.from_env()
     assert policy.stall_seconds == 900.0
     assert policy.poll_seconds == 1.0
     assert policy.max_seconds == 3600.0
-    warned = caplog.text
-    for name in ("HERMES_TURN_STALL_SECONDS", "HERMES_TURN_POLL_SECONDS", "HERMES_TURN_MAX_SECONDS"):
-        assert name in warned
+    assert policy.queue_max == 32
+    for name in ("HERMES_TURN_STALL_SECONDS", "HERMES_TURN_POLL_SECONDS",
+                 "HERMES_TURN_MAX_SECONDS", "HERMES_TURN_QUEUE_MAX"):
+        assert name in caplog.text
 
 
 def test_fallback_routine_self_set_matches_the_runtime():
@@ -248,6 +271,19 @@ def test_fallback_routine_self_set_matches_the_runtime():
     from molecule_runtime.a2a_executor import _ROUTINE_SELF_SOURCE_TYPES
 
     assert executor_mod._ROUTINE_SELF_SOURCE_TYPES_FALLBACK == frozenset(_ROUTINE_SELF_SOURCE_TYPES)
+
+
+def test_delegation_result_wakes_are_never_droppable():
+    """The runtime drops them mid-turn because a native turn reads
+    DELEGATION_RESULTS_FILE. Hermes does not, so the wake is the only copy."""
+    for source_type in ("self-harvester", "self-delegation-result"):
+        assert not executor_mod._is_droppable_self_ping(_ctx("results", source_type=source_type), "results")
+    untyped = "Delegation results are ready. Review them and take appropriate action:"
+    assert not executor_mod._is_droppable_self_ping(_ctx(untyped), untyped)
+    for source_type in ("self-idle", "self-scheduler", "self-cron", "self-goal-nudge", "self-lifecycle"):
+        assert executor_mod._is_droppable_self_ping(_ctx("tick", source_type=source_type), "tick")
+    for source_type in (None, "self-restart-context", "self-stall", "self-nudge"):
+        assert not executor_mod._is_droppable_self_ping(_ctx("hello", source_type=source_type), "hello")
 
 
 def test_scheduled_marker_is_read_from_request_level_metadata():
@@ -343,7 +379,7 @@ async def test_a_silent_gateway_is_abandoned_after_the_stall_window(monkeypatch)
         assert len(queue.texts()) == 1
         assert "reply timeout" in queue.texts()[0]
         assert "no activity from the hermes gateway for 0.3s" in queue.texts()[0]
-        assert await _until(lambda: "/stop" in gateway.contents())
+        assert "/stop" in gateway.contents()
         assert ex._turns == {}
         assert await _until(lambda: hb.active_tasks == 0)
     finally:
@@ -352,7 +388,10 @@ async def test_a_silent_gateway_is_abandoned_after_the_stall_window(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_the_turn_cap_stops_the_run_and_answers_everything_queued(monkeypatch):
+async def test_the_cap_stops_only_the_running_turn_and_the_queue_moves_on(monkeypatch):
+    """hermes' /stop leaves queued plugin messages parked to run next, so only
+    the running turn is answered with the cap; the one waiting behind it gets
+    its own run, and its own answer."""
     gateway = FakeGateway()
     await gateway.start()
     ex = _executor(monkeypatch, gateway, HERMES_TURN_MAX_SECONDS="0.5")
@@ -362,16 +401,20 @@ async def test_the_turn_cap_stops_the_run_and_answers_everything_queued(monkeypa
         running = asyncio.create_task(ex.execute(_ctx("endless"), first))
         await _dispatched(gateway, "endless")
         queued = asyncio.create_task(ex.execute(_ctx("behind it"), second))
-        await _dispatched(gateway, "behind it")
+        await _not_dispatched(gateway, "behind it", 0.1)
         # Busy and alive the whole time: only the cap can end this.
-        while not (running.done() and queued.done()):
+        while not running.done():
             await gateway.send("⏳ still going")
             await asyncio.sleep(0.05)
-        for queue in (first, second):
-            assert len(queue.texts()) == 1
-            assert "turn cap" in queue.texts()[0], queue.texts()
-        assert await _until(lambda: "/stop" in gateway.contents())
-        await asyncio.sleep(0.2)
+        assert len(first.texts()) == 1 and "turn cap" in first.texts()[0], first.texts()
+        assert gateway.contents().count("/stop") == 1
+        # /stop was answered before the next message went out.
+        assert gateway.contents().index("/stop") < gateway.contents().index("behind it") \
+            if "behind it" in gateway.contents() else True
+        await _dispatched(gateway, "behind it")
+        await gateway.answer("behind it", "its own answer")
+        await asyncio.wait_for(queued, 5)
+        assert second.texts() == ["its own answer"]
         assert gateway.contents().count("/stop") == 1
         assert ex._turns == {}
     finally:
@@ -379,7 +422,124 @@ async def test_the_turn_cap_stops_the_run_and_answers_everything_queued(monkeypa
         await gateway.close()
 
 
-# --- busy is reported for as long as the turn runs -------------------------------
+# --- one message at a time per chat ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_never_gets_a_second_message_while_one_runs(monkeypatch):
+    """hermes#393: a message hermes queues behind a run is answered under the
+    id of the message that opened the run. The executor never lets that
+    happen: the next message goes out once the previous one is answered."""
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        queues = [_Queue() for _ in range(3)]
+        tasks = []
+        for name, queue in zip(("X", "Y", "Z"), queues):
+            tasks.append(asyncio.create_task(ex.execute(_ctx(name), queue)))
+            await asyncio.sleep(0.02)
+        await _dispatched(gateway, "X")
+        await _not_dispatched(gateway, "Y")
+        await gateway.answer("X", "X-DONE")
+        await _dispatched(gateway, "Y")
+        await _not_dispatched(gateway, "Z", 0.1)
+        await gateway.answer("Y", "Y-OK")
+        await _dispatched(gateway, "Z")
+        await gateway.answer("Z", "Z-OK")
+        await asyncio.wait_for(asyncio.gather(*tasks), 5)
+        assert [q.texts() for q in queues] == [["X-DONE"], ["Y-OK"], ["Z-OK"]]
+        assert gateway.contents() == ["X", "Y", "Z"]
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_second_send_for_an_answered_message_goes_to_its_own_origin(monkeypatch):
+    """Nothing is ever re-routed to a waiting caller: a send anchored to an
+    already-answered message is that message's late reply."""
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        x_queue, y_queue = _Queue(), _Queue()
+        x = asyncio.create_task(ex.execute(_ctx("X"), x_queue))
+        x_id = await _dispatched(gateway, "X")
+        y = asyncio.create_task(ex.execute(_ctx("Y"), y_queue))
+        await gateway.send("X-DONE", reply_to=x_id)
+        await asyncio.wait_for(x, 5)
+        y_id = await _dispatched(gateway, "Y")
+        status, body = await gateway.send("more about X", reply_to=x_id)
+        assert (status, body) == (200, {"ok": True, "stale": True, "relayed": True})
+        assert platform.notified == [{"message": "more about X"}]
+        assert not y.done()
+        await gateway.send("Y-OK", reply_to=y_id)
+        await asyncio.wait_for(y, 5)
+        assert y_queue.texts() == ["Y-OK"]
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_post_frees_the_chat_for_the_next_message(monkeypatch):
+    gateway = FakeGateway()
+    gateway.refuse.add("refused")
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        first, second, third = _Queue(), _Queue(), _Queue()
+        a = asyncio.create_task(ex.execute(_ctx("A"), first))
+        await _dispatched(gateway, "A")
+        b = asyncio.create_task(ex.execute(_ctx("refused"), second))
+        c = asyncio.create_task(ex.execute(_ctx("C"), third))
+        await asyncio.sleep(0.05)
+        await gateway.answer("A", "A-OK")
+        await asyncio.wait_for(b, 5)
+        assert "hermes plugin POST error" in second.texts()[0]
+        await _dispatched(gateway, "C")
+        await gateway.answer("C", "C-OK")
+        await asyncio.wait_for(asyncio.gather(a, c), 5)
+        assert third.texts() == ["C-OK"]
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_full_queue_answers_with_backpressure(monkeypatch):
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_TURN_QUEUE_MAX="2")
+    await ex.start()
+    try:
+        tasks = [asyncio.create_task(ex.execute(_ctx("running"), _Queue()))]
+        await _dispatched(gateway, "running")
+        for name in ("w1", "w2"):
+            tasks.append(asyncio.create_task(ex.execute(_ctx(name), _Queue())))
+        await asyncio.sleep(0.05)
+        refused = _Queue()
+        await asyncio.wait_for(ex.execute(_ctx("one too many"), refused), 2)
+        assert refused.texts() == [executor_mod._QUEUE_FULL_REPLY]
+        for name in ("running", "w1", "w2"):
+            await _dispatched(gateway, name)
+            await gateway.answer(name, "ok")
+        await asyncio.wait_for(asyncio.gather(*tasks), 5)
+        assert "one too many" not in gateway.contents()
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+# --- busy is reported for as long as a turn runs or waits ---------------------
 
 
 @pytest.mark.asyncio
@@ -409,23 +569,22 @@ async def test_the_workspace_reports_busy_for_the_whole_turn(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_queued_message_holds_its_own_busy_slot(monkeypatch):
+async def test_a_waiting_message_holds_its_own_busy_slot(monkeypatch):
     hb = SimpleNamespace(active_tasks=0, current_task="")
     gateway = FakeGateway()
     await gateway.start()
     ex = _executor(monkeypatch, gateway, heartbeat=hb)
     await ex.start()
     try:
-        a, b = _Queue(), _Queue()
-        first = asyncio.create_task(ex.execute(_ctx("first"), a))
-        first_id = await _dispatched(gateway, "first")
-        second = asyncio.create_task(ex.execute(_ctx("second"), b))
-        second_id = await _dispatched(gateway, "second")
+        first = asyncio.create_task(ex.execute(_ctx("first"), _Queue()))
+        await _dispatched(gateway, "first")
+        second = asyncio.create_task(ex.execute(_ctx("second"), _Queue()))
         assert await _until(lambda: hb.active_tasks == 2)
-        await gateway.send("first done", reply_to=first_id)
+        await gateway.answer("first", "first done")
         await asyncio.wait_for(first, 5)
         assert await _until(lambda: hb.active_tasks == 1)
-        await gateway.send("second done", reply_to=second_id)
+        await _dispatched(gateway, "second")
+        await gateway.answer("second", "second done")
         await asyncio.wait_for(second, 5)
         assert await _until(lambda: hb.active_tasks == 0)
     finally:
@@ -433,7 +592,29 @@ async def test_a_queued_message_holds_its_own_busy_slot(monkeypatch):
         await gateway.close()
 
 
-# --- autonomous wakes during a turn ------------------------------------------------
+@pytest.mark.asyncio
+async def test_stop_gives_back_busy_slots_and_fails_waiters(monkeypatch):
+    hb = SimpleNamespace(active_tasks=0, current_task="")
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, heartbeat=hb)
+    await ex.start()
+    queue = _Queue()
+    running = asyncio.create_task(ex.execute(_ctx("never answered"), queue))
+    await _dispatched(gateway, "never answered")
+    waiting = asyncio.create_task(ex.execute(_ctx("never sent"), _Queue()))
+    assert await _until(lambda: hb.active_tasks == 2)
+    try:
+        await ex.stop()
+        await asyncio.wait_for(asyncio.gather(running, waiting), 5)
+        assert "executor shutting down" in queue.texts()[0]
+        assert hb.active_tasks == 0
+        assert "never sent" not in gateway.contents()
+    finally:
+        await gateway.close()
+
+
+# --- autonomous wakes and inline commands during a turn --------------------------
 
 
 @pytest.mark.asyncio
@@ -446,7 +627,7 @@ async def test_a_routine_self_wake_is_dropped_while_a_turn_runs(monkeypatch):
         queue = _Queue()
         running = asyncio.create_task(ex.execute(_ctx("real work"), queue))
         mid = await _dispatched(gateway, "real work")
-        for source_type in ("self-idle", "self-scheduler", "self-cron", "self-harvester"):
+        for source_type in ("self-idle", "self-scheduler", "self-cron"):
             wake = _Queue()
             await asyncio.wait_for(
                 ex.execute(_ctx(f"<SYSTEM IDLE PROMPT> {source_type}", source_type=source_type), wake),
@@ -473,27 +654,63 @@ async def test_a_routine_self_wake_is_dropped_while_a_turn_runs(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_people_peers_and_platform_wakes_still_reach_a_busy_gateway(monkeypatch):
+async def test_a_delegation_results_wake_queues_and_is_acked_in_time(monkeypatch):
+    """The harvester gives up on its POST after 120 s and resends the results
+    if it does; answering it at the self-wake deadline commits them once."""
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS="0.3")
+    await ex.start()
+    try:
+        running = asyncio.create_task(ex.execute(_ctx("busy"), _Queue()))
+        await _dispatched(gateway, "busy")
+        ack = _Queue()
+        started = time.monotonic()
+        await asyncio.wait_for(
+            ex.execute(_ctx("Delegation results are ready: ...", source_type="self-harvester"), ack),
+            2,
+        )
+        assert 0.3 <= time.monotonic() - started < 2
+        assert ack.texts()[0].startswith("[autonomous turn still running")
+        await _not_dispatched(gateway, "Delegation results are ready: ...", 0.1)
+        await gateway.answer("busy", "done")
+        await asyncio.wait_for(running, 5)
+        # It kept its place and runs next.
+        await _dispatched(gateway, "Delegation results are ready: ...")
+        status, body = await gateway.answer("Delegation results are ready: ...", "Reviewed.")
+        assert (status, body) == (200, {"ok": True, "stale": True})  # not shown to anyone
+        assert await _until(lambda: ex._turns == {})
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_people_peers_and_platform_wakes_wait_their_turn(monkeypatch):
     gateway = FakeGateway()
     await gateway.start()
     ex = _executor(monkeypatch, gateway)
     await ex.start()
     try:
-        tasks = [asyncio.create_task(ex.execute(_ctx("running"), _Queue()))]
-        await _dispatched(gateway, "running")
-        tasks.append(asyncio.create_task(ex.execute(_ctx("a person"), _Queue())))
-        tasks.append(asyncio.create_task(ex.execute(_ctx("a peer", peer_id="ws-peer"), _Queue())))
-        tasks.append(asyncio.create_task(
-            ex.execute(_ctx("restart context", source_type="self-restart-context"), _Queue())
-        ))
-        tasks.append(asyncio.create_task(
-            ex.execute(_ctx("liveness check", source_type="self-stall"), _Queue())
-        ))
-        for content in ("a person", "a peer", "restart context", "liveness check"):
-            await _dispatched(gateway, content)
-        for content in ("running", "a person", "a peer", "restart context", "liveness check"):
-            await gateway.send(f"re: {content}", reply_to=gateway.message_id(content))
+        names = ["running", "a person", "a peer", "restart context", "liveness check"]
+        contexts = [
+            _ctx("running"),
+            _ctx("a person"),
+            _ctx("a peer", peer_id="ws-peer"),
+            _ctx("restart context", source_type="self-restart-context"),
+            _ctx("liveness check", source_type="self-stall"),
+        ]
+        queues = [_Queue() for _ in names]
+        tasks = []
+        for ctx, queue in zip(contexts, queues):
+            tasks.append(asyncio.create_task(ex.execute(ctx, queue)))
+            await asyncio.sleep(0.02)
+        for name in names:
+            await _dispatched(gateway, name)
+            await gateway.answer(name, f"re: {name}")
         await asyncio.wait_for(asyncio.gather(*tasks), 5)
+        assert [q.texts() for q in queues] == [[f"re: {n}"] for n in names]
+        assert gateway.contents() == names
     finally:
         await ex.stop()
         await gateway.close()
@@ -509,115 +726,139 @@ async def test_dropping_self_wakes_can_be_switched_off(monkeypatch):
         running = asyncio.create_task(ex.execute(_ctx("busy"), _Queue()))
         await _dispatched(gateway, "busy")
         wake = asyncio.create_task(ex.execute(_ctx("tick", source_type="self-idle"), _Queue()))
+        await _not_dispatched(gateway, "tick", 0.1)
+        await gateway.answer("busy", "ok")
         await _dispatched(gateway, "tick")
-        for content in ("busy", "tick"):
-            await gateway.send("ok", reply_to=gateway.message_id(content))
+        await gateway.answer("tick", "ok")
         await asyncio.wait_for(asyncio.gather(running, wake), 5)
     finally:
         await ex.stop()
         await gateway.close()
 
 
-# --- replies hermes anchors to the wrong message (hermes#393) ---------------------
-
-
 @pytest.mark.asyncio
-async def test_a_misanchored_final_reaches_the_queued_caller(monkeypatch):
-    gateway = FakeGateway()
+async def test_a_persons_inline_command_skips_the_queue_and_stop_ends_the_turn(monkeypatch):
+    gateway = FakeGateway(answer_stop=False)
     await gateway.start()
     ex = _executor(monkeypatch, gateway)
     await ex.start()
     try:
-        x_queue, y_queue = _Queue(), _Queue()
-        x = asyncio.create_task(ex.execute(_ctx("X"), x_queue))
-        x_id = await _dispatched(gateway, "X")
-        y = asyncio.create_task(ex.execute(_ctx("Y"), y_queue))
-        y_id = await _dispatched(gateway, "Y")
+        running_queue, waiting_queue = _Queue(), _Queue()
+        running = asyncio.create_task(ex.execute(_ctx("long task"), running_queue))
+        await _dispatched(gateway, "long task")
+        waiting = asyncio.create_task(ex.execute(_ctx("after it"), waiting_queue))
 
-        assert await gateway.send("X-DONE", reply_to=x_id) == (200, {"ok": True})
-        # The gateway drains Y inside X's run and anchors Y's answer to X.
-        status, body = await gateway.send("Y-OK", reply_to=x_id)
-        assert (status, body) == (200, {"ok": True, "recorrelated": y_id})
-        # A redelivery of that same send is a duplicate, not a second answer.
-        assert await gateway.send("Y-OK", reply_to=x_id) == (200, {"ok": True, "stale": True})
+        status = _Queue()
+        checking = asyncio.create_task(ex.execute(_ctx("/status"), status))
+        await _dispatched(gateway, "/status")
+        await gateway.answer("/status", "Running: long task")
+        await asyncio.wait_for(checking, 5)
+        assert status.texts() == ["Running: long task"]
+        assert not running.done()
 
-        await asyncio.wait_for(asyncio.gather(x, y), 5)
-        assert x_queue.texts() == ["X-DONE"]
-        assert y_queue.texts() == ["Y-OK"]
+        stopping = asyncio.create_task(ex.execute(_ctx("/stop"), _Queue()))
+        await _dispatched(gateway, "/stop")
+        await gateway.answer("/stop", "⚡ Stopped.")
+        await asyncio.wait_for(asyncio.gather(stopping, running), 5)
+        assert running_queue.texts() == ["[the turn was interrupted by /stop]"]
+        await _dispatched(gateway, "after it")
+        await gateway.answer("after it", "next one")
+        await asyncio.wait_for(waiting, 5)
+        assert waiting_queue.texts() == ["next one"]
     finally:
         await ex.stop()
         await gateway.close()
 
 
+# --- the reply deadline -------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_recorrelation_can_be_switched_off(monkeypatch):
+async def test_a_person_gets_an_interim_reply_at_the_deadline_and_the_answer_later(monkeypatch):
+    platform = FakePlatform()
+    await platform.start()
     gateway = FakeGateway()
     await gateway.start()
-    ex = _executor(
-        monkeypatch, gateway, HERMES_REPLY_RECORRELATE="0", HERMES_TURN_STALL_SECONDS="0.4"
-    )
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    hb = SimpleNamespace(active_tasks=0, current_task="")
+    ex = _executor(monkeypatch, gateway, heartbeat=hb, HERMES_TURN_REPLY_DEADLINE_SECONDS="0.3")
     await ex.start()
     try:
-        y_queue = _Queue()
-        x = asyncio.create_task(ex.execute(_ctx("X"), _Queue()))
-        x_id = await _dispatched(gateway, "X")
-        y = asyncio.create_task(ex.execute(_ctx("Y"), y_queue))
-        await _dispatched(gateway, "Y")
-        await gateway.send("X-DONE", reply_to=x_id)
-        status, body = await gateway.send("Y-OK", reply_to=x_id)
-        assert body.get("recorrelated") is None
-        await asyncio.wait_for(asyncio.gather(x, y), 5)
-        assert "reply timeout" in y_queue.texts()[0]
+        queue = _Queue()
+        await asyncio.wait_for(ex.execute(_ctx("big job"), queue), 3)
+        assert queue.texts()[0].startswith("[hermes is still working on this after 0.3s")
+        mid = gateway.message_id("big job")
+        assert ex._turns[mid].detached
+        assert hb.active_tasks == 1, "the turn is still running"
+        status, body = await gateway.send("the big answer", reply_to=mid)
+        assert (status, body) == (200, {"ok": True, "stale": True, "relayed": True})
+        assert platform.notified == [{"message": "the big answer"}]
+        assert await _until(lambda: ex._turns == {} and hb.active_tasks == 0)
     finally:
         await ex.stop()
         await gateway.close()
+        await platform.close()
 
 
 @pytest.mark.asyncio
-async def test_an_older_message_is_released_once_a_newer_one_is_answered(monkeypatch):
+async def test_a_peer_gets_an_interim_reply_and_the_late_answer_stays_off_the_canvas(monkeypatch):
+    platform = FakePlatform()
+    await platform.start()
     gateway = FakeGateway()
     await gateway.start()
-    ex = _executor(monkeypatch, gateway)
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(monkeypatch, gateway, HERMES_TURN_REPLY_DEADLINE_SECONDS="0.3")
     await ex.start()
     try:
-        x_queue, y_queue = _Queue(), _Queue()
-        x = asyncio.create_task(ex.execute(_ctx("lost"), x_queue))
-        await _dispatched(gateway, "lost")
-        y = asyncio.create_task(ex.execute(_ctx("answered"), y_queue))
-        y_id = await _dispatched(gateway, "answered")
-        await gateway.send("here you go", reply_to=y_id)
-        await asyncio.wait_for(asyncio.gather(x, y), 2)
-        assert "moved on to a later message" in x_queue.texts()[0]
-        assert y_queue.texts() == ["here you go"]
-    finally:
-        await ex.stop()
-        await gateway.close()
-
-
-@pytest.mark.asyncio
-async def test_a_send_anchored_to_a_control_message_is_never_recorrelated(monkeypatch):
-    gateway = FakeGateway()
-    await gateway.start()
-    ex = _executor(monkeypatch, gateway)
-    await ex.start()
-    try:
-        ex._record_origin("ctl-1", "control")
-        ex._note_answered("ctl-1", CHAT)
-        y_queue = _Queue()
-        y = asyncio.create_task(ex.execute(_ctx("Y"), y_queue))
-        y_id = await _dispatched(gateway, "Y")
-        status, body = await gateway.send("Session reset, part two", reply_to="ctl-1")
+        queue = _Queue()
+        await asyncio.wait_for(ex.execute(_ctx("delegated", peer_id="ws-peer"), queue), 3)
+        assert "cannot be returned to this request" in queue.texts()[0]
+        status, body = await gateway.answer("delegated", "for the peer")
         assert (status, body) == (200, {"ok": True, "stale": True})
-        assert not y.done()
-        await gateway.send("Y-OK", reply_to=y_id)
-        await asyncio.wait_for(y, 5)
-        assert y_queue.texts() == ["Y-OK"]
+        assert platform.notified == []
     finally:
         await ex.stop()
         await gateway.close()
+        await platform.close()
 
 
-# --- anchorless sends ---------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_an_idle_wake_is_acked_in_time_and_its_late_answer_forwarded(monkeypatch):
+    """The idle digest's poster gives up after 300 s; acked earlier, its
+    baseline advances. The answer then goes through the digest's own forwarder,
+    which drops "(idle)"."""
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    monkeypatch.setenv("MOLECULE_WORKSPACE_ID", WS)
+    ex = _executor(monkeypatch, gateway, HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS="0.3")
+    await ex.start()
+    try:
+        wake = _Queue()
+        await asyncio.wait_for(
+            ex.execute(_ctx("<SYSTEM IDLE PROMPT> go", source_type="self-idle"), wake), 3
+        )
+        assert wake.texts()[0].startswith("[autonomous turn still running")
+        from molecule_runtime.idle_digest.reply_forwarder import should_suppress
+
+        assert should_suppress(wake.texts()[0]), "the poster must not show the interim reply"
+
+        mid = gateway.message_id("<SYSTEM IDLE PROMPT> go")
+        status, body = await gateway.send("(idle)", reply_to=mid)
+        assert (status, body) == (200, {"ok": True, "stale": True})
+        assert platform.notified == []
+        status, body = await gateway.send("Fixed the sitemap; PR #9 merged.", reply_to=mid)
+        assert (status, body) == (200, {"ok": True, "stale": True, "relayed": True})
+        assert platform.notified == [{"message": "Fixed the sitemap; PR #9 merged."}]
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
+
+
+# --- anchorless sends and late replies -------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -645,6 +886,38 @@ async def test_an_anchorless_send_is_progress_and_feeds_the_turn_lease(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_long_quiet_turn_reports_still_working_to_the_platform(monkeypatch):
+    """No tool calls for minutes: the platform still has to see activity, or
+    its stall watchdog restarts the workspace."""
+    emitted: List[tuple] = []
+
+    async def fake_emit(name, summary=None, status="ok"):
+        emitted.append((name, summary, status))
+
+    monkeypatch.setattr(executor_mod, "emit_tool_call", fake_emit)
+    monkeypatch.setattr(executor_mod, "_PROGRESS_ROW_SECONDS", 0.3)
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        running = asyncio.create_task(ex.execute(_ctx("thinking"), _Queue()))
+        mid = await _dispatched(gateway, "thinking")
+        await gateway.send("⏳ Working — 0 min")
+        assert emitted == [], "a young turn reports nothing extra"
+        for _ in range(10):
+            await asyncio.sleep(0.1)
+            await gateway.send("⏳ Working")
+        assert 2 <= len(emitted) <= 4, emitted
+        assert all(name == "hermes" and summary.startswith("⏳ still working") for name, summary, _ in emitted)
+        await gateway.send("done", reply_to=mid)
+        await asyncio.wait_for(running, 5)
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
 async def test_reply_validation_is_unchanged_for_malformed_bodies(monkeypatch):
     gateway = FakeGateway()
     await gateway.start()
@@ -659,43 +932,6 @@ async def test_reply_validation_is_unchanged_for_malformed_bodies(monkeypatch):
     finally:
         await ex.stop()
         await gateway.close()
-
-
-# --- late replies ----------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_a_late_reply_to_a_self_turn_goes_through_the_idle_forwarder(monkeypatch):
-    platform = FakePlatform()
-    await platform.start()
-    gateway = FakeGateway()
-    await gateway.start()
-    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
-    monkeypatch.setenv("MOLECULE_WORKSPACE_ID", WS)
-    ex = _executor(monkeypatch, gateway, HERMES_TURN_MAX_SECONDS="0.3")
-    await ex.start()
-    try:
-        wake = _Queue()
-        running = asyncio.create_task(
-            ex.execute(_ctx("<SYSTEM IDLE PROMPT> go", source_type="self-idle"), wake)
-        )
-        mid = await _dispatched(gateway, "<SYSTEM IDLE PROMPT> go")
-        while not running.done():
-            await gateway.send("⏳ working")
-            await asyncio.sleep(0.05)
-        assert "turn cap" in wake.texts()[0]
-
-        status, body = await gateway.send("(idle)", reply_to=mid)
-        assert (status, body) == (200, {"ok": True, "stale": True})
-        assert platform.notified == []
-
-        status, body = await gateway.send("Fixed the sitemap; PR #9 merged.", reply_to=mid)
-        assert (status, body) == (200, {"ok": True, "stale": True, "relayed": True})
-        assert platform.notified == [{"message": "Fixed the sitemap; PR #9 merged."}]
-    finally:
-        await ex.stop()
-        await gateway.close()
-        await platform.close()
 
 
 @pytest.mark.asyncio
@@ -722,8 +958,7 @@ async def test_a_turn_whose_caller_left_stays_busy_and_its_answer_is_relayed(mon
         status, body = await gateway.send("the answer, eventually", reply_to=mid)
         assert (status, body) == (200, {"ok": True, "stale": True, "relayed": True})
         assert platform.notified == [{"message": "the answer, eventually"}]
-        assert ex._turns == {}
-        assert await _until(lambda: hb.active_tasks == 0)
+        assert await _until(lambda: ex._turns == {} and hb.active_tasks == 0)
     finally:
         await ex.stop()
         await gateway.close()
@@ -731,10 +966,7 @@ async def test_a_turn_whose_caller_left_stays_busy_and_its_answer_is_relayed(mon
 
 
 @pytest.mark.asyncio
-async def test_a_failed_late_relay_is_retried_to_the_same_turn(monkeypatch):
-    """The redelivery of a late answer whose relay failed carries the same id
-    and content; it must not be mistaken for hermes#393 and handed to another
-    caller who is still waiting."""
+async def test_a_failed_late_relay_is_retried_and_the_next_message_waits(monkeypatch):
     platform = FakePlatform()
     platform.fail_next = 1
     await platform.start()
@@ -751,16 +983,16 @@ async def test_a_failed_late_relay_is_retried_to_the_same_turn(monkeypatch):
             await left
         waiting_queue = _Queue()
         waiting = asyncio.create_task(ex.execute(_ctx("caller waits"), waiting_queue))
-        waiting_id = await _dispatched(gateway, "caller waits")
+        await _not_dispatched(gateway, "caller waits", 0.1)
 
         status, _ = await gateway.send("answer for the one who left", reply_to=left_id)
         assert status == 503
         status, body = await gateway.send("answer for the one who left", reply_to=left_id)
         assert (status, body) == (200, {"ok": True, "stale": True, "relayed": True})
         assert platform.notified == [{"message": "answer for the one who left"}]
-        assert not waiting.done()
 
-        await gateway.send("answer for the one who waited", reply_to=waiting_id)
+        await _dispatched(gateway, "caller waits")
+        await gateway.answer("caller waits", "answer for the one who waited")
         await asyncio.wait_for(waiting, 5)
         assert waiting_queue.texts() == ["answer for the one who waited"]
     finally:
