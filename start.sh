@@ -950,6 +950,13 @@ if [ -z "${MOLECULE_TOOL_ACTIVITY_FILE:-}" ]; then
   install -d -m 700 -o agent -g agent "$(dirname "$MOLECULE_TOOL_ACTIVITY_FILE")"
 fi
 export MOLECULE_TOOL_ACTIVITY_FILE
+# The gateway sends a "still working" notice for a running turn every
+# HERMES_AGENT_NOTIFY_INTERVAL seconds (upstream default 180). The executor
+# counts every gateway send as liveness and gives up on a turn after
+# HERMES_TURN_STALL_SECONDS of silence (default 900), so the notice has to come
+# well inside that window, including during one long tool call. Exported for
+# both processes; a value set by the platform or an operator wins.
+export HERMES_AGENT_NOTIFY_INTERVAL="${HERMES_AGENT_NOTIFY_INTERVAL:-60}"
 TURN_PLUGIN_SRC="/app/hermes_plugins/molecule_turn_activity"
 [ -d "$TURN_PLUGIN_SRC" ] || TURN_PLUGIN_SRC="$(dirname "$0")/hermes_plugins/molecule_turn_activity"
 TURN_PLUGIN_DST="${HERMES_HOME}/plugins/molecule_turn_activity"

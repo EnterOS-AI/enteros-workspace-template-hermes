@@ -40,21 +40,29 @@ The plugin POSTs replies to:
 We correlate by ``reply_to`` and resolve the matching pending Future.
 ``chat_id`` is intentionally *not* used for correlation: it's coarser
 than message_id (multiple in-flight messages on the same chat would
-race).
+race). A send without ``reply_to`` is mid-run output (interim text, the
+gateway's "still working" notice) and counts as liveness only. ``reply_to``
+stays right because hermes gets one message per chat at a time: one drained
+from hermes' own queue is answered under another message's id (hermes#393).
+
+A turn stays tracked, and the workspace busy, until its reply arrives or the
+turn supervisor gives up on it (see TurnSupervisionPolicy).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import socket
 import time
 import uuid
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 import httpx
 
@@ -128,9 +136,129 @@ _DEFAULT_CALLBACK_PORT = 8646
 _DEFAULT_CALLBACK_PATH = "/a2a/reply"
 SECRET_HEADER = "X-Molecule-A2A-Secret"
 
-# Same generous bound as the chat-completions path. Prevents a hung
-# hermes daemon from wedging the A2A queue forever.
-_PLUGIN_REPLY_TIMEOUT = 600.0
+# --- Turn supervision --------------------------------------------------------
+# A plugin turn ends when the gateway answers it, not on a clock. Every message
+# stays tracked until its answer arrives, and the workspace reports busy for
+# that long: the runtime's idle loop, the scheduler's watchdog and the platform
+# all read that before they send another autonomous wake.
+#
+# One message per chat at the gateway. A message that waits in hermes' own
+# queue is drained inside the run ahead of it and answered under the id of the
+# message that opened that run (hermes#393), and /stop leaves queued plugin
+# messages parked to run next. So later messages wait here, in arrival order,
+# and each gets the gateway to itself.
+#
+# Three clocks bound a turn:
+# * reply deadline: the caller is answered before its own request gives up.
+#   The platform abandons an A2A request at 30 minutes and then queues it to be
+#   delivered again, which would run the work twice; some callers give up
+#   sooner (_SHORT_FUSE_SELF_SOURCE_TYPES, _CHANNEL_REPLY_DEADLINE_SECONDS). The
+#   clock starts when execute() gets the message and covers every dispatch the
+#   turn makes. At the deadline the caller gets an interim reply and the turn's
+#   answer is delivered later, where its origin belongs (_deliver_late).
+# * stall: no sign of life from the gateway for HERMES_TURN_STALL_SECONDS. A
+#   live run is never that quiet: it sends interim text, a "still working"
+#   notice every HERMES_AGENT_NOTIFY_INTERVAL (start.sh sets it), and every
+#   tool call rewrites MOLECULE_TOOL_ACTIVITY_FILE. A turn that quiet was lost
+#   with a crashed or wedged gateway.
+# * cap: the running turn has gone on for HERMES_TURN_MAX_SECONDS (0 = no cap);
+#   the executor sends hermes' /stop.
+#
+# A turn can also end in hermes with nothing sent under its id: hermes drops a
+# final that is only a silence marker ([SILENT], NO_REPLY) on these internal
+# turns, and a message that ran inside a run hermes started itself (a
+# background job finishing) is answered under that run's anchor, which is none.
+# Such finals arrive with no reply_to and are held for the running turn. Once
+# the gateway has been quiet for HERMES_TURN_SETTLE_SECONDS while its health
+# check still answers, no run is going (a live one sends "still working" every
+# HERMES_AGENT_NOTIFY_INTERVAL), and the turn is settled with the last held
+# final, or with _NO_RESPONSE.
+#
+# Stall and cap default to the runtime's turn-lease bounds
+# (MOLECULE_TURN_LEASE_TTL_SECONDS / A2A_COMPLETION_IDLE_TIMEOUT_SECONDS, and
+# MOLECULE_MAX_TURN_SECONDS), so a hermes turn is judged by the same numbers as
+# a native one.
+_DEFAULT_STALL_SECONDS = 900.0
+_DEFAULT_MAX_TURN_SECONDS = 3600.0
+_DEFAULT_REPLY_DEADLINE_SECONDS = 1500.0
+_DEFAULT_SELF_REPLY_DEADLINE_SECONDS = 60.0
+_DEFAULT_TURN_POLL_SECONDS = 1.0
+_DEFAULT_CONTROL_REPLY_SECONDS = 120.0
+_DEFAULT_QUEUE_MAX = 32
+# hermes' own default for HERMES_AGENT_NOTIFY_INTERVAL (start.sh sets 60).
+_HERMES_NOTIFY_INTERVAL_DEFAULT = 180.0
+# A long turn with no tool calls reports "still working" at most this often:
+# the platform's stall watchdog probes a busy workspace after 12 minutes
+# without activity and restarts it 5 minutes later.
+_PROGRESS_ROW_SECONDS = 240.0
+# How long the POST that hands a message to the plugin may take. The plugin
+# answers it before the run starts, so a slow answer is a busy gateway, not a
+# refusal (see _post_inbound).
+_INBOUND_POST_TIMEOUT = 10.0
+
+# Which caller gets which reply deadline. The runtime's own wakes below give up
+# within minutes and never show the reply text to anyone: the delegation
+# harvester after 120 s, the idle digest after 300 s (its forwarder drops the
+# interim text), the lifecycle prompt after 600 s (it retries on a timeout and
+# discards the reply). They get the short self-turn deadline. Every other
+# self-wake keeps the regular one: the platform's first-boot greeting shows the
+# reply text and falls back on its own after 90 s, and the scheduler's trigger
+# lane waits for the real answer.
+_SHORT_FUSE_SELF_SOURCE_TYPES = frozenset({"self-harvester", "self-idle", "self-lifecycle"})
+# A channel plugin's inbound turn (channel_sdk.send_channel_message) waits
+# 600 s and is never replayed.
+_CHANNEL_REPLY_DEADLINE_SECONDS = 540.0
+# What a caller gets when hermes ends its turn without an answer under its id:
+# the runtime's own empty-reply sentinel, which the idle digest never shows.
+_NO_RESPONSE = "(no response generated)"
+# A retried send of the same unanchored text arrives within seconds; the same
+# text later is a new message.
+_UNANCHORED_DEDUP_SECONDS = 120.0
+# hermes sends a final's attachments (an image link, the notice for a file it
+# could not deliver) right after the final, with the final's notify metadata and
+# no reply_to (base._deliver_attachments). A send like that within this window
+# of a chat's last anchored one belongs to that message.
+_ATTACHMENT_WINDOW_SECONDS = 10.0
+# The source the platform stamps on a person's canvas message (molecule-core
+# a2a_proxy_helpers.injectCanvasUserIdentity); any other source is a channel's.
+_CANVAS_SOURCE = "canvas_user"
+
+# Fast-ack for a routine self-wake that arrives while a turn runs. The
+# "[autonomous " prefix is the one the idle digest's reply forwarder suppresses,
+# so the skip never becomes a chat bubble.
+_SELF_PING_SKIPPED = (
+    "[autonomous wake skipped — a turn is already in flight; this routine wake "
+    "recurs next cycle]"
+)
+# The runtime's own backpressure reply (a2a_executor, inbox at capacity).
+_QUEUE_FULL_REPLY = '{"status":"busy","retry":true}'
+
+# The runtime's routine self-ping set (a2a_executor._ROUTINE_SELF_SOURCE_TYPES),
+# used only when that module cannot be imported. tests/test_turn_supervision.py
+# fails if the two drift.
+_ROUTINE_SELF_SOURCE_TYPES_FALLBACK = frozenset({
+    "self-cron",
+    "self-harvester",
+    "self-idle",
+    "self-scheduler",
+    "self-goal-nudge",
+    "self-delegation-result",
+    "self-lifecycle",
+})
+# A native turn picks delegation results up from DELEGATION_RESULTS_FILE, which
+# is why the runtime may drop these wakes mid-turn. Hermes never reads that
+# file: the wake is the only copy of the results, and the harvester does not
+# resend one it got a 2xx for. They queue instead.
+_UNDROPPABLE_SELF_SOURCE_TYPES = frozenset({"self-harvester", "self-delegation-result"})
+_DELEGATION_RESULTS_PREFIX = "Delegation results are ready"
+
+# Commands hermes answers inline even while a run is going. A person may send
+# one mid-turn (to approve a blocked command, or to stop the turn), so these
+# skip the queue. The first three end the running turn.
+_INTERRUPTING_COMMANDS = frozenset({"/stop", "/new", "/reset"})
+_INLINE_COMMANDS = _INTERRUPTING_COMMANDS | frozenset(
+    {"/approve", "/deny", "/status", "/usage", "/help"}
+)
 
 # Inbound `metadata.source_type` values that mean "this delivery is an
 # autonomous self-turn, not a human talking". The scheduler plugin stamps
@@ -485,17 +613,18 @@ class _SessionResetClock:
         self._finished: Dict[str, float] = {}
         self._in_flight: Dict[str, int] = {}
 
-    def begin(self, chat_id: str) -> Optional[str]:
+    def begin(self, chat_id: str, busy: bool = False) -> Optional[str]:
         """Record a turn start; return the reset reason if one is due first.
 
-        A turn that overlaps one already in flight on the chat is never reset
-        (/new would interrupt the running turn) and does not move the start
-        clock, so the next turn that starts alone still sees the boundary.
-        Synchronous on purpose: two deliveries racing on the event loop cannot
-        both see the chat idle.
+        A turn that overlaps one already in flight on the chat, or that the
+        caller says is not alone (``busy``: the executor still has a message
+        running or waiting there), is never reset, since /new would interrupt or
+        wait behind that message, and does not move the start clock, so the next
+        turn that starts alone still sees the boundary. Synchronous on purpose:
+        two deliveries racing on the event loop cannot both see the chat idle.
         """
-        if self._in_flight.get(chat_id):
-            self._in_flight[chat_id] += 1
+        if busy or self._in_flight.get(chat_id):
+            self._in_flight[chat_id] = self._in_flight.get(chat_id, 0) + 1
             return None
         now = self._clock()
         reason = self.policy.reset_reason(
@@ -512,6 +641,292 @@ class _SessionResetClock:
             self._in_flight[chat_id] = remaining
         else:
             self._in_flight.pop(chat_id, None)
+
+
+# --- Turn supervision (see the constants block near the top) ----------------
+
+
+def _float_env_or_warn(
+    name: str, default: float, low: float, high: Optional[float]
+) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value: Optional[float] = float(raw)
+    except ValueError:
+        value = None
+    if value is None or value != value or value < low or (high is not None and value > high):
+        accepted = f"{low:g}-{high:g}" if high is not None else f">= {low:g}"
+        logger.warning(
+            "%s=%r is not a number in %s; using the default %g instead",
+            name, raw, accepted, default,
+        )
+        return default
+    return value
+
+
+def _runtime_turn_defaults() -> tuple[float, float]:
+    """(stall, cap) from the runtime's turn-lease resolution, so the knobs the
+    runtime documents for native turns also bound hermes turns."""
+    try:
+        from molecule_runtime import turn_lease
+
+        return (
+            float(turn_lease.default_ttl_seconds()),
+            float(turn_lease.default_absolute_cap_seconds()),
+        )
+    except Exception:  # noqa: BLE001 — an older runtime without the helpers
+        return (_DEFAULT_STALL_SECONDS, _DEFAULT_MAX_TURN_SECONDS)
+
+
+@dataclass(frozen=True)
+class TurnSupervisionPolicy:
+    stall_seconds: float = _DEFAULT_STALL_SECONDS
+    max_seconds: float = _DEFAULT_MAX_TURN_SECONDS
+    reply_deadline_seconds: float = _DEFAULT_REPLY_DEADLINE_SECONDS
+    self_reply_deadline_seconds: float = _DEFAULT_SELF_REPLY_DEADLINE_SECONDS
+    poll_seconds: float = _DEFAULT_TURN_POLL_SECONDS
+    control_seconds: float = _DEFAULT_CONTROL_REPLY_SECONDS
+    queue_max: int = _DEFAULT_QUEUE_MAX
+    drop_self_pings: bool = True
+    # 0 = never settle a quiet turn early; the stall window still applies.
+    settle_seconds: float = 0.0
+
+    @classmethod
+    def from_env(cls) -> "TurnSupervisionPolicy":
+        """Read the HERMES_TURN_* knobs. A bad value is logged and the default used."""
+        stall, cap = _runtime_turn_defaults()
+        # Two still-working notices missed in a row: a live run sends one every
+        # interval, so no run is going. Off when the notice is off.
+        notify = _float_env_or_warn(
+            "HERMES_AGENT_NOTIFY_INTERVAL", _HERMES_NOTIFY_INTERVAL_DEFAULT, 0.0, None
+        )
+        settle = 2 * notify + 10 if notify > 0 else 0.0
+        return cls(
+            settle_seconds=_float_env_or_warn("HERMES_TURN_SETTLE_SECONDS", settle, 0.0, None),
+            stall_seconds=_float_env_or_warn("HERMES_TURN_STALL_SECONDS", stall, 0.01, None),
+            max_seconds=_float_env_or_warn("HERMES_TURN_MAX_SECONDS", cap, 0.0, None),
+            reply_deadline_seconds=_float_env_or_warn(
+                "HERMES_TURN_REPLY_DEADLINE_SECONDS", _DEFAULT_REPLY_DEADLINE_SECONDS, 0.0, None
+            ),
+            self_reply_deadline_seconds=_float_env_or_warn(
+                "HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS",
+                _DEFAULT_SELF_REPLY_DEADLINE_SECONDS, 0.0, None,
+            ),
+            poll_seconds=_float_env_or_warn(
+                "HERMES_TURN_POLL_SECONDS", _DEFAULT_TURN_POLL_SECONDS, 0.01, 60.0
+            ),
+            control_seconds=_float_env_or_warn(
+                "HERMES_CONTROL_REPLY_SECONDS", _DEFAULT_CONTROL_REPLY_SECONDS, 0.01, None
+            ),
+            queue_max=_int_env_or_warn("HERMES_TURN_QUEUE_MAX", _DEFAULT_QUEUE_MAX, 1, None),
+            drop_self_pings=_bool_env("HERMES_DROP_SELF_PINGS_WHEN_BUSY", True),
+        )
+
+
+class HermesTurnAbandoned(RuntimeError):
+    """The executor stopped waiting for a turn; ``str()`` is the reply text."""
+
+
+@dataclass(frozen=True)
+class _Caller:
+    """Who is waiting for the turn whose dispatches run in this task, and until when."""
+
+    origin: str  # "user" | "self" | "peer" | "channel"
+    source_type: str
+    brief: str
+    deadline: float  # seconds, 0 = none; named in the interim reply
+    deadline_at: Optional[float]  # monotonic
+
+
+# Set by execute() for the whole turn, so the turn's every dispatch (the turn,
+# an overflow replay, the /new before a retry) shares one caller and one
+# deadline. Unset in the supervisor, whose /stop belongs to no caller.
+_TURN_CALLER: contextvars.ContextVar[Optional[_Caller]] = contextvars.ContextVar(
+    "hermes_turn_caller", default=None
+)
+
+# How long a message's origin is remembered, so an answer that arrives long
+# after its caller was answered still goes where it belongs. The cap bounds a
+# running turn, so a day is ample.
+_LATE_REPLY_TTL = 86400.0
+
+
+@dataclass
+class _Turn:
+    """One message the executor is carrying to the gateway, until it settles."""
+
+    message_id: str
+    chat_id: str
+    # "turn": waits for the chat's slot at the gateway. "command": an inline
+    # hermes command sent mid-turn, which skips the queue. "control": /new or
+    # /stop sent by the executor itself.
+    kind: str
+    origin: str  # "user" | "self" | "peer" | "channel" | "control"
+    source_type: str
+    brief: str
+    registered_at: float
+    command: str = ""
+    # The caller's reply deadline (see _Caller).
+    deadline: float = 0.0
+    deadline_at: Optional[float] = None
+    # For /stop, /new or /reset from a person: the turn that was running when
+    # it went out, the only one its answer may end.
+    target: str = ""
+    # When it was posted to the gateway; the cap is measured from here.
+    started_at: Optional[float] = None
+    dispatched: bool = False
+    # Holds one heartbeat active_tasks slot until released.
+    counted: bool = False
+    # No caller is waiting any more (answered at the reply deadline, or its
+    # task was cancelled). The turn keeps its place; its answer goes to
+    # _deliver_late and its driver cleans it up.
+    detached: bool = False
+    # The supervisor is ending it (stall or cap); /stop is on its way.
+    stopping: bool = False
+    progress: int = 0
+    # Finals that arrived with no reply_to while this turn ran (see the
+    # turn-supervision notes), oldest first.
+    unanchored: List[str] = field(default_factory=list)
+    # When the supervisor last asked the gateway whether a quiet turn is over.
+    probed_at: float = 0.0
+
+
+def _message_metadata(context: Any) -> Optional[dict]:
+    """The inbound envelope metadata, message level first, then the request
+    level the runtime's own self-wakes stamp (executor_helpers SSOT)."""
+    try:
+        from molecule_runtime.executor_helpers import get_message_metadata
+
+        return get_message_metadata(context)
+    except Exception:  # noqa: BLE001 — an older runtime without the helper
+        metadata = getattr(getattr(context, "message", None), "metadata", None)
+        if metadata is None:
+            metadata = getattr(context, "metadata", None)
+        return metadata if isinstance(metadata, dict) else None
+
+
+def _message_source_type(context: Any) -> str:
+    value = (_message_metadata(context) or {}).get("source_type")
+    return value if isinstance(value, str) else ""
+
+
+def _is_droppable_self_ping(context: Any, text: str) -> bool:
+    """A self-wake that may be dropped while a turn runs: the runtime's own
+    drop-not-queue rule (a2a_executor._is_routine_self_message) for cron, idle,
+    scheduler and lifecycle wakes, minus delegation results (see
+    _UNDROPPABLE_SELF_SOURCE_TYPES)."""
+    source_type = _message_source_type(context)
+    if source_type in _UNDROPPABLE_SELF_SOURCE_TYPES:
+        return False
+    if not source_type and (text or "").lstrip().startswith(_DELEGATION_RESULTS_PREFIX):
+        return False
+    try:
+        from molecule_runtime.a2a_executor import _is_routine_self_message
+
+        return bool(_is_routine_self_message(context, text))
+    except Exception:  # noqa: BLE001
+        return source_type in _ROUTINE_SELF_SOURCE_TYPES_FALLBACK
+
+
+def _command_of(text: str) -> str:
+    """The leading hermes command of a one-line message ("/stop"), or ""."""
+    stripped = (text or "").strip()
+    if not stripped.startswith("/") or "\n" in stripped:
+        return ""
+    return stripped.split(None, 1)[0].lower()
+
+
+def _is_self_source(source_type: str) -> bool:
+    try:
+        from molecule_runtime.a2a_executor import _is_self_source_type
+
+        return bool(_is_self_source_type(source_type or None))
+    except Exception:  # noqa: BLE001
+        return bool(source_type) and source_type.startswith("self-")
+
+
+def _brief(text: str) -> str:
+    try:
+        from molecule_runtime.shared_runtime import brief_task
+
+        return brief_task(text)
+    except Exception:  # noqa: BLE001
+        return " ".join((text or "").split())[:60]
+
+
+async def _set_current_task(heartbeat: Any, task: str) -> None:
+    """The runtime's active_tasks/current_task accounting (increment on a
+    non-empty task, decrement on ""), plus its immediate heartbeat push."""
+    try:
+        from molecule_runtime.executor_helpers import set_current_task
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        await set_current_task(heartbeat, task)
+    except Exception:  # noqa: BLE001 — busy telemetry must never fail a turn
+        logger.debug("set_current_task failed", exc_info=True)
+
+
+def _touch_turn_lease() -> None:
+    try:
+        from molecule_runtime import turn_lease
+
+        turn_lease.touch_current()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _redact(text: str) -> str:
+    try:
+        from molecule_runtime.secret_redactor import redact_secrets
+
+        return redact_secrets(text)
+    except Exception:  # noqa: BLE001
+        return text
+
+
+# Which argument names the chip previews for the tools hermes uses most.
+_TOOL_PREVIEW_KEYS = (
+    "command", "path", "file_path", "url", "query", "pattern", "goal", "code", "name",
+)
+_TOOL_PREVIEW_CHARS = 80
+
+
+def _tool_chip_summary(tool: str, args_text: str) -> str:
+    """One canvas chip line for a hermes tool call, e.g. ``🛠 terminal: ls -la``."""
+    preview = ""
+    try:
+        args = json.loads(args_text) if args_text else None
+    except ValueError:
+        args = None
+    if isinstance(args, dict):
+        for key in _TOOL_PREVIEW_KEYS:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                preview = value
+                break
+    elif isinstance(args, str):
+        preview = args
+    preview = " ".join(_redact(preview).split())
+    if len(preview) > _TOOL_PREVIEW_CHARS:
+        preview = preview[: _TOOL_PREVIEW_CHARS - 1] + "…"
+    return f"🛠 {tool}: {preview}" if preview else f"🛠 {tool}"
+
+
+def _read_tool_event(path: str) -> Optional[dict]:
+    """The molecule_turn_activity record in the activity file, or None."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            record = json.loads(fh.read(8192))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("v") != 1:
+        return None
+    if not isinstance(record.get("seq"), int) or not isinstance(record.get("tool"), str):
+        return None
+    return record
 
 
 class HermesAgentProxyExecutor(AgentExecutor):
@@ -561,6 +976,34 @@ class HermesAgentProxyExecutor(AgentExecutor):
         self._reply_site: Optional["web.TCPSite"] = None
         self._started: bool = False
 
+        # Turn supervision (see TurnSupervisionPolicy).
+        self._heartbeat = getattr(config, "heartbeat", None)
+        self._turn_policy = TurnSupervisionPolicy.from_env()
+        # Every message the executor is carrying, until it settles.
+        self._turns: Dict[str, _Turn] = {}
+        # chat_id -> message_id holding the chat's one slot at the gateway, the
+        # ids waiting for it in arrival order, and the future each waiter is
+        # parked on.
+        self._slot: Dict[str, str] = {}
+        self._queue: Dict[str, Deque[str]] = {}
+        self._slot_waiters: Dict[str, asyncio.Future] = {}
+        # chat_id -> monotonic time of the gateway's last send for that chat.
+        self._chat_activity: Dict[str, float] = {}
+        # chat_id -> (message_id, monotonic ts) of the last send that carried a
+        # reply_to, which the attachments sent right after it belong to.
+        self._last_anchored: Dict[str, tuple] = {}
+        # chat_id -> turns holding a busy slot.
+        self._busy_chats: Dict[str, int] = {}
+        self._supervisor: Optional[asyncio.Task] = None
+        self._stopping = False
+        self._background: Set[asyncio.Task] = set()
+        # (boot, seq) of the last tool event reported from the activity file.
+        self._tool_event_mark: Optional[tuple] = None
+        self._tool_file_mtime: float = 0.0
+        self._tool_activity_at: float = 0.0
+        # When the last agent_log row (tool chip or "still working") went out.
+        self._activity_row_at: float = 0.0
+
         # Scheduled session reset (issue #383). None = never reset (default).
         reset_policy = SessionResetPolicy.from_env()
         self._session_clock: Optional[_SessionResetClock] = (
@@ -586,8 +1029,72 @@ class HermesAgentProxyExecutor(AgentExecutor):
                 "MOLECULE_A2A_PLATFORM_ENABLED=false to use the legacy path."
             )
         await self._start_reply_server()
+        policy = self._turn_policy
+        logger.info(
+            "hermes turn supervision: stall=%gs cap=%s reply_deadline=%s "
+            "self_reply_deadline=%s settle=%s queue_max=%d poll=%gs "
+            "drop_self_pings_when_busy=%s",
+            policy.stall_seconds,
+            f"{policy.max_seconds:g}s" if policy.max_seconds else "off",
+            f"{policy.reply_deadline_seconds:g}s" if policy.reply_deadline_seconds else "off",
+            f"{policy.self_reply_deadline_seconds:g}s" if policy.self_reply_deadline_seconds else "off",
+            f"{policy.settle_seconds:g}s" if policy.settle_seconds else "off",
+            policy.queue_max,
+            policy.poll_seconds,
+            policy.drop_self_pings,
+        )
+        notify = _float_env_or_warn(
+            "HERMES_AGENT_NOTIFY_INTERVAL", _HERMES_NOTIFY_INTERVAL_DEFAULT, 0.0, None
+        )
+        if notify <= 0 or notify * 3 > policy.stall_seconds:
+            logger.warning(
+                "HERMES_AGENT_NOTIFY_INTERVAL=%g leaves the gateway's still-working "
+                "notice too sparse (or off) for HERMES_TURN_STALL_SECONDS=%g: a "
+                "turn that spends that long in one tool call may be abandoned",
+                notify, policy.stall_seconds,
+            )
+        if policy.settle_seconds and (notify <= 0 or policy.settle_seconds < 2 * notify):
+            logger.warning(
+                "HERMES_TURN_SETTLE_SECONDS=%g is shorter than two still-working "
+                "notices (HERMES_AGENT_NOTIFY_INTERVAL=%g): a live turn may be settled "
+                "with no response",
+                policy.settle_seconds, notify,
+            )
+        self._ensure_supervisor()
 
     async def stop(self) -> None:
+        self._stopping = True
+        # Busy slots are given back below, in one bounded step; the cleanup the
+        # cancelled tasks run must not try to push them as well.
+        counted = [t for t in self._turns.values() if t.counted]
+        for turn in counted:
+            turn.counted = False
+
+        # Fail every pending future so in-flight execute() calls surface a
+        # clear shutdown error instead of waiting on a reply that cannot come.
+        # Nobody waits on a detached turn's future; cancelling it keeps asyncio
+        # from reporting an exception that was never retrieved.
+        for message_id, fut in list(self._pending.items()):
+            if fut.done():
+                continue
+            turn = self._turns.get(message_id)
+            if turn is not None and turn.detached:
+                fut.cancel()
+            else:
+                fut.set_exception(RuntimeError("executor shutting down"))
+
+        supervisor, self._supervisor = self._supervisor, None
+        tasks = [t for t in [supervisor, *self._background] if t is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except BaseException:  # noqa: BLE001 — cancelled or already failed
+                pass
+        self._background.clear()
+
         if self._reply_site is not None:
             try:
                 await self._reply_site.stop()
@@ -601,13 +1108,33 @@ class HermesAgentProxyExecutor(AgentExecutor):
                 logger.exception("hermes plugin: reply runner cleanup failed")
             self._reply_runner = None
 
-        # Cancel all pending futures so any in-flight execute() calls
-        # surface a clear shutdown error rather than hanging until the
-        # 600s timeout fires.
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(RuntimeError("executor shutting down"))
         self._pending.clear()
+        chats = {t.chat_id for t in self._turns.values()}
+        self._turns.clear()
+        self._slot.clear()
+        self._queue.clear()
+        self._slot_waiters.clear()
+        self._busy_chats.clear()
+        try:
+            from molecule_runtime.runtime_inbox import get_inbox
+
+            for chat_id in chats:
+                entry = get_inbox().peek(f"hermes:{chat_id}")
+                if entry is not None:
+                    entry.turn_in_flight = False
+                    entry.in_flight_source_type = None
+        except Exception:  # noqa: BLE001
+            pass
+        # set_current_task drops active_tasks before it awaits its heartbeat
+        # push, so even a push that times out here leaves the count right.
+        if counted:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(_set_current_task(self._heartbeat, "") for _ in counted)),
+                    2.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _start_reply_server(self) -> None:
         app = web.Application()
@@ -657,6 +1184,14 @@ class HermesAgentProxyExecutor(AgentExecutor):
         prompt = text
 
         if self._use_plugin:
+            # A routine self-wake (idle digest, cron, scheduler, harvester)
+            # that lands while a turn runs is dropped, as the runtime's native
+            # executor drops it: it recurs next cycle, and forwarding it would
+            # queue it in the gateway behind the running turn, where a backlog
+            # of stale wakes runs for hours once the turn ends.
+            if self._should_skip_self_ping(context, prompt):
+                await event_queue.enqueue_event(new_text_message(_SELF_PING_SKIPPED))
+                return
             # Plugin path → hermes daemon owns session state natively
             # (gateway/session.py SessionStore: SQLite + JSONL, keyed by
             # session_key derived from SessionSource.chat_id).
@@ -673,22 +1208,29 @@ class HermesAgentProxyExecutor(AgentExecutor):
             # volume) this can be revisited. See RFC #600 sibling
             # discussion in #497.
             history = self._extract_history_from_context(context)
-            clock = getattr(self, "_session_clock", None)
-            if clock is None:
-                await self._execute_via_plugin(
-                    context, event_queue, prompt, history=history
-                )
-                return
-            chat_id = self._derive_chat_id(context)
-            reason = clock.begin(chat_id)
+            # The caller's deadline runs from here and covers the scheduled /new.
+            token = _TURN_CALLER.set(self._caller_of(context, prompt))
             try:
-                if reason:
-                    await self._scheduled_session_reset(context, chat_id, reason)
-                await self._execute_via_plugin(
-                    context, event_queue, prompt, history=history
-                )
+                clock = getattr(self, "_session_clock", None)
+                if clock is None:
+                    await self._execute_via_plugin(
+                        context, event_queue, prompt, history=history
+                    )
+                    return
+                chat_id = self._derive_chat_id(context)
+                # While another message runs or waits on the chat, /new would
+                # wait behind it; the reset waits for a turn that starts alone.
+                reason = clock.begin(chat_id, busy=self._chat_busy(chat_id))
+                try:
+                    if reason:
+                        await self._scheduled_session_reset(context, chat_id, reason)
+                    await self._execute_via_plugin(
+                        context, event_queue, prompt, history=history
+                    )
+                finally:
+                    clock.end(chat_id)
             finally:
-                clock.end(chat_id)
+                _TURN_CALLER.reset(token)
         else:
             # Legacy chat_completions path: /v1/chat/completions is
             # stateless by contract — it has no session store of its own,
@@ -700,10 +1242,9 @@ class HermesAgentProxyExecutor(AgentExecutor):
             )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        # Both transports rely on a wall-clock timeout in execute() to
-        # bound a hung hermes-side run. No per-request cancel API is
-        # exposed by either path today. Revisit when hermes adds a
-        # turn/interrupt RPC for the chat_completions path.
+        # The chat-completions path is bounded by its HTTP timeout and the
+        # plugin path by the turn supervisor (stall and cap; the cap sends
+        # hermes' /stop). Neither offers a per-request cancel.
         return None
 
     # ------------------------------------------------------------------
@@ -715,6 +1256,61 @@ class HermesAgentProxyExecutor(AgentExecutor):
         event_queue: EventQueue,
         prompt: str,
         history: list[dict[str, Any]] | None = None,
+    ) -> None:
+        # Every dispatch this turn makes (the turn, an overflow replay, the
+        # retry) shares the turn's caller; _dispatch_and_wait reads it from the
+        # context so its signature stays what callers and tests know.
+        if _TURN_CALLER.get() is not None:
+            await self._run_plugin_turn(context, event_queue, prompt, history)
+            return
+        token = _TURN_CALLER.set(self._caller_of(context, prompt))
+        try:
+            await self._run_plugin_turn(context, event_queue, prompt, history)
+        finally:
+            _TURN_CALLER.reset(token)
+
+    def _caller_of(self, context: RequestContext, prompt: str) -> _Caller:
+        """Who sent this message, and when its reply is due."""
+        raw_source_type = _message_source_type(context)
+        peer_id, _ = self._derive_peer_identity(context)
+        message_meta = getattr(getattr(context, "message", None), "metadata", None)
+        request_meta = getattr(context, "metadata", None)
+        if peer_id or (isinstance(message_meta, dict) and message_meta.get("delegation_id")):
+            # The platform's async delegation names its delegation_id; it stores
+            # the reply as the delegator's result.
+            origin = "peer"
+        elif _is_self_source(raw_source_type):
+            origin = "self"
+        elif (
+            isinstance(request_meta, dict)
+            and isinstance(request_meta.get("source"), str)
+            and request_meta["source"].strip() not in ("", _CANVAS_SOURCE)
+        ):
+            # The runtime stamps a channel plugin's id there (channel_events).
+            origin = "channel"
+        else:
+            origin = "user"
+        policy = getattr(self, "_turn_policy", None) or TurnSupervisionPolicy()
+        if origin == "self" and raw_source_type in _SHORT_FUSE_SELF_SOURCE_TYPES:
+            deadline = policy.self_reply_deadline_seconds
+        elif origin == "channel" and policy.reply_deadline_seconds:
+            deadline = min(policy.reply_deadline_seconds, _CHANNEL_REPLY_DEADLINE_SECONDS)
+        else:
+            deadline = policy.reply_deadline_seconds
+        return _Caller(
+            origin=origin,
+            source_type=raw_source_type,
+            brief=_brief(prompt),
+            deadline=deadline,
+            deadline_at=time.monotonic() + deadline if deadline else None,
+        )
+
+    async def _run_plugin_turn(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+        prompt: str,
+        history: list[dict[str, Any]] | None,
     ) -> None:
         chat_id = self._derive_chat_id(context)
         peer_id, peer_name = self._derive_peer_identity(context)
@@ -904,18 +1500,57 @@ class HermesAgentProxyExecutor(AgentExecutor):
         event_queue: EventQueue | None,
         source_type: str = "",
     ) -> str | None:
-        """POST one message into the hermes plugin and await its reply.
+        """Give one message to the hermes plugin and wait for its answer.
 
-        Returns the reply text, or None when the turn failed. On failure a
-        user-facing message is enqueued when ``event_queue`` is provided;
-        internal dispatches (the `/new` reset) pass None and are silent.
+        Returns the reply text, or None when the turn failed or its caller was
+        answered at the reply deadline; the text for the caller is then already
+        enqueued. Dispatches with no ``event_queue`` are control messages (the
+        `/new` reset, the supervisor's `/stop`): silent, and bounded by
+        HERMES_CONTROL_REPLY_SECONDS, and by the deadline of the turn they are
+        sent for.
         """
         message_id = uuid.uuid4().hex
+        control = event_queue is None
+        caller = _TURN_CALLER.get()
+        deadline, deadline_at = (caller.deadline, caller.deadline_at) if caller else (0.0, None)
+        target = ""
+        if control:
+            kind, origin, raw_source_type, brief = "control", "control", "", content
+        else:
+            if caller is not None:
+                origin, raw_source_type, brief = caller.origin, caller.source_type, caller.brief
+            else:
+                # A dispatch outside execute(): its own caller, its own clock.
+                origin = "peer" if peer_id else "user"
+                raw_source_type, brief = source_type, _brief(content)
+                deadline = self._turn_policy.reply_deadline_seconds
+                deadline_at = time.monotonic() + deadline if deadline else None
+            command = _command_of(content)
+            if (
+                origin in ("user", "channel")
+                and command in _INLINE_COMMANDS
+                and self._chat_busy(chat_id)
+            ):
+                kind = "command"
+                if command in _INTERRUPTING_COMMANDS:
+                    # The turn holding the chat, posted or still being posted:
+                    # either way hermes has it before this command.
+                    holder = self._turns.get(self._slot.get(chat_id, ""))
+                    target = holder.message_id if holder is not None and holder.kind == "turn" else ""
+            else:
+                kind = "turn"
+            if kind == "turn" and len(self._queue.get(chat_id, ())) >= self._turn_policy.queue_max:
+                logger.warning(
+                    "hermes plugin: %d messages already waiting on %s; refusing another",
+                    len(self._queue.get(chat_id, ())), chat_id,
+                )
+                await event_queue.enqueue_event(new_text_message(_QUEUE_FULL_REPLY))
+                return None
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._pending[message_id] = future
-        self._record_origin(message_id, "peer" if peer_id else "user")
+        self._record_origin(message_id, origin, raw_source_type)
 
         # Belt-and-suspenders session continuity (task #385): the hermes
         # daemon owns session state natively, but its store at
@@ -977,43 +1612,254 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if self._shared_secret:
             headers[SECRET_HEADER] = self._shared_secret
 
-        inbound_url = (
-            f"http://{self._plugin_host}:{self._plugin_port}/a2a/inbound"
+        turn = _Turn(
+            message_id=message_id,
+            chat_id=chat_id,
+            kind=kind,
+            origin=origin,
+            source_type=raw_source_type or "",
+            brief=brief or "hermes turn",
+            registered_at=time.monotonic(),
+            command=_command_of(content) if kind == "command" else "",
+            deadline=deadline,
+            deadline_at=deadline_at,
+            target=target,
+        )
+        self._turns[message_id] = turn
+        if kind != "control":
+            self._claim_busy(turn)
+        if self._spawn(self._drive(turn, payload, headers, future)) is None:
+            self._retire(turn)
+            if event_queue is not None:
+                await event_queue.enqueue_event(
+                    new_text_message("[hermes plugin error] executor shutting down")
+                )
+            return None
+        try:
+            if kind == "control":
+                return await self._await_control(turn, future)
+            return await self._await_outcome(turn, future, event_queue)
+        except asyncio.CancelledError:
+            # The caller went away; the turn did not. It keeps its place (and,
+            # if it is running, the gateway) and its answer is delivered late.
+            if not future.done():
+                turn.detached = True
+                logger.warning(
+                    "hermes plugin: caller of message_id=%s went away; the turn "
+                    "keeps its place and its answer will be delivered late",
+                    message_id,
+                )
+            raise
+        finally:
+            if not turn.detached:
+                self._retire(turn)
+
+    async def _drive(
+        self, turn: _Turn, payload: Dict[str, Any], headers: Dict[str, str],
+        future: asyncio.Future,
+    ) -> None:
+        """Take the chat's slot, post the message, and hold the slot until the
+        message settles. Its own task, so a caller that stops waiting (the reply
+        deadline, a cancellation) does not take the turn down with it."""
+        holds_slot = turn.kind == "turn" or (
+            turn.kind == "control" and payload.get("content") != "/stop"
         )
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            if holds_slot:
+                await self._acquire_slot(turn.chat_id, turn.message_id)
+            if future.done():
+                return
+            turn.started_at = time.monotonic()
+            error = await self._post_inbound(payload, headers)
+            if error is not None:
+                self._fail(turn, future, f"[hermes plugin POST error] {error}")
+                return
+            turn.dispatched = True
+            if turn.kind == "turn":
+                # Bounded by the supervisor: stall and cap.
+                await asyncio.wait({future})
+            else:
+                await asyncio.wait({future}, timeout=self._turn_policy.control_seconds)
+                self._fail(
+                    turn, future,
+                    f"[hermes plugin: no reply to {payload.get('content', '')[:20]!r} "
+                    f"within {self._turn_policy.control_seconds:g}s]",
+                )
+        finally:
+            if holds_slot:
+                self._release_slot(turn.chat_id, turn.message_id)
+            if turn.unanchored:
+                # Held for this turn, never its answer: other runs' output.
+                held, turn.unanchored = turn.unanchored, []
+                self._spawn(self._relay_held(turn.chat_id, held))
+            if turn.detached:
+                self._retire(turn)
+
+    async def _post_inbound(self, payload: Dict[str, Any], headers: Dict[str, str]) -> Optional[str]:
+        """POST one message to the plugin's /a2a/inbound; the error text, or None.
+
+        A request that was sent whole but not answered in time counts as
+        delivered: the plugin may already have the message, and treating it as
+        refused would let the next one land behind it. The stall window catches
+        a gateway that is really gone.
+        """
+        inbound_url = f"http://{self._plugin_host}:{self._plugin_port}/a2a/inbound"
+        try:
+            async with httpx.AsyncClient(timeout=_INBOUND_POST_TIMEOUT) as client:
                 resp = await client.post(inbound_url, json=payload, headers=headers)
                 resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            self._pending.pop(message_id, None)
-            logger.exception("hermes plugin POST failed")
-            if event_queue is not None:
-                await event_queue.enqueue_event(
-                    new_text_message(f"[hermes plugin POST error] {exc!s}")
-                )
-            return None
-
-        try:
-            return await asyncio.wait_for(future, timeout=_PLUGIN_REPLY_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.error(
-                "hermes plugin: reply timeout for message_id=%s", message_id
+        except httpx.ReadTimeout:
+            logger.warning(
+                "hermes plugin: no answer to the POST of message_id=%s within %gs; "
+                "treating it as delivered",
+                payload.get("message_id"), _INBOUND_POST_TIMEOUT,
             )
-            if event_queue is not None:
-                await event_queue.enqueue_event(
-                    new_text_message(
-                        f"[hermes plugin reply timeout after {_PLUGIN_REPLY_TIMEOUT:.0f}s]"
+        except httpx.HTTPError as exc:
+            logger.exception("hermes plugin POST failed")
+            return str(exc)
+        return None
+
+    async def _acquire_slot(self, chat_id: str, message_id: str) -> None:
+        if chat_id not in self._slot:
+            self._slot[chat_id] = message_id
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        self._slot_waiters[message_id] = waiter
+        self._queue.setdefault(chat_id, deque()).append(message_id)
+        try:
+            await waiter
+        finally:
+            self._slot_waiters.pop(message_id, None)
+            queue = self._queue.get(chat_id)
+            if queue is not None and message_id in queue:
+                queue.remove(message_id)
+                if not queue:
+                    self._queue.pop(chat_id, None)
+
+    def _release_slot(self, chat_id: str, message_id: str) -> None:
+        """Hand the chat's slot to the next waiter, if ``message_id`` holds it."""
+        if self._slot.get(chat_id) != message_id:
+            return
+        queue = self._queue.get(chat_id)
+        while queue:
+            nxt = queue.popleft()
+            waiter = self._slot_waiters.get(nxt)
+            if waiter is not None and not waiter.done():
+                self._slot[chat_id] = nxt
+                if not queue:
+                    self._queue.pop(chat_id, None)
+                waiter.set_result(None)
+                return
+        self._queue.pop(chat_id, None)
+        self._slot.pop(chat_id, None)
+
+    def _chat_busy(self, chat_id: str) -> bool:
+        return chat_id in self._slot or bool(self._queue.get(chat_id))
+
+    def _fail(self, turn: _Turn, future: asyncio.Future, text: str) -> None:
+        """Settle an unanswered turn with ``text`` as its caller's reply."""
+        if future.done():
+            return
+        if turn.detached:
+            # Nobody will read it; a set exception would only be reported as
+            # never retrieved.
+            future.cancel()
+        else:
+            future.set_exception(HermesTurnAbandoned(text))
+
+    def _retire(self, turn: _Turn) -> None:
+        self._pending.pop(turn.message_id, None)
+        self._turns.pop(turn.message_id, None)
+        self._release_busy(turn)
+
+    def _interim_reply(self, turn: _Turn, deadline: float) -> str:
+        if turn.origin == "self":
+            return (
+                f"[autonomous turn still running after {deadline:g}s; it continues, "
+                "and its outcome is reported when it ends]"
+            )
+        if turn.origin == "peer":
+            return (
+                f"[hermes is still working on this after {deadline:g}s; its answer "
+                "cannot be returned to this request]"
+            )
+        if turn.origin == "channel":
+            return (
+                f"[hermes is still working on this after {deadline:g}s; its answer "
+                "will be posted in the workspace's own chat, not here]"
+            )
+        return (
+            f"[hermes is still working on this after {deadline:g}s; its answer will "
+            "appear in this chat when it is ready]"
+        )
+
+    async def _await_outcome(
+        self, turn: _Turn, future: asyncio.Future, event_queue: EventQueue
+    ) -> str | None:
+        """Wait for the turn's outcome, or answer the caller at the reply deadline.
+
+        Waits in slices only to restart a supervisor that died, so a bug there
+        cannot turn into an unbounded wait here.
+        """
+        slice_seconds = max(1.0, 5 * self._turn_policy.poll_seconds)
+        while not future.done():
+            timeout = slice_seconds
+            if turn.deadline_at is not None:
+                remaining = turn.deadline_at - time.monotonic()
+                if remaining <= 0:
+                    turn.detached = True
+                    logger.info(
+                        "hermes turn %s: caller answered at the %gs reply deadline; "
+                        "the turn keeps running and its answer will be delivered late",
+                        turn.message_id, turn.deadline,
                     )
-                )
+                    await event_queue.enqueue_event(
+                        new_text_message(self._interim_reply(turn, turn.deadline))
+                    )
+                    return None
+                timeout = min(timeout, remaining)
+            await asyncio.wait({future}, timeout=timeout)
+            self._ensure_supervisor()
+        if future.cancelled():
+            await event_queue.enqueue_event(
+                new_text_message("[hermes plugin error] the turn was cancelled")
+            )
+            return None
+        try:
+            text = future.result()
+        except HermesTurnAbandoned as exc:
+            await event_queue.enqueue_event(new_text_message(str(exc)))
             return None
         except Exception as exc:
-            if event_queue is not None:
-                await event_queue.enqueue_event(
-                    new_text_message(f"[hermes plugin error] {exc!s}")
-                )
+            await event_queue.enqueue_event(new_text_message(f"[hermes plugin error] {exc!s}"))
             return None
-        finally:
-            self._pending.pop(message_id, None)
+        logger.info(
+            "hermes turn %s answered after %.1fs (%d progress sends)",
+            turn.message_id, time.monotonic() - turn.registered_at, turn.progress,
+        )
+        return text
+
+    async def _await_control(self, turn: _Turn, future: asyncio.Future) -> str | None:
+        # The driver bounds the wait once the message is out; the deadline of
+        # the turn it was sent for also bounds the wait for the slot.
+        if turn.deadline_at is None:
+            await asyncio.wait({future})
+        else:
+            remaining = turn.deadline_at - time.monotonic()
+            if remaining > 0:
+                await asyncio.wait({future}, timeout=remaining)
+            self._fail(
+                turn, future,
+                f"[hermes plugin: {turn.brief[:20]!r} not answered by the caller's "
+                f"{turn.deadline:g}s reply deadline]",
+            )
+        if future.cancelled():
+            return None
+        try:
+            return future.result()
+        except Exception as exc:
+            logger.error("hermes plugin: %r: %s", turn.brief[:20], exc)
+            return None
 
     async def _handle_reply(self, request: "web.Request") -> "web.Response":
         if self._shared_secret:
@@ -1029,18 +1875,65 @@ class HermesAgentProxyExecutor(AgentExecutor):
                 {"ok": False, "error": "invalid json"}, status=400
             )
 
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"ok": False, "error": "expected object"}, status=400
+            )
         reply_to = body.get("reply_to")
         content = body.get("content")
-        if not reply_to or not isinstance(content, str):
+        if not isinstance(content, str):
             return web.json_response(
                 {"ok": False, "error": "reply_to and content required"},
                 status=400,
             )
+        raw_chat = body.get("chat_id")
+        chat_id = raw_chat if isinstance(raw_chat, str) else ""
+        now = time.monotonic()
+        if chat_id:
+            # Any send for the chat proves the gateway is working on it.
+            self._chat_activity[chat_id] = now
+        # The turn's last tool call lands in the activity file just before its
+        # answer; read it now so that call is reported ahead of the reply,
+        # not on the supervisor's next tick.
+        self._poll_tool_activity(now)
+
+        if not reply_to:
+            self._note_progress(chat_id)
+            metadata = body.get("metadata")
+            if not (
+                isinstance(metadata, dict)
+                and metadata.get("notify") is True
+                and not metadata.get("_interim_send")
+            ):
+                # Mid-run output: interim text, the "still working" notice, a
+                # compaction notice. Liveness only; refusing it (the old 400)
+                # only made hermes log a failed send.
+                return web.json_response({"ok": True, "progress": True})
+            # hermes marks a final notify (base._mark_notify_metadata) and a
+            # mid-run send _interim_send. Right after an anchored final this is
+            # one of its attachments; otherwise it answered a run hermes
+            # started itself, or one of ours that ran inside it.
+            last = self._last_anchored.get(chat_id) if chat_id else None
+            if last is None or now - last[1] > _ATTACHMENT_WINDOW_SECONDS:
+                return await self._take_unanchored_final(chat_id, content)
+            reply_to = last[0]
+        reply_to = str(reply_to)
+        if chat_id:
+            self._last_anchored[chat_id] = (reply_to, now)
 
         future = self._pending.get(reply_to)
         if future is not None and not future.done():
             future.set_result(content)
             self._mark_delivered(reply_to, content)
+            turn = self._turns.get(reply_to)
+            if turn is not None:
+                if turn.command in _INTERRUPTING_COMMANDS:
+                    self._end_running_turn(
+                        turn.chat_id, f"[the turn was interrupted by {turn.command}]",
+                        only=turn.target,
+                    )
+                if turn.detached:
+                    return await self._deliver_late(reply_to, content)
             return web.json_response({"ok": True})
 
         # Orphan path: no pending future, OR a present-but-done future (a
@@ -1063,15 +1956,28 @@ class HermesAgentProxyExecutor(AgentExecutor):
                 reply_to,
             )
             return web.json_response({"ok": True, "stale": True})
-        origin = self._origin_of(reply_to)
-        if origin != "user":
-            # "peer" — or unknown (executor restarted since registration;
-            # conservative pre-relay behavior: drop, matching the old
-            # uniform-drop contract for turns we cannot attribute).
+        return await self._deliver_late(reply_to, content)
+
+    async def _deliver_late(self, reply_to: str, content: str) -> "web.Response":
+        """An answer nobody is waiting for: deliver it where its origin belongs.
+
+        A person (canvas or channel): the workspace's chat via /notify. An
+        idle-digest wake: the same chat, through the digest's own reply
+        forwarder, which drops "(idle)" and other housekeeping text, as it would
+        have on time. Any other self-wake (scheduler tick, delegation results,
+        platform wakes), a peer, a control message, or an origin no longer
+        known: not relayed. Their senders never show the answer to a person, and
+        the peer already got its interim reply.
+        """
+        origin, source_type = self._origin_entry(reply_to)
+        person = origin in ("user", "channel")
+        relay = person or (origin == "self" and source_type == "self-idle")
+        if not relay:
             logger.warning(
-                "hermes plugin: late reply for message_id=%s origin=%s — not relayed",
+                "hermes plugin: late reply for message_id=%s origin=%s source=%s — not relayed",
                 reply_to,
                 origin or "unknown",
+                source_type or "-",
             )
             return web.json_response({"ok": True, "stale": True})
         # RESERVE the dedup slot BEFORE awaiting the relay so a concurrent
@@ -1080,7 +1986,17 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # 503 so the plugin's retry loop redelivers — a 200 here would
         # make one transient platform blip a permanent reply loss (#3).
         self._mark_delivered(reply_to, content)
-        relayed = await self._relay_orphan_reply(reply_to, content)
+        if person:
+            relayed = await self._relay_orphan_reply(reply_to, content)
+        else:
+            status = await self._forward_self_reply(content)
+            logger.info(
+                "hermes plugin: late reply for self-turn message_id=%s: %s",
+                reply_to, status,
+            )
+            if status in ("suppressed",) or status.startswith("skipped"):
+                return web.json_response({"ok": True, "stale": True})
+            relayed = status == "delivered"
         if not relayed:
             self._unmark_delivered(reply_to, content)
             return web.json_response(
@@ -1088,6 +2004,411 @@ class HermesAgentProxyExecutor(AgentExecutor):
                 status=503,
             )
         return web.json_response({"ok": True, "stale": True, "relayed": True})
+
+    async def _forward_self_reply(self, content: str) -> str:
+        """Hand a self-turn's late reply to the idle digest's reply forwarder."""
+        try:
+            from molecule_runtime.idle_digest.reply_forwarder import (
+                forward_reply_to_user,
+            )
+        except Exception:  # noqa: BLE001
+            return "skipped: reply forwarder unavailable"
+        workspace_id = (
+            os.environ.get("MOLECULE_WORKSPACE_ID")
+            or os.environ.get("WORKSPACE_ID", "")
+        ).strip()
+        base = (os.environ.get("PLATFORM_URL") or "").strip().rstrip("/")
+        if not workspace_id or not base:
+            return "skipped: PLATFORM_URL/MOLECULE_WORKSPACE_ID unset"
+        try:
+            return await forward_reply_to_user(base, workspace_id, content)
+        except Exception as exc:  # noqa: BLE001 — it never raises; be sure
+            return f"error: {exc}"
+
+    async def _take_unanchored_final(self, chat_id: str, content: str) -> "web.Response":
+        """A final with no reply_to. While one of our turns runs it may be that
+        turn's answer (hermes ran it inside a run it started itself), so it is
+        held; the turn's own answer, or the settle window, decides. With nothing
+        running it is the agent speaking on its own: relayed to the chat."""
+        running = self._running_turn(chat_id) if chat_id else None
+        if running is not None:
+            running.unanchored.append(content)
+            logger.info(
+                "hermes plugin: final with no reply_to on %s while message_id=%s runs; "
+                "held (%d)", chat_id, running.message_id, len(running.unanchored),
+            )
+            return web.json_response({"ok": True, "held": True})
+        status = await self._relay_unanchored(chat_id, content)
+        if status.startswith("error"):
+            return web.json_response({"ok": False, "relayed": False}, status=503)
+        return web.json_response({"ok": True, "relayed": status == "delivered"})
+
+    async def _relay_unanchored(self, chat_id: str, content: str) -> str:
+        """Post the agent's own output to the chat, through the idle digest's
+        forwarder (it drops silence and housekeeping text); the forwarder's status."""
+        key = f"unanchored:{chat_id}"
+        if self._already_delivered(key, content, within=_UNANCHORED_DEDUP_SECONDS):
+            return "duplicate"
+        self._mark_delivered(key, content)
+        status = await self._forward_self_reply(content)
+        logger.info("hermes plugin: final with no reply_to on %s: %s", chat_id or "-", status)
+        if status.startswith("error"):
+            self._unmark_delivered(key, content)
+        return status
+
+    async def _relay_held(self, chat_id: str, texts: List[str]) -> None:
+        for text in texts:
+            await self._relay_unanchored(chat_id, text)
+
+    # ------------------------------------------------------------------
+    # Turn supervision
+    # ------------------------------------------------------------------
+    def _chat_turns(self, chat_id: str) -> List[_Turn]:
+        return [t for t in self._turns.values() if t.chat_id == chat_id]
+
+    def _running_turn(self, chat_id: str) -> Optional[_Turn]:
+        """The turn holding the chat's slot at the gateway, once posted."""
+        turn = self._turns.get(self._slot.get(chat_id, ""))
+        if turn is None or turn.kind != "turn" or not turn.dispatched:
+            return None
+        future = self._pending.get(turn.message_id)
+        return turn if future is not None and not future.done() else None
+
+    def _note_progress(self, chat_id: str) -> None:
+        running = self._running_turn(chat_id) if chat_id else None
+        if running is not None:
+            running.progress += 1
+            now = time.monotonic()
+            # A run that makes no tool calls for minutes still has to show up as
+            # activity on the platform, or its stall watchdog restarts the
+            # workspace (see _PROGRESS_ROW_SECONDS).
+            if (
+                now - (running.started_at or now) >= _PROGRESS_ROW_SECONDS
+                and now - self._activity_row_at >= _PROGRESS_ROW_SECONDS
+            ):
+                self._activity_row_at = now
+                minutes = int((now - (running.started_at or now)) // 60)
+                self._spawn(emit_tool_call("hermes", f"⏳ still working — {minutes} min", "ok"))
+        _touch_turn_lease()
+
+    def _should_skip_self_ping(self, context: RequestContext, text: str) -> bool:
+        policy = getattr(self, "_turn_policy", None)
+        if policy is None or not policy.drop_self_pings:
+            return False
+        chat_id = self._derive_chat_id(context)
+        if not self._chat_busy(chat_id):
+            return False
+        if not _is_droppable_self_ping(context, text):
+            return False
+        logger.info(
+            "hermes plugin: routine self-wake (%s) while a turn is in flight on "
+            "%s — fast-ack + drop (recurs next cycle)",
+            _message_source_type(context) or "untyped", chat_id,
+        )
+        return True
+
+    # --- busy signals -------------------------------------------------
+    # active_tasks (heartbeat) gates the runtime's idle loop; the runtime
+    # inbox's turn_in_flight is what the heartbeat reports as is_busy, which
+    # the platform reads before it defers, queues or hibernates.
+    def _claim_busy(self, turn: _Turn) -> None:
+        if turn.counted:
+            return
+        turn.counted = True
+        self._busy_chats[turn.chat_id] = self._busy_chats.get(turn.chat_id, 0) + 1
+        self._apply_inbox(turn.chat_id)
+        self._spawn(self._push_busy(turn.chat_id, turn.brief))
+
+    def _release_busy(self, turn: _Turn) -> None:
+        if not turn.counted:
+            return
+        turn.counted = False
+        remaining = self._busy_chats.get(turn.chat_id, 0) - 1
+        if remaining > 0:
+            self._busy_chats[turn.chat_id] = remaining
+        else:
+            self._busy_chats.pop(turn.chat_id, None)
+        self._apply_inbox(turn.chat_id)
+        self._spawn(self._push_busy(turn.chat_id, ""))
+
+    async def _push_busy(self, chat_id: str, task: str) -> None:
+        # set_current_task updates active_tasks before its first await, so the
+        # increments and decrements land in the order these tasks were spawned;
+        # only the HTTP pushes behind them may overlap, and the next periodic
+        # heartbeat carries the settled count.
+        await _set_current_task(self._heartbeat, task)
+        try:
+            from molecule_runtime.runtime_inbox import get_inbox
+
+            await get_inbox().get_or_create(f"hermes:{chat_id}")
+        except Exception:  # noqa: BLE001
+            return
+        self._apply_inbox(chat_id)
+
+    def _apply_inbox(self, chat_id: str) -> None:
+        """Mirror the chat's busy state onto its runtime inbox entry, if it exists yet."""
+        try:
+            from molecule_runtime.runtime_inbox import get_inbox
+
+            entry = get_inbox().peek(f"hermes:{chat_id}")
+        except Exception:  # noqa: BLE001
+            return
+        if entry is None:
+            return
+        busy = [t for t in self._chat_turns(chat_id) if t.counted]
+        entry.turn_in_flight = bool(busy)
+        entry.in_flight_source_type = (busy[0].source_type or None) if busy else None
+
+    def _spawn(self, coro) -> Optional[asyncio.Task]:
+        if getattr(self, "_stopping", False):
+            coro.close()
+            return None
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return None
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
+
+    # --- the supervisor -------------------------------------------------
+    def _ensure_supervisor(self) -> None:
+        if not self._use_plugin or getattr(self, "_stopping", False):
+            return
+        task = self._supervisor
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if task is None:
+            self._baseline_tool_activity()
+        else:
+            logger.error("hermes turn supervisor had stopped; restarting it")
+        self._supervisor = loop.create_task(self._supervise_loop())
+
+    async def _supervise_loop(self) -> None:
+        # A supervisor restarted from inside a turn would inherit its caller.
+        _TURN_CALLER.set(None)
+        while True:
+            await asyncio.sleep(self._turn_policy.poll_seconds)
+            try:
+                await self._supervise_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("hermes turn supervisor: tick failed")
+
+    async def _supervise_once(self) -> None:
+        now = time.monotonic()
+        self._poll_tool_activity(now)
+        policy = self._turn_policy
+        for chat_id in list(self._slot):
+            turn = self._running_turn(chat_id)
+            if turn is None or turn.stopping:
+                continue
+            started = turn.started_at or now
+            quiet = now - self._last_sign(turn, now)
+            if quiet >= policy.stall_seconds:
+                self._stop_running(
+                    turn, "stall",
+                    "[hermes plugin reply timeout: no activity from the hermes gateway "
+                    f"for {policy.stall_seconds:g}s; the turn was abandoned]",
+                )
+            elif policy.max_seconds and now - started >= policy.max_seconds:
+                self._stop_running(
+                    turn, "cap",
+                    "[hermes plugin reply timeout: the turn ran past the "
+                    f"{policy.max_seconds:g}s turn cap and was stopped]",
+                )
+            elif (
+                policy.settle_seconds
+                and quiet >= policy.settle_seconds
+                and now - turn.probed_at >= policy.settle_seconds
+            ):
+                turn.probed_at = now
+                self._spawn(self._settle_if_over(turn))
+        self._prune_bookkeeping(now)
+
+    def _last_sign(self, turn: _Turn, now: float) -> float:
+        """When the gateway last showed it was working on this turn's chat."""
+        return max(
+            self._chat_activity.get(turn.chat_id, 0.0),
+            self._tool_activity_at,
+            turn.started_at or now,
+        )
+
+    async def _settle_if_over(self, turn: _Turn) -> None:
+        """The gateway has been quiet past the settle window while this turn ran.
+
+        A live run sends "still working" every HERMES_AGENT_NOTIFY_INTERVAL, so if
+        the gateway still answers its health check, no run is going and nothing
+        more will come under this turn's id (see the turn-supervision notes). The
+        turn is settled with the last final held for it, or with _NO_RESPONSE.
+        A gateway that does not answer is left to the stall window.
+        """
+        if not await self._gateway_alive():
+            return
+        future = self._pending.get(turn.message_id)
+        if (
+            future is None or future.done() or turn.stopping
+            or self._running_turn(turn.chat_id) is not turn
+        ):
+            return
+        now = time.monotonic()
+        quiet = now - self._last_sign(turn, now)
+        if quiet < self._turn_policy.settle_seconds:
+            return  # the gateway spoke while it was being asked
+        held = bool(turn.unanchored)
+        answer = turn.unanchored.pop() if held else _NO_RESPONSE
+        logger.warning(
+            "hermes turn %s: the gateway was idle for %.0fs with no answer under its id; "
+            "settled with %s",
+            turn.message_id, quiet,
+            "the last final it sent without one" if held else "no response",
+        )
+        self._mark_delivered(turn.message_id, answer)
+        future.set_result(answer)
+        if not turn.detached:
+            return
+        # Its caller was told the answer would follow: deliver it, or tell a
+        # person there is none.
+        if held:
+            delivered = False
+            for pause in (0.0, 2.0, 5.0):
+                await asyncio.sleep(pause)
+                resp = await self._deliver_late(turn.message_id, answer)
+                if resp.status < 300:
+                    delivered = True
+                    break
+            if not delivered:
+                logger.error(
+                    "hermes turn %s: its answer could not be delivered late", turn.message_id
+                )
+        elif turn.origin in ("user", "channel"):
+            await self._relay_orphan_reply(turn.message_id, _NO_RESPONSE)
+
+    async def _gateway_alive(self) -> bool:
+        url = f"http://{self._plugin_host}:{self._plugin_port}/a2a/health"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+        except httpx.HTTPError:
+            return False
+        return resp.status_code == 200
+
+    def _stop_running(self, turn: _Turn, reason: str, text: str) -> None:
+        """End the running turn: /stop, then settle it, then the queue moves on.
+
+        Only the running turn is settled. The messages waiting behind it never
+        reached the gateway and each gets its own run next. The slot is handed on
+        only after /stop is answered, so the next message cannot land in hermes
+        behind a run that is still being stopped.
+        """
+        turn.stopping = True
+        logger.error(
+            "hermes plugin: %s on %s — message_id=%s running %.0fs; sending /stop",
+            reason, turn.chat_id, turn.message_id,
+            time.monotonic() - (turn.started_at or turn.registered_at),
+        )
+        self._spawn(self._stop_then_settle(turn, text))
+
+    async def _stop_then_settle(self, turn: _Turn, text: str) -> None:
+        _TURN_CALLER.set(None)  # this /stop belongs to no caller's deadline
+        await self._send_stop(turn.chat_id)
+        future = self._pending.get(turn.message_id)
+        if future is None or future.done():
+            return
+        if turn.detached and turn.origin in ("user", "channel"):
+            # The person was told the answer would follow; tell them it won't.
+            await self._relay_orphan_reply(turn.message_id, text)
+        self._fail(turn, future, text)
+
+    def _end_running_turn(self, chat_id: str, text: str, *, only: str) -> None:
+        """A person's /stop, /new or /reset ended the running turn in hermes:
+        the turn ``only`` names, the one holding the chat when the command went
+        out. A turn that started since then is not the one the person meant."""
+        turn = self._turns.get(only) if only else None
+        if turn is None or self._slot.get(chat_id) != only:
+            return
+        future = self._pending.get(turn.message_id)
+        if future is not None:
+            logger.info("hermes plugin: %s (message_id=%s)", text, turn.message_id)
+            self._fail(turn, future, text)
+
+    async def _send_stop(self, chat_id: str) -> None:
+        try:
+            reply = await self._dispatch_and_wait(
+                content="/stop",
+                chat_id=chat_id,
+                peer_id="",
+                peer_name=None,
+                callback_url=(
+                    f"http://{self._callback_host}:{self._callback_port}"
+                    f"{_DEFAULT_CALLBACK_PATH}"
+                ),
+                history=None,
+                event_queue=None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("hermes plugin: /stop dispatch failed for %s", chat_id)
+            return
+        if reply is None:
+            logger.warning(
+                "hermes plugin: /stop on %s got no answer; the run may still be going",
+                chat_id,
+            )
+            return
+        logger.info("hermes plugin: /stop on %s answered: %s", chat_id, reply[:120])
+
+    # --- tool events from the hermes gateway --------------------------
+    # The molecule_turn_activity hermes plugin rewrites the activity file after
+    # every tool call. Each new event becomes one agent_log activity row: the
+    # canvas tool chip, and the activity that keeps the platform's stall
+    # watchdog from restarting a workspace whose long turn is marked busy.
+    def _baseline_tool_activity(self) -> None:
+        path = os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE", "").strip()
+        if not path:
+            return
+        try:
+            self._tool_file_mtime = os.stat(path).st_mtime
+        except OSError:
+            return
+        record = _read_tool_event(path)
+        if record is not None:
+            self._tool_event_mark = (record.get("boot"), record["seq"])
+
+    def _poll_tool_activity(self, now: float) -> None:
+        path = os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE", "").strip()
+        if not path:
+            return
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return
+        if mtime <= self._tool_file_mtime:
+            return
+        self._tool_file_mtime = mtime
+        self._tool_activity_at = now
+        record = _read_tool_event(path)
+        if record is None:
+            return
+        mark = (record.get("boot"), record["seq"])
+        previous = self._tool_event_mark
+        if previous is not None and previous[0] == mark[0] and mark[1] <= previous[1]:
+            return
+        self._tool_event_mark = mark
+        tool = record["tool"].strip()
+        if not tool:
+            return
+        status = "error" if record.get("status") == "error" else "ok"
+        args = record.get("args") if isinstance(record.get("args"), str) else ""
+        self._activity_row_at = now
+        self._spawn(emit_tool_call(tool, _tool_chip_summary(tool, args), status))
 
     # Retry-dedup bookkeeping for _handle_reply. TTL bounds memory AND
     # bounds the redelivery-dedup horizon: a retry arriving after expiry
@@ -1125,29 +2446,51 @@ class HermesAgentProxyExecutor(AgentExecutor):
         while len(self._delivered) > self._DELIVERED_MAX:
             oldest = min(self._delivered, key=self._delivered.get)
             self._delivered.pop(oldest, None)
-        for m, (_, ts) in list(self._origin.items()):
-            if ts < cutoff:
+        # Origins outlive the dedup window: a turn can run for the whole cap
+        # before its answer shows up. Entries are (origin, ts, source_type).
+        turns = getattr(self, "_turns", {})
+        late_cutoff = now - _LATE_REPLY_TTL
+        for m, entry in list(self._origin.items()):
+            if entry[1] < late_cutoff and m not in turns:
                 self._origin.pop(m, None)
         while len(self._origin) > self._DELIVERED_MAX:
             oldest = min(self._origin, key=lambda m: self._origin[m][1])
             self._origin.pop(oldest, None)
+        activity = getattr(self, "_chat_activity", {})
+        live_chats = {t.chat_id for t in turns.values()}
+        for chat_id, ts in list(activity.items()):
+            if ts < late_cutoff and chat_id not in live_chats:
+                activity.pop(chat_id, None)
+        anchored = getattr(self, "_last_anchored", {})
+        for chat_id, (_, ts) in list(anchored.items()):
+            if ts < late_cutoff:
+                anchored.pop(chat_id, None)
 
-    def _record_origin(self, message_id: str, origin: str) -> None:
+    def _record_origin(self, message_id: str, origin: str, source_type: str = "") -> None:
         import time
 
         now = time.monotonic()
-        self._origin[str(message_id)] = (origin, now)
+        self._origin[str(message_id)] = (origin, now, source_type or "")
         self._prune_bookkeeping(now)
 
-    def _origin_of(self, message_id: str) -> str:
+    def _origin_entry(self, message_id: str) -> tuple:
+        """(origin, source_type) recorded for the message, or ("", "")."""
         entry = self._origin.get(str(message_id))
-        return entry[0] if entry else ""
+        if not entry:
+            return ("", "")
+        return (entry[0], entry[2] if len(entry) > 2 else "")
 
-    def _already_delivered(self, message_id: str, content: str) -> bool:
+    def _origin_of(self, message_id: str) -> str:
+        return self._origin_entry(message_id)[0]
+
+    def _already_delivered(
+        self, message_id: str, content: str, within: Optional[float] = None
+    ) -> bool:
         import time
 
         ts = self._delivered.get(self._content_key(message_id, content))
-        return ts is not None and (time.monotonic() - ts) < self._DELIVERED_TTL
+        window = self._DELIVERED_TTL if within is None else within
+        return ts is not None and (time.monotonic() - ts) < window
 
     async def _relay_orphan_reply(self, reply_to: str, content: str) -> bool:
         """Push a late gateway reply to the canvas chat via /notify.
@@ -1290,16 +2633,13 @@ class HermesAgentProxyExecutor(AgentExecutor):
 
         Returns "" for anything not in ``_SCHEDULED_SOURCE_TYPES`` — see the
         note there for why this is an allow-list and not a passthrough.
+
+        Read with the runtime's own extractor: message metadata first, then the
+        request-level metadata where the runtime's self-sends (the scheduler's
+        trigger lane among them) put the marker. Reading only the message
+        level missed every one of those.
         """
-        message = getattr(context, "message", None)
-        if message is None:
-            return ""
-        metadata = getattr(message, "metadata", None) or {}
-        if not isinstance(metadata, dict):
-            return ""
-        source_type = metadata.get("source_type")
-        if not isinstance(source_type, str):
-            return ""
+        source_type = _message_source_type(context)
         return source_type if source_type in _SCHEDULED_SOURCE_TYPES else ""
 
     # ------------------------------------------------------------------

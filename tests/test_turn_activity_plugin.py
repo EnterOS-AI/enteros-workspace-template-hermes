@@ -11,6 +11,7 @@ real pinned gateway in CI (gateway-live-roundtrip).
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -92,6 +93,65 @@ def test_touch_without_the_variable_writes_nothing(tmp_path, monkeypatch):
 def test_touch_never_raises(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV, str(tmp_path / "no-such-dir" / "tool_activity"))
     assert _plugin().touch_activity_file() is None
+
+
+def test_each_tool_call_rewrites_the_record_with_the_next_seq(tmp_path, monkeypatch):
+    activity = tmp_path / "tool_activity"
+    monkeypatch.setenv(ENV, str(activity))
+    plugin = _plugin()
+    plugin.touch_activity_file(
+        tool_name="terminal", args={"command": "ls"}, status="ok", duration_ms=12
+    )
+    first = json.loads(activity.read_text(encoding="utf-8"))
+    plugin.touch_activity_file(tool_name="read_file", args={"path": "/x"}, status="error")
+    second = json.loads(activity.read_text(encoding="utf-8"))
+
+    assert first["v"] == 1
+    assert (first["tool"], first["status"], first["duration_ms"]) == ("terminal", "ok", 12)
+    assert json.loads(first["args"]) == {"command": "ls"}
+    assert second["seq"] == first["seq"] + 1
+    assert second["boot"] == first["boot"]
+    assert (second["tool"], second["status"]) == ("read_file", "error")
+    # Atomic replace: no temp file is left behind, and the file stays private.
+    assert [p.name for p in tmp_path.iterdir()] == ["tool_activity"]
+    assert stat.S_IMODE(activity.stat().st_mode) & 0o077 == 0
+
+
+def test_a_new_gateway_process_gets_a_new_boot(tmp_path, monkeypatch):
+    activity = tmp_path / "tool_activity"
+    monkeypatch.setenv(ENV, str(activity))
+    _plugin().touch_activity_file(tool_name="terminal")
+    before = json.loads(activity.read_text(encoding="utf-8"))
+    _plugin().touch_activity_file(tool_name="terminal")
+    after = json.loads(activity.read_text(encoding="utf-8"))
+    assert before["boot"] != after["boot"]
+    assert after["seq"] == 1
+
+
+def test_args_are_bounded_and_odd_ones_never_raise(tmp_path, monkeypatch):
+    activity = tmp_path / "tool_activity"
+    monkeypatch.setenv(ENV, str(activity))
+    plugin = _plugin()
+    plugin.touch_activity_file(tool_name="terminal", args={"command": "x" * 10_000})
+    assert len(json.loads(activity.read_text(encoding="utf-8"))["args"]) <= 400
+    plugin.touch_activity_file(tool_name="terminal", args="raw string")
+    assert json.loads(activity.read_text(encoding="utf-8"))["args"] == "raw string"
+    assert plugin.touch_activity_file(tool_name="terminal", args={"obj": object()}) is None
+    assert plugin.touch_activity_file(tool_name=None, args=None, duration_ms="slow") is None
+    record = json.loads(activity.read_text(encoding="utf-8"))
+    assert (record["tool"], record["duration_ms"]) == ("", 0)
+
+
+def test_the_executor_reads_what_the_plugin_writes(tmp_path, monkeypatch):
+    """The record is a contract between two processes; pin both ends."""
+    import executor
+
+    activity = tmp_path / "tool_activity"
+    monkeypatch.setenv(ENV, str(activity))
+    _plugin().touch_activity_file(tool_name="terminal", args={"command": "pwd"}, status="ok")
+    record = executor._read_tool_event(str(activity))
+    assert record is not None and record["tool"] == "terminal"
+    assert executor._tool_chip_summary(record["tool"], record["args"]) == "🛠 terminal: pwd"
 
 
 # --- start.sh: enabling it ----------------------------------------------------------
