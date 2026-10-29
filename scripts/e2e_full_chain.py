@@ -36,8 +36,11 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
+import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -47,6 +50,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List
 from unittest.mock import MagicMock
 
@@ -80,6 +84,10 @@ def _wait_url(url: str, timeout_secs: float = 60.0) -> bool:
 
 
 TOOL_MARKER = "use one tool"
+# "[e2e:sleep:<seconds>:<calls>] <tag>": the stub answers with <calls> terminal
+# calls of `sleep <seconds>`, one after another, then the text "slept:<tag>".
+# That gives a turn of a known length made of real hermes tool calls.
+SLEEP_RE = re.compile(r"\[e2e:sleep:(\d+(?:\.\d+)?):(\d+)\]\s*(\S+)")
 
 
 def _tool_call_for(tools: list, probe: str) -> tuple[str, dict] | None:
@@ -116,12 +124,28 @@ async def _stub_llm_server(port: int, observed: dict):
         # Echo with a tag so we can match the trip.
         reply = f"echo[{last_user}]"
         tool_call = None
+        observed.setdefault("user_texts", []).append(last_user)
+        last_user_at = max(
+            (i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1
+        )
+        sleep = SLEEP_RE.search(last_user)
         marker_at = max(
             (i for i, m in enumerate(messages)
              if m.get("role") == "user" and TOOL_MARKER in _text(m)),
             default=-1,
         )
-        if marker_at >= 0 and body.get("tools"):
+        if sleep and body.get("tools"):
+            seconds, calls, tag = sleep.group(1), int(sleep.group(2)), sleep.group(3)
+            done = sum(1 for m in messages[last_user_at + 1:] if m.get("role") == "tool")
+            offered = {((t or {}).get("function") or {}).get("name") for t in body["tools"]}
+            if done < calls and "terminal" in offered:
+                observed.setdefault("sleeps", []).append((tag, done + 1, time.monotonic()))
+                tool_call = ("terminal", {"command": f"sleep {seconds} && echo slept-{tag}-{done + 1}"})
+            elif "terminal" not in offered:
+                reply = "no-terminal-tool"
+            else:
+                reply = f"slept:{tag}"
+        elif marker_at >= 0 and body.get("tools"):
             observed["offered"] = sorted(
                 ((t or {}).get("function") or {}).get("name") or "?" for t in body["tools"]
             )
@@ -135,8 +159,9 @@ async def _stub_llm_server(port: int, observed: dict):
                     observed["called"] = tool_call[0]
         if tool_call is not None:
             name, args = tool_call
+            observed["call_seq"] = observed.get("call_seq", 0) + 1
             calls = [{
-                "index": 0, "id": "call_e2e_1", "type": "function",
+                "index": 0, "id": f"call_e2e_{observed['call_seq']}", "type": "function",
                 "function": {"name": name, "arguments": json.dumps(args)},
             }]
             if body.get("stream"):
@@ -215,9 +240,20 @@ async def _stub_llm_server(port: int, observed: dict):
             "data": [{"id": "test-model", "object": "model"}],
         })
 
+    # Stand-ins for the two platform endpoints the executor calls on its own:
+    # /notify (late replies) and /registry/heartbeat (busy pushes).
+    async def notify(request):
+        observed.setdefault("notified", []).append(await request.json())
+        return web.json_response({"ok": True})
+
+    async def heartbeat(_request):
+        return web.json_response({"ok": True})
+
     app = web.Application()
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_get("/v1/models", models)
+    app.router.add_post("/workspaces/{workspace_id}/notify", notify)
+    app.router.add_post("/registry/heartbeat", heartbeat)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -226,7 +262,7 @@ async def _stub_llm_server(port: int, observed: dict):
     return runner, site
 
 
-def _ctx(text: str, *, task_id: str = "task-fullchain"):
+def _ctx(text: str, *, task_id: str = "task-fullchain", source_type: str | None = None):
     text_part = MagicMock()
     text_part.text = text
     text_part.kind = "text"
@@ -237,7 +273,34 @@ def _ctx(text: str, *, task_id: str = "task-fullchain"):
     ctx = MagicMock()
     ctx.task_id = task_id
     ctx.message = msg
+    if source_type:
+        # Where the runtime's own self-wakes carry it: the request metadata.
+        msg.metadata = None
+        ctx.metadata = {"source_type": source_type}
     return ctx
+
+
+class _LogTap(logging.Handler):
+    """Collects the executor's log lines so a scenario can assert on them."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.lines: List[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+    def matching(self, pattern: str) -> List[str]:
+        return [ln for ln in self.lines if re.search(pattern, ln)]
+
+
+async def _until(predicate, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.05)
+    return bool(predicate())
 
 
 class _CapturingQueue:
@@ -246,6 +309,172 @@ class _CapturingQueue:
 
     async def enqueue_event(self, event: Any) -> None:
         self.events.append(event)
+
+
+def _texts(queue: "_CapturingQueue") -> List[str]:
+    return ["".join(p.text for p in e.parts if getattr(p, "text", None)) for e in queue.events]
+
+
+async def _turn_supervision_scenarios(
+    executor, executor_mod, heartbeat, tap, chips, observed, proc, platform_url
+) -> str | None:
+    """Turn supervision against the real gateway. Returns a failure, or None.
+
+    Each scenario is a production failure from 2026-10-29 (jrs) or an open
+    issue, replayed through the pinned hermes with a stub model whose turns
+    are real terminal calls of known length.
+    """
+    from molecule_runtime.runtime_inbox import any_turn_in_flight
+
+    os.environ["PLATFORM_URL"] = platform_url
+
+    def policy(**changes):
+        executor._turn_policy = dataclasses.replace(
+            executor._turn_policy, poll_seconds=0.2, control_seconds=15.0, **changes
+        )
+
+    def sleeps(tag):
+        return [s for s in observed.get("sleeps", []) if s[0] == tag]
+
+    def idle():
+        return heartbeat.active_tasks == 0 and not any_turn_in_flight()
+
+    # A. One 12 s tool call against an 8 s stall window. Nothing touches the
+    # activity file until the call returns, so only the gateway's own
+    # "still working" sends can keep the turn alive. The old executor gave up
+    # on every turn at 600 s whatever it was doing.
+    policy(stall_seconds=8.0, max_seconds=0.0)
+    long_q = _CapturingQueue()
+    started = time.monotonic()
+    long_turn = asyncio.create_task(
+        executor.execute(_ctx("[e2e:sleep:12:1] long", task_id="t-long"), long_q)
+    )
+    if not await _until(lambda: sleeps("long"), 30):
+        return f"the stub never got the long turn's tool request: offered={observed.get('offered')!r}"
+    if not await _until(lambda: heartbeat.active_tasks == 1 and any_turn_in_flight(), 5):
+        return (f"busy not reported during the turn: active_tasks={heartbeat.active_tasks} "
+                f"in_flight={any_turn_in_flight()}")
+    print("OK: busy reported while the turn runs (active_tasks=1, is_busy)")
+
+    # B. A routine self-wake that lands mid-turn is fast-acked and dropped.
+    # Production queued 32 of these behind one turn and ran them for hours.
+    wake_q = _CapturingQueue()
+    wake_at = time.monotonic()
+    await asyncio.wait_for(
+        executor.execute(
+            _ctx("<SYSTEM IDLE PROMPT> e2e-wake", task_id="t-wake", source_type="self-idle"),
+            wake_q,
+        ),
+        5,
+    )
+    if _texts(wake_q) != [executor_mod._SELF_PING_SKIPPED]:
+        return f"a self-idle wake during a turn was not fast-acked: {_texts(wake_q)!r}"
+    print(f"OK: a self-idle wake during the turn was fast-acked in {time.monotonic() - wake_at:.2f}s")
+
+    try:
+        await asyncio.wait_for(long_turn, 60)
+    except asyncio.TimeoutError:
+        return "the 12 s turn did not finish within 60 s"
+    elapsed = time.monotonic() - started
+    if _texts(long_q) != ["slept:long"]:
+        return f"long turn answer: {_texts(long_q)!r}"
+    if elapsed < 11:
+        return f"the long turn finished too fast to prove anything ({elapsed:.1f}s)"
+    progress = [
+        int(m.group(1))
+        for m in (re.search(r"\((\d+) progress sends\)", ln) for ln in tap.lines)
+        if m
+    ]
+    if not progress or progress[-1] < 1:
+        return f"no gateway progress sends reached the executor during a {elapsed:.0f}s turn"
+    if any("e2e-wake" in text for text in observed.get("user_texts", [])):
+        return "the dropped self-wake reached the model anyway"
+    if not any(name == "terminal" and "sleep 12" in (summary or "") for name, summary, _ in chips):
+        return f"the gateway's tool call never became an activity row: {chips!r}"
+    if not await _until(idle, 5):
+        return f"busy not released after the turn: active_tasks={heartbeat.active_tasks}"
+    print(
+        f"OK: a single 12 s tool call outlived the 8 s stall window ({elapsed:.1f}s, "
+        f"{progress[-1]} progress sends); its tool call became an activity row; busy released"
+    )
+
+    # C. hermes#393: a message queued behind a running turn gets its own answer.
+    policy(stall_seconds=30.0, max_seconds=0.0)
+    x_q, y_q = _CapturingQueue(), _CapturingQueue()
+    x = asyncio.create_task(executor.execute(_ctx("[e2e:sleep:4:1] X", task_id="t-x"), x_q))
+    if not await _until(lambda: sleeps("X"), 30):
+        return "X's tool call never started"
+    y = asyncio.create_task(executor.execute(_ctx("reply with Y-OK", task_id="t-y"), y_q))
+    try:
+        await asyncio.wait_for(asyncio.gather(x, y), 60)
+    except asyncio.TimeoutError:
+        return f"X/Y did not both finish: X={_texts(x_q)!r} Y={_texts(y_q)!r}"
+    if _texts(x_q) != ["slept:X"] or _texts(y_q) != ["echo[reply with Y-OK]"]:
+        return f"queued message answers misrouted: X={_texts(x_q)!r} Y={_texts(y_q)!r}"
+    print(
+        "OK: a message queued behind a running turn got its own answer "
+        f"({len(tap.matching('re-correlated'))} misanchored send(s) re-correlated)"
+    )
+
+    # D. The turn cap ends a real run: /stop, no more tool calls, the gateway
+    # free for the next message at once.
+    policy(stall_seconds=30.0, max_seconds=4.0)
+    cap_q = _CapturingQueue()
+    try:
+        await asyncio.wait_for(
+            executor.execute(_ctx("[e2e:sleep:3:10] capped", task_id="t-cap"), cap_q), 30
+        )
+    except asyncio.TimeoutError:
+        return "the turn cap did not end a 30 s turn"
+    if len(_texts(cap_q)) != 1 or "turn cap" not in _texts(cap_q)[0]:
+        return f"capped turn answer: {_texts(cap_q)!r}"
+    if not await _until(lambda: tap.matching(r"/stop on .* answered"), 20):
+        return "the gateway never answered /stop"
+    calls_at_stop = len(sleeps("capped"))
+    await asyncio.sleep(8)
+    if len(sleeps("capped")) > calls_at_stop + 1:  # the call in flight may still complete
+        return f"the capped run kept calling tools after /stop: {sleeps('capped')!r}"
+    policy(stall_seconds=30.0, max_seconds=0.0)
+    after_q = _CapturingQueue()
+    after_at = time.monotonic()
+    try:
+        await asyncio.wait_for(executor.execute(_ctx("after cap", task_id="t-after"), after_q), 20)
+    except asyncio.TimeoutError:
+        return "the gateway was still busy after /stop"
+    if _texts(after_q) != ["echo[after cap]"]:
+        return f"message after the cap: {_texts(after_q)!r}"
+    if not await _until(idle, 5):
+        return "busy not released after the capped turn"
+    print(
+        "OK: the turn cap sent /stop, the run made no further tool calls, and the next "
+        f"message was answered in {time.monotonic() - after_at:.1f}s"
+    )
+
+    # E. A gateway that dies mid-turn: the turn is abandoned one stall window later.
+    policy(stall_seconds=4.0, max_seconds=0.0)
+    doomed_q = _CapturingQueue()
+    doomed = asyncio.create_task(
+        executor.execute(_ctx("[e2e:sleep:30:1] doomed", task_id="t-doomed"), doomed_q)
+    )
+    if not await _until(lambda: sleeps("doomed"), 30):
+        return "the doomed turn never started"
+    proc.kill()
+    proc.wait(timeout=10)
+    killed_at = time.monotonic()
+    try:
+        await asyncio.wait_for(doomed, 30)
+    except asyncio.TimeoutError:
+        return "a turn on a dead gateway was never abandoned"
+    waited = time.monotonic() - killed_at
+    if len(_texts(doomed_q)) != 1 or "no activity from the hermes gateway" not in _texts(doomed_q)[0]:
+        return f"dead-gateway turn answer: {_texts(doomed_q)!r}"
+    if not await _until(idle, 5):
+        return "busy not released after the dead-gateway turn"
+    print(f"OK: a turn on a killed gateway was abandoned {waited:.1f}s after the kill (stall window 4 s)")
+    late = observed.get("notified", [])
+    if late:
+        print(f"     late replies relayed to /notify during the run: {[n.get('message', '')[:60] for n in late]!r}")
+    return None
 
 
 async def _amain() -> int:
@@ -293,6 +522,9 @@ async def _amain() -> int:
     os.utime(activity, (stale, stale))
     os.environ["MOLECULE_TOOL_ACTIVITY_FILE"] = str(activity)
     os.environ["MOLECULE_TOOL_ACTIVITY_POLL_SECONDS"] = "0.2"
+    # The gateway's "still working" notice, the executor's liveness signal
+    # inside one long tool call. start.sh sets 60 s; 2 s keeps this run short.
+    os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = "2"
     (hermes_home / "config.yaml").write_text(
         "model:\n"
         "  default: \"test-model\"\n"
@@ -353,10 +585,22 @@ async def _amain() -> int:
         # DIFFERENT session and the "same-session" claim below would be vacuous.
         os.environ["WORKSPACE_ID"] = "ws-e2e-fullchain"
 
+        import executor as executor_mod
         from executor import HermesAgentProxyExecutor
         from molecule_runtime.adapters.base import AdapterConfig
 
-        cfg = AdapterConfig(model="test-model", system_prompt="be terse")
+        # The runtime's heartbeat object, so the busy accounting is observable.
+        heartbeat = SimpleNamespace(active_tasks=0, current_task="")
+        cfg = AdapterConfig(model="test-model", system_prompt="be terse", heartbeat=heartbeat)
+        tap = _LogTap()
+        logging.getLogger("executor").addHandler(tap)
+        logging.getLogger("executor").setLevel(logging.INFO)
+        chips: List[tuple] = []
+
+        async def _record_chip(name, summary=None, status="ok"):
+            chips.append((name, summary, status))
+
+        executor_mod.emit_tool_call = _record_chip
         executor = HermesAgentProxyExecutor(cfg)
         await executor.start()
         print(f"OK: executor reply server up on http://127.0.0.1:{cb_port}/a2a/reply")
@@ -483,6 +727,19 @@ async def _amain() -> int:
             "the runtime turn lease"
         )
 
+        failure = await _turn_supervision_scenarios(
+            executor, executor_mod, heartbeat, tap, chips, observed, proc,
+            f"http://127.0.0.1:{llm_port}",
+        )
+        if failure:
+            log_file.seek(0)
+            print(f"FAIL: {failure}")
+            print("Gateway log tail:")
+            print(log_file.read()[-6000:])
+            print("Executor log tail:")
+            print("\n".join(tap.lines[-80:]))
+            return 1
+
     finally:
         if executor is not None:
             await executor.stop()
@@ -502,6 +759,9 @@ async def _amain() -> int:
     print("  → stub LLM /v1/chat/completions → hermes plugin send()")
     print("  → executor reply server → execute() emits on event_queue")
     print("  + hermes tool call → molecule_turn_activity → runtime turn lease")
+    print("  + turn supervision: busy for the whole turn, a 12 s tool call past an 8 s")
+    print("    stall window, self-wakes dropped mid-turn, queued replies routed (#393),")
+    print("    the cap's /stop ending a real run, a killed gateway abandoned")
     return 0
 
 

@@ -1238,4 +1238,5 @@ jobs:
           tests/test_mcp_bare_python_pin.py
           tests/test_start_sh_tmpdir.py
           tests/test_turn_activity_plugin.py
+          tests/test_turn_supervision.py
           -v

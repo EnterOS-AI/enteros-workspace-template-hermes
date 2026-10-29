@@ -537,8 +537,8 @@ async def test_execute_handles_inbound_post_failure(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_execute_handles_reply_timeout(monkeypatch):
-    """Inbound POST succeeds but no reply comes — execute() emits a
-    timeout message after the configured deadline."""
+    """Inbound POST succeeds but no reply and no other sign of life comes —
+    execute() emits a timeout message once the stall window passes."""
 
     plugin_port = _free_port()
 
@@ -553,14 +553,14 @@ async def test_execute_handles_reply_timeout(monkeypatch):
     plugin_site = web.TCPSite(plugin_runner, "127.0.0.1", plugin_port)
     await plugin_site.start()
 
-    # Patch the timeout so the test runs in <1s instead of 600s.
-    import executor as ex_mod
-    monkeypatch.setattr(ex_mod, "_PLUGIN_REPLY_TIMEOUT", 0.5)
-
+    # A short stall window so the test runs in under a second.
     ex = _make_executor(
         monkeypatch,
         MOLECULE_A2A_PLATFORM_PORT=str(plugin_port),
         MOLECULE_A2A_CALLBACK_PORT=str(_free_port()),
+        HERMES_TURN_STALL_SECONDS="0.5",
+        HERMES_TURN_POLL_SECONDS="0.05",
+        HERMES_CONTROL_REPLY_SECONDS="0.2",
     )
     queue = _CapturingQueue()
     try:

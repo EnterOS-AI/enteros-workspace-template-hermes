@@ -1,8 +1,9 @@
 name: molecule_turn_activity
-version: "1.0.0"
+version: "1.1.0"
 description: >-
-  Touches MOLECULE_TOOL_ACTIVITY_FILE after every tool call so the Molecule
-  runtime's turn lease sees the gateway working.
+  Rewrites MOLECULE_TOOL_ACTIVITY_FILE with the latest tool event after every
+  tool call, so the Molecule runtime's turn lease sees the gateway working and
+  the executor can report each tool call to the platform.
 kind: standalone
 provides_hooks:
   - post_tool_call

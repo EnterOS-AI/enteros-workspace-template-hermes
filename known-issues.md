@@ -44,6 +44,9 @@ Molecule image boots through `Dockerfile` and `start.sh`.
 
 ## Timeouts
 
-The bridge request timeout is a code constant in `executor.py`; there is no
-documented runtime environment override. Change it only with tests and a pull
-request.
+On the plugin transport (the image default) a turn has no fixed timeout. It
+ends when Hermes answers it, when the gateway shows no sign of life for the
+stall window, or at the turn cap, which sends Hermes' `/stop`. The workspace
+reports busy for as long as a turn runs. See "Turn supervision" in
+`docs/CONFIGURATION.md` for the knobs and what a caller sees. The
+chat-completions fallback keeps its fixed request timeout in `executor.py`.
