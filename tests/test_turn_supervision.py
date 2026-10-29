@@ -49,7 +49,10 @@ async def _until(predicate, timeout: float = 5.0) -> bool:
     return bool(predicate())
 
 
-def _ctx(text: str, *, source_type: Optional[str] = None, peer_id: Optional[str] = None):
+def _ctx(
+    text: str, *, source_type: Optional[str] = None, peer_id: Optional[str] = None,
+    message_meta: Optional[dict] = None, request_meta: Optional[dict] = None,
+):
     """A RequestContext stub. ``source_type`` goes where the runtime's own
     self-wakes put it: the request-level metadata, not the message's."""
     part = MagicMock()
@@ -59,13 +62,13 @@ def _ctx(text: str, *, source_type: Optional[str] = None, peer_id: Optional[str]
     msg.task_id = "task"
     msg.message = None  # read the parts off this object (see test_executor_plugin_path)
     msg.parts = [part]
-    msg.metadata = {"peer_id": peer_id} if peer_id else None
+    msg.metadata = dict(message_meta or {}, **({"peer_id": peer_id} if peer_id else {})) or None
     ctx = MagicMock()
     ctx.task_id = "task"
     ctx.session_id = None
     ctx.context_id = None
     ctx.message = msg
-    ctx.metadata = {"source_type": source_type} if source_type else None
+    ctx.metadata = dict(request_meta or {}, **({"source_type": source_type} if source_type else {})) or None
     return ctx
 
 
@@ -96,12 +99,15 @@ class FakeGateway:
         self.callback_url: Optional[str] = None
         self.answer_stop = answer_stop
         self.refuse: set = set()
+        self.healthy = True
+        self.post_delay = 0.0  # seconds before /a2a/inbound answers
         self._runner: Optional[web.AppRunner] = None
         self._tasks: List[asyncio.Task] = []
 
     async def start(self) -> None:
         app = web.Application()
         app.router.add_post("/a2a/inbound", self._handle)
+        app.router.add_get("/a2a/health", self._health)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         await web.TCPSite(self._runner, "127.0.0.1", self.port).start()
@@ -111,6 +117,9 @@ class FakeGateway:
             task.cancel()
         if self._runner is not None:
             await self._runner.cleanup()
+
+    async def _health(self, _request: web.Request) -> web.Response:
+        return web.json_response({"ok": self.healthy}, status=200 if self.healthy else 503)
 
     async def _handle(self, request: web.Request) -> web.Response:
         body = await request.json()
@@ -122,6 +131,8 @@ class FakeGateway:
             self._tasks.append(asyncio.create_task(
                 self.send("⚡ Stopped.", reply_to=body["message_id"])
             ))
+        if self.post_delay:
+            await asyncio.sleep(self.post_delay)
         return web.json_response({"ok": True, "queued": True})
 
     def contents(self) -> List[str]:
@@ -187,6 +198,8 @@ def _clean_runtime_state(monkeypatch):
         "MOLECULE_MAX_TURN_SECONDS", "HERMES_TURN_STALL_SECONDS",
         "HERMES_TURN_MAX_SECONDS", "HERMES_TURN_REPLY_DEADLINE_SECONDS",
         "HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS", "HERMES_TURN_QUEUE_MAX",
+        "HERMES_AGENT_NOTIFY_INTERVAL", "HERMES_TURN_SETTLE_SECONDS",
+        "HERMES_SESSION_IDLE_MINUTES", "HERMES_SESSION_RESET_HOUR",
     ):
         monkeypatch.delenv(name, raising=False)
     get_inbox().reset_for_tests()
@@ -248,6 +261,17 @@ def test_policy_defaults_follow_the_runtime_turn_lease(monkeypatch):
     policy = executor_mod.TurnSupervisionPolicy.from_env()
     assert (policy.stall_seconds, policy.max_seconds) == (45.0, 0.0)
     assert (policy.reply_deadline_seconds, policy.queue_max) == (0.0, 4)
+
+
+def test_the_settle_window_follows_the_still_working_notice(monkeypatch):
+    # Two notices missed in a row; hermes' own default interval is 180 s.
+    assert executor_mod.TurnSupervisionPolicy.from_env().settle_seconds == 370.0
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "60")  # what start.sh sets
+    assert executor_mod.TurnSupervisionPolicy.from_env().settle_seconds == 130.0
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")  # no notice, no settling
+    assert executor_mod.TurnSupervisionPolicy.from_env().settle_seconds == 0.0
+    monkeypatch.setenv("HERMES_TURN_SETTLE_SECONDS", "45")
+    assert executor_mod.TurnSupervisionPolicy.from_env().settle_seconds == 45.0
 
 
 def test_bad_knob_values_fall_back_to_defaults(monkeypatch, caplog):
@@ -1052,6 +1076,353 @@ async def test_each_new_tool_event_becomes_one_activity_row(monkeypatch, tmp_pat
         os.utime(activity, (stamp + 5, stamp + 5))
         await asyncio.sleep(0.1)
         assert len(emitted) == 3
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+# --- who is waiting, and until when ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_only_the_runtimes_short_fuse_wakes_get_the_self_deadline(monkeypatch):
+    """The platform's first-boot greeting shows the reply text and falls back on
+    its own after 90 s; an interim reply there would become the greeting."""
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS="0.3")
+    await ex.start()
+    try:
+        greet = _Queue()
+        greeting = asyncio.create_task(
+            ex.execute(_ctx("say hello", source_type="self-first-boot-greet"), greet)
+        )
+        await _dispatched(gateway, "say hello")
+        await asyncio.sleep(0.6)
+        assert not greeting.done(), greet.texts()
+        await gateway.answer("say hello", "Hi, I'm your agent.")
+        await asyncio.wait_for(greeting, 5)
+        assert greet.texts() == ["Hi, I'm your agent."]
+        assert await _until(lambda: ex._turns == {})
+
+        for source_type in ("self-lifecycle", "self-harvester", "self-idle"):
+            wake = _Queue()
+            started = time.monotonic()
+            await asyncio.wait_for(
+                ex.execute(_ctx(f"wake {source_type}", source_type=source_type), wake), 3
+            )
+            assert 0.3 <= time.monotonic() - started < 2, source_type
+            assert wake.texts()[0].startswith("[autonomous turn still running after 0.3s"), wake.texts()
+            await gateway.answer(f"wake {source_type}", "ok")
+            assert await _until(lambda: ex._turns == {})
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_the_reply_deadline_covers_every_dispatch_of_a_turn(monkeypatch):
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_TURN_REPLY_DEADLINE_SECONDS="0.6")
+    await ex.start()
+    try:
+        queue = _Queue()
+        started = time.monotonic()
+        turn = asyncio.create_task(ex.execute(_ctx("summarise everything"), queue))
+        await _dispatched(gateway, "summarise everything")
+        await asyncio.sleep(0.4)
+        # The gateway's ambiguous overflow fallback earns one replay on the same session.
+        await gateway.answer(
+            "summarise everything", "Sorry, this is too long for me to read all at once."
+        )
+        assert await _until(lambda: gateway.contents().count("summarise everything") == 2)
+        await asyncio.wait_for(turn, 3)
+        elapsed = time.monotonic() - started
+        assert queue.texts()[0].startswith("[hermes is still working on this after 0.6s"), queue.texts()
+        assert elapsed < 0.95, f"the replay got a deadline of its own ({elapsed:.2f}s)"
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_scheduled_reset_waits_for_a_turn_that_starts_alone(monkeypatch):
+    """A /new for a message that arrives while another one runs would wait
+    behind it, past the new message's own deadline."""
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(
+        monkeypatch, gateway,
+        HERMES_SESSION_RESET_MODE="daily", HERMES_TURN_REPLY_DEADLINE_SECONDS="0.5",
+    )
+    await ex.start()
+    try:
+        # A outlives its caller's deadline and keeps the gateway.
+        await asyncio.wait_for(ex.execute(_ctx("A"), _Queue()), 3)
+        ex._session_clock._started[CHAT] = time.time() - 2 * 86400  # a boundary has passed
+        await asyncio.wait_for(ex.execute(_ctx("B"), _Queue()), 3)
+        assert gateway.contents() == ["A"]
+        await gateway.answer("A", "A done")
+        await _dispatched(gateway, "B")
+        await gateway.answer("B", "B done")
+        assert await _until(lambda: ex._turns == {})
+        assert "/new" not in gateway.contents()
+
+        # The boundary is still there for the next turn that starts alone.
+        c = asyncio.create_task(ex.execute(_ctx("C"), _Queue()))
+        await _dispatched(gateway, "/new")
+        await gateway.answer("/new", "Session reset.")
+        await _dispatched(gateway, "C")
+        await gateway.answer("C", "C done")
+        await asyncio.wait_for(c, 3)
+        assert gateway.contents() == ["A", "B", "/new", "C"]
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_persons_stop_ends_only_the_turn_it_was_sent_for(monkeypatch):
+    gateway = FakeGateway(answer_stop=False)
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        first, second = _Queue(), _Queue()
+        m1 = asyncio.create_task(ex.execute(_ctx("M1"), first))
+        await _dispatched(gateway, "M1")
+        m2 = asyncio.create_task(ex.execute(_ctx("M2"), second))
+        stopping = asyncio.create_task(ex.execute(_ctx("/stop"), _Queue()))
+        await _dispatched(gateway, "/stop")
+        # M1 finishes before hermes gets to the /stop; M2 goes out.
+        await gateway.answer("M1", "M1 done")
+        await asyncio.wait_for(m1, 3)
+        await _dispatched(gateway, "M2")
+        await gateway.answer("/stop", "⚡ Stopped.")
+        await asyncio.wait_for(stopping, 3)
+        await asyncio.sleep(0.1)
+        assert not m2.done(), second.texts()
+        await gateway.answer("M2", "M2 done")
+        await asyncio.wait_for(m2, 3)
+        assert (first.texts(), second.texts()) == (["M1 done"], ["M2 done"])
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_post_that_times_out_counts_as_delivered(monkeypatch):
+    """The plugin may already have the message; treating it as refused would
+    let the next one land behind it."""
+    monkeypatch.setattr(executor_mod, "_INBOUND_POST_TIMEOUT", 0.2)
+    gateway = FakeGateway()
+    gateway.post_delay = 0.6
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        first, second = _Queue(), _Queue()
+        a = asyncio.create_task(ex.execute(_ctx("slow to accept"), first))
+        mid = await _dispatched(gateway, "slow to accept")
+        b = asyncio.create_task(ex.execute(_ctx("next"), second))
+        await asyncio.sleep(0.5)
+        assert not a.done(), first.texts()
+        assert "next" not in gateway.contents()
+        gateway.post_delay = 0.0
+        await gateway.send("accepted after all", reply_to=mid)
+        await asyncio.wait_for(a, 3)
+        assert first.texts() == ["accepted after all"]
+        await _dispatched(gateway, "next")
+        await gateway.answer("next", "ok")
+        await asyncio.wait_for(b, 3)
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_async_delegations_and_channel_turns_are_told_apart(monkeypatch):
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(monkeypatch, gateway, HERMES_TURN_REPLY_DEADLINE_SECONDS="0.3")
+    await ex.start()
+    try:
+        # The platform's async delegation; it keeps the reply as the delegator's result.
+        delegated = _Queue()
+        await asyncio.wait_for(
+            ex.execute(_ctx("audit the sitemap", message_meta={"delegation_id": "d-1"}), delegated), 3
+        )
+        assert "cannot be returned to this request" in delegated.texts()[0]
+        assert await gateway.answer("audit the sitemap", "Sitemap is fine.") == (
+            200, {"ok": True, "stale": True}
+        )
+        assert platform.notified == []
+        assert await _until(lambda: ex._turns == {})
+
+        # A channel plugin's turn: the runtime stamps the plugin's id as the source.
+        channel = _Queue()
+        await asyncio.wait_for(
+            ex.execute(_ctx("status?", request_meta={"source": "telegram"}), channel), 3
+        )
+        assert "workspace's own chat" in channel.texts()[0]
+        assert await gateway.answer("status?", "All green.") == (
+            200, {"ok": True, "stale": True, "relayed": True}
+        )
+        assert platform.notified == [{"message": "All green."}]
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
+
+
+# --- finals hermes sends without an anchor ----------------------------------------
+# hermes marks every final notify; a run it starts itself (a background job
+# finishing) has no anchor, and neither does one of ours that it ran inside such
+# a run.
+
+
+def _final(**extra) -> dict:
+    return {"notify": True, **extra}
+
+
+async def _one_turn(ex, gateway, text="warm up") -> None:
+    turn = asyncio.create_task(ex.execute(_ctx(text), _Queue()))
+    await _dispatched(gateway, text)
+    await gateway.answer(text, "ok")
+    await asyncio.wait_for(turn, 3)
+    assert await _until(lambda: ex._turns == {})
+
+
+@pytest.mark.asyncio
+async def test_a_final_with_no_anchor_and_nothing_running_reaches_the_chat(monkeypatch):
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        await _one_turn(ex, gateway)
+        done = "The build finished: 0 errors."
+        assert await gateway.send(done, metadata=_final()) == (200, {"ok": True, "relayed": True})
+        assert platform.notified == [{"message": done}]
+        # hermes resends a send it got no 2xx for; the same text at once is that resend.
+        assert await gateway.send(done, metadata=_final()) == (200, {"ok": True, "relayed": False})
+        # A mid-run send is progress whatever else it carries; "(idle)" is housekeeping.
+        assert await gateway.send("⏳ Working", metadata=_final(_interim_send=True)) == (
+            200, {"ok": True, "progress": True}
+        )
+        assert await gateway.send("(idle)", metadata=_final()) == (200, {"ok": True, "relayed": False})
+        assert platform.notified == [{"message": done}]
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
+
+
+@pytest.mark.asyncio
+async def test_a_final_with_no_anchor_is_held_while_a_turn_runs(monkeypatch):
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        queue = _Queue()
+        running = asyncio.create_task(ex.execute(_ctx("ask"), queue))
+        mid = await _dispatched(gateway, "ask")
+        assert await gateway.send("A background job is done.", metadata=_final()) == (
+            200, {"ok": True, "held": True}
+        )
+        assert platform.notified == []
+        await gateway.send("the answer", reply_to=mid)
+        await asyncio.wait_for(running, 3)
+        assert queue.texts() == ["the answer"]
+        assert await _until(lambda: platform.notified == [{"message": "A background job is done."}])
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_hermes_ran_inside_its_own_run_gets_its_answer(monkeypatch):
+    """Our message landed while hermes ran a turn it started itself: hermes
+    answers that run, then ours, both under the run's anchor, which is none."""
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(monkeypatch, gateway, HERMES_TURN_SETTLE_SECONDS="0.3")
+    await ex.start()
+    try:
+        queue = _Queue()
+        running = asyncio.create_task(ex.execute(_ctx("what changed?"), queue))
+        await _dispatched(gateway, "what changed?")
+        await gateway.send("The nightly job finished.", metadata=_final())
+        await gateway.send("Two pages changed.", metadata=_final())
+        await asyncio.wait_for(running, 3)
+        assert queue.texts() == ["Two pages changed."]
+        assert await _until(lambda: platform.notified == [{"message": "The nightly job finished."}])
+        assert await _until(lambda: ex._turns == {})
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_hermes_ended_silently_is_settled_once_the_gateway_is_idle(monkeypatch):
+    """hermes drops a final that is only a silence marker on these internal
+    turns; the chat must not wait out the stall window for it."""
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_TURN_SETTLE_SECONDS="0.3")
+    await ex.start()
+    try:
+        first, second = _Queue(), _Queue()
+        started = time.monotonic()
+        silent = asyncio.create_task(ex.execute(_ctx("anything new?"), first))
+        await _dispatched(gateway, "anything new?")
+        following = asyncio.create_task(ex.execute(_ctx("next"), second))
+        await asyncio.wait_for(silent, 3)
+        assert first.texts() == [executor_mod._NO_RESPONSE]
+        assert 0.3 <= time.monotonic() - started < 2
+        await _dispatched(gateway, "next")
+        await gateway.answer("next", "ok")
+        await asyncio.wait_for(following, 3)
+        assert "/stop" not in gateway.contents()
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_turn_on_a_gateway_that_does_not_answer_waits_for_the_stall(monkeypatch):
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(
+        monkeypatch, gateway,
+        HERMES_TURN_SETTLE_SECONDS="0.2", HERMES_TURN_STALL_SECONDS="1.0",
+    )
+    await ex.start()
+    try:
+        queue = _Queue()
+        turn = asyncio.create_task(ex.execute(_ctx("hello?"), queue))
+        await _dispatched(gateway, "hello?")
+        gateway.healthy = False
+        await asyncio.sleep(0.6)
+        assert not turn.done(), queue.texts()
+        await asyncio.wait_for(turn, 3)
+        assert "no activity from the hermes gateway for 1s" in queue.texts()[0]
     finally:
         await ex.stop()
         await gateway.close()

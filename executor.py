@@ -60,7 +60,7 @@ import socket
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
@@ -151,9 +151,10 @@ SECRET_HEADER = "X-Molecule-A2A-Secret"
 # Three clocks bound a turn:
 # * reply deadline: the caller is answered before its own request gives up.
 #   The platform abandons an A2A request at 30 minutes and then queues it to be
-#   delivered again, which would run the work twice; the runtime's self-wakes
-#   time out sooner (the delegation harvester at 120 s, the idle digest at
-#   300 s). At the deadline the caller gets an interim reply and the turn's
+#   delivered again, which would run the work twice; some callers give up
+#   sooner (_SHORT_FUSE_SELF_SOURCE_TYPES, _CHANNEL_REPLY_DEADLINE_SECONDS). The
+#   clock starts when execute() gets the message and covers every dispatch the
+#   turn makes. At the deadline the caller gets an interim reply and the turn's
 #   answer is delivered later, where its origin belongs (_deliver_late).
 # * stall: no sign of life from the gateway for HERMES_TURN_STALL_SECONDS. A
 #   live run is never that quiet: it sends interim text, a "still working"
@@ -162,6 +163,16 @@ SECRET_HEADER = "X-Molecule-A2A-Secret"
 #   with a crashed or wedged gateway.
 # * cap: the running turn has gone on for HERMES_TURN_MAX_SECONDS (0 = no cap);
 #   the executor sends hermes' /stop.
+#
+# A turn can also end in hermes with nothing sent under its id: hermes drops a
+# final that is only a silence marker ([SILENT], NO_REPLY) on these internal
+# turns, and a message that ran inside a run hermes started itself (a
+# background job finishing) is answered under that run's anchor, which is none.
+# Such finals arrive with no reply_to and are held for the running turn. Once
+# the gateway has been quiet for HERMES_TURN_SETTLE_SECONDS while its health
+# check still answers, no run is going (a live one sends "still working" every
+# HERMES_AGENT_NOTIFY_INTERVAL), and the turn is settled with the last held
+# final, or with _NO_RESPONSE.
 #
 # Stall and cap default to the runtime's turn-lease bounds
 # (MOLECULE_TURN_LEASE_TTL_SECONDS / A2A_COMPLETION_IDLE_TIMEOUT_SECONDS, and
@@ -174,10 +185,35 @@ _DEFAULT_SELF_REPLY_DEADLINE_SECONDS = 60.0
 _DEFAULT_TURN_POLL_SECONDS = 1.0
 _DEFAULT_CONTROL_REPLY_SECONDS = 120.0
 _DEFAULT_QUEUE_MAX = 32
+# hermes' own default for HERMES_AGENT_NOTIFY_INTERVAL (start.sh sets 60).
+_HERMES_NOTIFY_INTERVAL_DEFAULT = 180.0
 # A long turn with no tool calls reports "still working" at most this often:
 # the platform's stall watchdog probes a busy workspace after 12 minutes
 # without activity and restarts it 5 minutes later.
 _PROGRESS_ROW_SECONDS = 240.0
+# How long the POST that hands a message to the plugin may take. The plugin
+# answers it before the run starts, so a slow answer is a busy gateway, not a
+# refusal (see _post_inbound).
+_INBOUND_POST_TIMEOUT = 10.0
+
+# Which caller gets which reply deadline. The runtime's own wakes below give up
+# within minutes and never show the reply text to anyone: the delegation
+# harvester after 120 s, the idle digest after 300 s (its forwarder drops the
+# interim text), the lifecycle prompt after 600 s (it retries on a timeout and
+# discards the reply). They get the short self-turn deadline. Every other
+# self-wake keeps the regular one: the platform's first-boot greeting shows the
+# reply text and falls back on its own after 90 s, and the scheduler's trigger
+# lane waits for the real answer.
+_SHORT_FUSE_SELF_SOURCE_TYPES = frozenset({"self-harvester", "self-idle", "self-lifecycle"})
+# A channel plugin's inbound turn (channel_sdk.send_channel_message) waits
+# 600 s and is never replayed.
+_CHANNEL_REPLY_DEADLINE_SECONDS = 540.0
+# What a caller gets when hermes ends its turn without an answer under its id:
+# the runtime's own empty-reply sentinel, which the idle digest never shows.
+_NO_RESPONSE = "(no response generated)"
+# A retried send of the same unanchored text arrives within seconds; the same
+# text later is a new message.
+_UNANCHORED_DEDUP_SECONDS = 120.0
 
 # Fast-ack for a routine self-wake that arrives while a turn runs. The
 # "[autonomous " prefix is the one the idle digest's reply forwarder suppresses,
@@ -569,17 +605,18 @@ class _SessionResetClock:
         self._finished: Dict[str, float] = {}
         self._in_flight: Dict[str, int] = {}
 
-    def begin(self, chat_id: str) -> Optional[str]:
+    def begin(self, chat_id: str, busy: bool = False) -> Optional[str]:
         """Record a turn start; return the reset reason if one is due first.
 
-        A turn that overlaps one already in flight on the chat is never reset
-        (/new would interrupt the running turn) and does not move the start
-        clock, so the next turn that starts alone still sees the boundary.
-        Synchronous on purpose: two deliveries racing on the event loop cannot
-        both see the chat idle.
+        A turn that overlaps one already in flight on the chat, or that the
+        caller says is not alone (``busy``: the executor still has a message
+        running or waiting there), is never reset, since /new would interrupt or
+        wait behind that message, and does not move the start clock, so the next
+        turn that starts alone still sees the boundary. Synchronous on purpose:
+        two deliveries racing on the event loop cannot both see the chat idle.
         """
-        if self._in_flight.get(chat_id):
-            self._in_flight[chat_id] += 1
+        if busy or self._in_flight.get(chat_id):
+            self._in_flight[chat_id] = self._in_flight.get(chat_id, 0) + 1
             return None
         now = self._clock()
         reason = self.policy.reset_reason(
@@ -645,12 +682,21 @@ class TurnSupervisionPolicy:
     control_seconds: float = _DEFAULT_CONTROL_REPLY_SECONDS
     queue_max: int = _DEFAULT_QUEUE_MAX
     drop_self_pings: bool = True
+    # 0 = never settle a quiet turn early; the stall window still applies.
+    settle_seconds: float = 0.0
 
     @classmethod
     def from_env(cls) -> "TurnSupervisionPolicy":
         """Read the HERMES_TURN_* knobs. A bad value is logged and the default used."""
         stall, cap = _runtime_turn_defaults()
+        # Two still-working notices missed in a row: a live run sends one every
+        # interval, so no run is going. Off when the notice is off.
+        notify = _float_env_or_warn(
+            "HERMES_AGENT_NOTIFY_INTERVAL", _HERMES_NOTIFY_INTERVAL_DEFAULT, 0.0, None
+        )
+        settle = 2 * notify + 10 if notify > 0 else 0.0
         return cls(
+            settle_seconds=_float_env_or_warn("HERMES_TURN_SETTLE_SECONDS", settle, 0.0, None),
             stall_seconds=_float_env_or_warn("HERMES_TURN_STALL_SECONDS", stall, 0.01, None),
             max_seconds=_float_env_or_warn("HERMES_TURN_MAX_SECONDS", cap, 0.0, None),
             reply_deadline_seconds=_float_env_or_warn(
@@ -675,10 +721,22 @@ class HermesTurnAbandoned(RuntimeError):
     """The executor stopped waiting for a turn; ``str()`` is the reply text."""
 
 
-# (origin, raw source_type, brief) of the turn whose dispatches are running in
-# this task. Unset for dispatches made outside a turn (the scheduled /new).
-_TURN_ORIGIN: contextvars.ContextVar[Optional[tuple]] = contextvars.ContextVar(
-    "hermes_turn_origin", default=None
+@dataclass(frozen=True)
+class _Caller:
+    """Who is waiting for the turn whose dispatches run in this task, and until when."""
+
+    origin: str  # "user" | "self" | "peer" | "channel"
+    source_type: str
+    brief: str
+    deadline: float  # seconds, 0 = none; named in the interim reply
+    deadline_at: Optional[float]  # monotonic
+
+
+# Set by execute() for the whole turn, so the turn's every dispatch (the turn,
+# an overflow replay, the /new before a retry) shares one caller and one
+# deadline. Unset in the supervisor, whose /stop belongs to no caller.
+_TURN_CALLER: contextvars.ContextVar[Optional[_Caller]] = contextvars.ContextVar(
+    "hermes_turn_caller", default=None
 )
 
 # How long a message's origin is remembered, so an answer that arrives long
@@ -697,11 +755,17 @@ class _Turn:
     # hermes command sent mid-turn, which skips the queue. "control": /new or
     # /stop sent by the executor itself.
     kind: str
-    origin: str  # "user" | "self" | "peer" | "control"
+    origin: str  # "user" | "self" | "peer" | "channel" | "control"
     source_type: str
     brief: str
     registered_at: float
     command: str = ""
+    # The caller's reply deadline (see _Caller).
+    deadline: float = 0.0
+    deadline_at: Optional[float] = None
+    # For /stop, /new or /reset from a person: the turn that was running when
+    # it went out, the only one its answer may end.
+    target: str = ""
     # When it was posted to the gateway; the cap is measured from here.
     started_at: Optional[float] = None
     dispatched: bool = False
@@ -714,6 +778,11 @@ class _Turn:
     # The supervisor is ending it (stall or cap); /stop is on its way.
     stopping: bool = False
     progress: int = 0
+    # Finals that arrived with no reply_to while this turn ran (see the
+    # turn-supervision notes), oldest first.
+    unanchored: List[str] = field(default_factory=list)
+    # When the supervisor last asked the gateway whether a quiet turn is over.
+    probed_at: float = 0.0
 
 
 def _message_metadata(context: Any) -> Optional[dict]:
@@ -952,22 +1021,33 @@ class HermesAgentProxyExecutor(AgentExecutor):
         policy = self._turn_policy
         logger.info(
             "hermes turn supervision: stall=%gs cap=%s reply_deadline=%s "
-            "self_reply_deadline=%s queue_max=%d poll=%gs drop_self_pings_when_busy=%s",
+            "self_reply_deadline=%s settle=%s queue_max=%d poll=%gs "
+            "drop_self_pings_when_busy=%s",
             policy.stall_seconds,
             f"{policy.max_seconds:g}s" if policy.max_seconds else "off",
             f"{policy.reply_deadline_seconds:g}s" if policy.reply_deadline_seconds else "off",
             f"{policy.self_reply_deadline_seconds:g}s" if policy.self_reply_deadline_seconds else "off",
+            f"{policy.settle_seconds:g}s" if policy.settle_seconds else "off",
             policy.queue_max,
             policy.poll_seconds,
             policy.drop_self_pings,
         )
-        notify = _float_env_or_warn("HERMES_AGENT_NOTIFY_INTERVAL", 180.0, 0.0, None)
+        notify = _float_env_or_warn(
+            "HERMES_AGENT_NOTIFY_INTERVAL", _HERMES_NOTIFY_INTERVAL_DEFAULT, 0.0, None
+        )
         if notify <= 0 or notify * 3 > policy.stall_seconds:
             logger.warning(
                 "HERMES_AGENT_NOTIFY_INTERVAL=%g leaves the gateway's still-working "
                 "notice too sparse (or off) for HERMES_TURN_STALL_SECONDS=%g: a "
                 "turn that spends that long in one tool call may be abandoned",
                 notify, policy.stall_seconds,
+            )
+        if policy.settle_seconds and (notify <= 0 or policy.settle_seconds < 2 * notify):
+            logger.warning(
+                "HERMES_TURN_SETTLE_SECONDS=%g is shorter than two still-working "
+                "notices (HERMES_AGENT_NOTIFY_INTERVAL=%g): a live turn may be settled "
+                "with no response",
+                policy.settle_seconds, notify,
             )
         self._ensure_supervisor()
 
@@ -1117,22 +1197,29 @@ class HermesAgentProxyExecutor(AgentExecutor):
             # volume) this can be revisited. See RFC #600 sibling
             # discussion in #497.
             history = self._extract_history_from_context(context)
-            clock = getattr(self, "_session_clock", None)
-            if clock is None:
-                await self._execute_via_plugin(
-                    context, event_queue, prompt, history=history
-                )
-                return
-            chat_id = self._derive_chat_id(context)
-            reason = clock.begin(chat_id)
+            # The caller's deadline runs from here and covers the scheduled /new.
+            token = _TURN_CALLER.set(self._caller_of(context, prompt))
             try:
-                if reason:
-                    await self._scheduled_session_reset(context, chat_id, reason)
-                await self._execute_via_plugin(
-                    context, event_queue, prompt, history=history
-                )
+                clock = getattr(self, "_session_clock", None)
+                if clock is None:
+                    await self._execute_via_plugin(
+                        context, event_queue, prompt, history=history
+                    )
+                    return
+                chat_id = self._derive_chat_id(context)
+                # While another message runs or waits on the chat, /new would
+                # wait behind it; the reset waits for a turn that starts alone.
+                reason = clock.begin(chat_id, busy=self._chat_busy(chat_id))
+                try:
+                    if reason:
+                        await self._scheduled_session_reset(context, chat_id, reason)
+                    await self._execute_via_plugin(
+                        context, event_queue, prompt, history=history
+                    )
+                finally:
+                    clock.end(chat_id)
             finally:
-                clock.end(chat_id)
+                _TURN_CALLER.reset(token)
         else:
             # Legacy chat_completions path: /v1/chat/completions is
             # stateless by contract — it has no session store of its own,
@@ -1160,21 +1247,52 @@ class HermesAgentProxyExecutor(AgentExecutor):
         history: list[dict[str, Any]] | None = None,
     ) -> None:
         # Every dispatch this turn makes (the turn, an overflow replay, the
-        # retry) is tracked under the turn's origin; _dispatch_and_wait reads it
-        # from here so its signature stays what callers and tests know.
-        peer_id, _ = self._derive_peer_identity(context)
-        raw_source_type = _message_source_type(context)
-        if peer_id:
-            origin = "peer"
-        elif _is_self_source(raw_source_type):
-            origin = "self"
-        else:
-            origin = "user"
-        token = _TURN_ORIGIN.set((origin, raw_source_type, _brief(prompt)))
+        # retry) shares the turn's caller; _dispatch_and_wait reads it from the
+        # context so its signature stays what callers and tests know.
+        if _TURN_CALLER.get() is not None:
+            await self._run_plugin_turn(context, event_queue, prompt, history)
+            return
+        token = _TURN_CALLER.set(self._caller_of(context, prompt))
         try:
             await self._run_plugin_turn(context, event_queue, prompt, history)
         finally:
-            _TURN_ORIGIN.reset(token)
+            _TURN_CALLER.reset(token)
+
+    def _caller_of(self, context: RequestContext, prompt: str) -> _Caller:
+        """Who sent this message, and when its reply is due."""
+        raw_source_type = _message_source_type(context)
+        peer_id, _ = self._derive_peer_identity(context)
+        message_meta = getattr(getattr(context, "message", None), "metadata", None)
+        request_meta = getattr(context, "metadata", None)
+        if peer_id or (isinstance(message_meta, dict) and message_meta.get("delegation_id")):
+            # The platform's async delegation names its delegation_id; it stores
+            # the reply as the delegator's result.
+            origin = "peer"
+        elif _is_self_source(raw_source_type):
+            origin = "self"
+        elif (
+            isinstance(request_meta, dict)
+            and isinstance(request_meta.get("source"), str)
+            and request_meta["source"].strip()
+        ):
+            # The runtime stamps a channel plugin's id there (channel_events).
+            origin = "channel"
+        else:
+            origin = "user"
+        policy = getattr(self, "_turn_policy", None) or TurnSupervisionPolicy()
+        if origin == "self" and raw_source_type in _SHORT_FUSE_SELF_SOURCE_TYPES:
+            deadline = policy.self_reply_deadline_seconds
+        elif origin == "channel" and policy.reply_deadline_seconds:
+            deadline = min(policy.reply_deadline_seconds, _CHANNEL_REPLY_DEADLINE_SECONDS)
+        else:
+            deadline = policy.reply_deadline_seconds
+        return _Caller(
+            origin=origin,
+            source_type=raw_source_type,
+            brief=_brief(prompt),
+            deadline=deadline,
+            deadline_at=time.monotonic() + deadline if deadline else None,
+        )
 
     async def _run_plugin_turn(
         self,
@@ -1377,22 +1495,35 @@ class HermesAgentProxyExecutor(AgentExecutor):
         answered at the reply deadline; the text for the caller is then already
         enqueued. Dispatches with no ``event_queue`` are control messages (the
         `/new` reset, the supervisor's `/stop`): silent, and bounded by
-        HERMES_CONTROL_REPLY_SECONDS.
+        HERMES_CONTROL_REPLY_SECONDS, and by the deadline of the turn they are
+        sent for.
         """
         message_id = uuid.uuid4().hex
         control = event_queue is None
+        caller = _TURN_CALLER.get()
+        deadline, deadline_at = (caller.deadline, caller.deadline_at) if caller else (0.0, None)
+        target = ""
         if control:
             kind, origin, raw_source_type, brief = "control", "control", "", content
         else:
-            turn_origin = _TURN_ORIGIN.get()
-            if turn_origin is not None:
-                origin, raw_source_type, brief = turn_origin
+            if caller is not None:
+                origin, raw_source_type, brief = caller.origin, caller.source_type, caller.brief
             else:
+                # A dispatch outside execute(): its own caller, its own clock.
                 origin = "peer" if peer_id else "user"
                 raw_source_type, brief = source_type, _brief(content)
+                deadline = self._turn_policy.reply_deadline_seconds
+                deadline_at = time.monotonic() + deadline if deadline else None
             command = _command_of(content)
-            if origin == "user" and command in _INLINE_COMMANDS and self._chat_busy(chat_id):
+            if (
+                origin in ("user", "channel")
+                and command in _INLINE_COMMANDS
+                and self._chat_busy(chat_id)
+            ):
                 kind = "command"
+                if command in _INTERRUPTING_COMMANDS:
+                    running = self._running_turn(chat_id)
+                    target = running.message_id if running is not None else ""
             else:
                 kind = "turn"
             if kind == "turn" and len(self._queue.get(chat_id, ())) >= self._turn_policy.queue_max:
@@ -1477,6 +1608,9 @@ class HermesAgentProxyExecutor(AgentExecutor):
             brief=brief or "hermes turn",
             registered_at=time.monotonic(),
             command=_command_of(content) if kind == "command" else "",
+            deadline=deadline,
+            deadline_at=deadline_at,
+            target=target,
         )
         self._turns[message_id] = turn
         if kind != "control":
@@ -1541,16 +1675,32 @@ class HermesAgentProxyExecutor(AgentExecutor):
         finally:
             if holds_slot:
                 self._release_slot(turn.chat_id, turn.message_id)
+            if turn.unanchored:
+                # Held for this turn, never its answer: other runs' output.
+                held, turn.unanchored = turn.unanchored, []
+                self._spawn(self._relay_held(turn.chat_id, held))
             if turn.detached:
                 self._retire(turn)
 
     async def _post_inbound(self, payload: Dict[str, Any], headers: Dict[str, str]) -> Optional[str]:
-        """POST one message to the plugin's /a2a/inbound; the error text, or None."""
+        """POST one message to the plugin's /a2a/inbound; the error text, or None.
+
+        A request that was sent but not answered in time counts as delivered:
+        the plugin may already have the message, and treating it as refused
+        would let the next one land behind it. The stall window catches a
+        gateway that is really gone.
+        """
         inbound_url = f"http://{self._plugin_host}:{self._plugin_port}/a2a/inbound"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=_INBOUND_POST_TIMEOUT) as client:
                 resp = await client.post(inbound_url, json=payload, headers=headers)
                 resp.raise_for_status()
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+            logger.warning(
+                "hermes plugin: no answer to the POST of message_id=%s within %gs (%s); "
+                "treating it as delivered",
+                payload.get("message_id"), _INBOUND_POST_TIMEOUT, type(exc).__name__,
+            )
         except httpx.HTTPError as exc:
             logger.exception("hermes plugin POST failed")
             return str(exc)
@@ -1620,6 +1770,11 @@ class HermesAgentProxyExecutor(AgentExecutor):
                 f"[hermes is still working on this after {deadline:g}s; its answer "
                 "cannot be returned to this request]"
             )
+        if turn.origin == "channel":
+            return (
+                f"[hermes is still working on this after {deadline:g}s; its answer "
+                "will be posted in the workspace's own chat, not here]"
+            )
         return (
             f"[hermes is still working on this after {deadline:g}s; its answer will "
             "appear in this chat when it is ready]"
@@ -1633,25 +1788,20 @@ class HermesAgentProxyExecutor(AgentExecutor):
         Waits in slices only to restart a supervisor that died, so a bug there
         cannot turn into an unbounded wait here.
         """
-        policy = self._turn_policy
-        deadline = (
-            policy.self_reply_deadline_seconds if turn.origin == "self"
-            else policy.reply_deadline_seconds
-        )
-        slice_seconds = max(1.0, 5 * policy.poll_seconds)
+        slice_seconds = max(1.0, 5 * self._turn_policy.poll_seconds)
         while not future.done():
             timeout = slice_seconds
-            if deadline:
-                remaining = deadline - (time.monotonic() - turn.registered_at)
+            if turn.deadline_at is not None:
+                remaining = turn.deadline_at - time.monotonic()
                 if remaining <= 0:
                     turn.detached = True
                     logger.info(
                         "hermes turn %s: caller answered at the %gs reply deadline; "
                         "the turn keeps running and its answer will be delivered late",
-                        turn.message_id, deadline,
+                        turn.message_id, turn.deadline,
                     )
                     await event_queue.enqueue_event(
-                        new_text_message(self._interim_reply(turn, deadline))
+                        new_text_message(self._interim_reply(turn, turn.deadline))
                     )
                     return None
                 timeout = min(timeout, remaining)
@@ -1677,8 +1827,19 @@ class HermesAgentProxyExecutor(AgentExecutor):
         return text
 
     async def _await_control(self, turn: _Turn, future: asyncio.Future) -> str | None:
-        # The driver bounds a control message's wait.
-        await asyncio.wait({future})
+        # The driver bounds the wait once the message is out; the deadline of
+        # the turn it was sent for also bounds the wait for the slot.
+        if turn.deadline_at is None:
+            await asyncio.wait({future})
+        else:
+            remaining = turn.deadline_at - time.monotonic()
+            if remaining > 0:
+                await asyncio.wait({future}, timeout=remaining)
+            self._fail(
+                turn, future,
+                f"[hermes plugin: {turn.brief[:20]!r} not answered by the caller's "
+                f"{turn.deadline:g}s reply deadline]",
+            )
         if future.cancelled():
             return None
         try:
@@ -1724,11 +1885,20 @@ class HermesAgentProxyExecutor(AgentExecutor):
         self._poll_tool_activity(now)
 
         if not reply_to:
-            # A send with no anchor is mid-run output: interim text, the
-            # "still working" notice, a compaction notice. The run's answer
-            # always carries its message id. Count it as liveness and accept
-            # it; refusing it (the old 400) only made hermes log a failed send.
             self._note_progress(chat_id)
+            metadata = body.get("metadata")
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("notify") is True
+                and not metadata.get("_interim_send")
+            ):
+                # hermes marks a final notify (base._mark_notify_metadata) and a
+                # mid-run send _interim_send. A final with no anchor answered a
+                # run hermes started itself, or one of ours that ran inside it.
+                return await self._take_unanchored_final(chat_id, content)
+            # Mid-run output: interim text, the "still working" notice, a
+            # compaction notice. Liveness only; refusing it (the old 400) only
+            # made hermes log a failed send.
             return web.json_response({"ok": True, "progress": True})
         reply_to = str(reply_to)
 
@@ -1740,7 +1910,8 @@ class HermesAgentProxyExecutor(AgentExecutor):
             if turn is not None:
                 if turn.command in _INTERRUPTING_COMMANDS:
                     self._end_running_turn(
-                        turn.chat_id, f"[the turn was interrupted by {turn.command}]"
+                        turn.chat_id, f"[the turn was interrupted by {turn.command}]",
+                        only=turn.target,
                     )
                 if turn.detached:
                     return await self._deliver_late(reply_to, content)
@@ -1771,15 +1942,17 @@ class HermesAgentProxyExecutor(AgentExecutor):
     async def _deliver_late(self, reply_to: str, content: str) -> "web.Response":
         """An answer nobody is waiting for: deliver it where its origin belongs.
 
-        user: the canvas chat via /notify. An idle-digest wake: the same chat,
-        through the digest's own reply forwarder, which drops "(idle)" and other
-        housekeeping text, as it would have on time. Any other self-wake
-        (scheduler tick, delegation results, platform wakes), a peer, a control
-        message, or an origin no longer known: not relayed. Their senders never
-        show the answer to a person, and the peer already got its interim reply.
+        A person (canvas or channel): the workspace's chat via /notify. An
+        idle-digest wake: the same chat, through the digest's own reply
+        forwarder, which drops "(idle)" and other housekeeping text, as it would
+        have on time. Any other self-wake (scheduler tick, delegation results,
+        platform wakes), a peer, a control message, or an origin no longer
+        known: not relayed. Their senders never show the answer to a person, and
+        the peer already got its interim reply.
         """
         origin, source_type = self._origin_entry(reply_to)
-        relay = origin == "user" or (origin == "self" and source_type == "self-idle")
+        person = origin in ("user", "channel")
+        relay = person or (origin == "self" and source_type == "self-idle")
         if not relay:
             logger.warning(
                 "hermes plugin: late reply for message_id=%s origin=%s source=%s — not relayed",
@@ -1794,7 +1967,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # 503 so the plugin's retry loop redelivers — a 200 here would
         # make one transient platform blip a permanent reply loss (#3).
         self._mark_delivered(reply_to, content)
-        if origin == "user":
+        if person:
             relayed = await self._relay_orphan_reply(reply_to, content)
         else:
             status = await self._forward_self_reply(content)
@@ -1832,6 +2005,41 @@ class HermesAgentProxyExecutor(AgentExecutor):
             return await forward_reply_to_user(base, workspace_id, content)
         except Exception as exc:  # noqa: BLE001 — it never raises; be sure
             return f"error: {exc}"
+
+    async def _take_unanchored_final(self, chat_id: str, content: str) -> "web.Response":
+        """A final with no reply_to. While one of our turns runs it may be that
+        turn's answer (hermes ran it inside a run it started itself), so it is
+        held; the turn's own answer, or the settle window, decides. With nothing
+        running it is the agent speaking on its own: relayed to the chat."""
+        running = self._running_turn(chat_id) if chat_id else None
+        if running is not None:
+            running.unanchored.append(content)
+            logger.info(
+                "hermes plugin: final with no reply_to on %s while message_id=%s runs; "
+                "held (%d)", chat_id, running.message_id, len(running.unanchored),
+            )
+            return web.json_response({"ok": True, "held": True})
+        status = await self._relay_unanchored(chat_id, content)
+        if status.startswith("error"):
+            return web.json_response({"ok": False, "relayed": False}, status=503)
+        return web.json_response({"ok": True, "relayed": status == "delivered"})
+
+    async def _relay_unanchored(self, chat_id: str, content: str) -> str:
+        """Post the agent's own output to the chat, through the idle digest's
+        forwarder (it drops silence and housekeeping text); the forwarder's status."""
+        key = f"unanchored:{chat_id}"
+        if self._already_delivered(key, content, within=_UNANCHORED_DEDUP_SECONDS):
+            return "duplicate"
+        self._mark_delivered(key, content)
+        status = await self._forward_self_reply(content)
+        logger.info("hermes plugin: final with no reply_to on %s: %s", chat_id or "-", status)
+        if status.startswith("error"):
+            self._unmark_delivered(key, content)
+        return status
+
+    async def _relay_held(self, chat_id: str, texts: List[str]) -> None:
+        for text in texts:
+            await self._relay_unanchored(chat_id, text)
 
     # ------------------------------------------------------------------
     # Turn supervision
@@ -1963,6 +2171,8 @@ class HermesAgentProxyExecutor(AgentExecutor):
         self._supervisor = loop.create_task(self._supervise_loop())
 
     async def _supervise_loop(self) -> None:
+        # A supervisor restarted from inside a turn would inherit its caller.
+        _TURN_CALLER.set(None)
         while True:
             await asyncio.sleep(self._turn_policy.poll_seconds)
             try:
@@ -1981,8 +2191,8 @@ class HermesAgentProxyExecutor(AgentExecutor):
             if turn is None or turn.stopping:
                 continue
             started = turn.started_at or now
-            last_sign = max(self._chat_activity.get(chat_id, 0.0), self._tool_activity_at, started)
-            if now - last_sign >= policy.stall_seconds:
+            quiet = now - self._last_sign(turn, now)
+            if quiet >= policy.stall_seconds:
                 self._stop_running(
                     turn, "stall",
                     "[hermes plugin reply timeout: no activity from the hermes gateway "
@@ -1994,7 +2204,62 @@ class HermesAgentProxyExecutor(AgentExecutor):
                     "[hermes plugin reply timeout: the turn ran past the "
                     f"{policy.max_seconds:g}s turn cap and was stopped]",
                 )
+            elif (
+                policy.settle_seconds
+                and quiet >= policy.settle_seconds
+                and now - turn.probed_at >= policy.settle_seconds
+            ):
+                turn.probed_at = now
+                self._spawn(self._settle_if_over(turn))
         self._prune_bookkeeping(now)
+
+    def _last_sign(self, turn: _Turn, now: float) -> float:
+        """When the gateway last showed it was working on this turn's chat."""
+        return max(
+            self._chat_activity.get(turn.chat_id, 0.0),
+            self._tool_activity_at,
+            turn.started_at or now,
+        )
+
+    async def _settle_if_over(self, turn: _Turn) -> None:
+        """The gateway has been quiet past the settle window while this turn ran.
+
+        A live run sends "still working" every HERMES_AGENT_NOTIFY_INTERVAL, so if
+        the gateway still answers its health check, no run is going and nothing
+        more will come under this turn's id (see the turn-supervision notes). The
+        turn is settled with the last final held for it, or with _NO_RESPONSE.
+        A gateway that does not answer is left to the stall window.
+        """
+        if not await self._gateway_alive():
+            return
+        future = self._pending.get(turn.message_id)
+        if future is None or future.done() or self._running_turn(turn.chat_id) is not turn:
+            return
+        now = time.monotonic()
+        quiet = now - self._last_sign(turn, now)
+        if quiet < self._turn_policy.settle_seconds:
+            return  # the gateway spoke while it was being asked
+        held = bool(turn.unanchored)
+        answer = turn.unanchored.pop() if held else _NO_RESPONSE
+        logger.warning(
+            "hermes turn %s: the gateway was idle for %.0fs with no answer under its id; "
+            "settled with %s",
+            turn.message_id, quiet,
+            "the last final it sent without one" if held else "no response",
+        )
+        self._mark_delivered(turn.message_id, answer)
+        future.set_result(answer)
+        if turn.detached and held:
+            await self._deliver_late(turn.message_id, answer)
+
+    async def _gateway_alive(self) -> bool:
+        url = f"http://{self._plugin_host}:{self._plugin_port}/a2a/health"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url)
+        except httpx.HTTPError:
+            return False
+        return resp.status_code == 200
 
     def _stop_running(self, turn: _Turn, reason: str, text: str) -> None:
         """End the running turn: /stop, then settle it, then the queue moves on.
@@ -2013,19 +2278,22 @@ class HermesAgentProxyExecutor(AgentExecutor):
         self._spawn(self._stop_then_settle(turn, text))
 
     async def _stop_then_settle(self, turn: _Turn, text: str) -> None:
+        _TURN_CALLER.set(None)  # this /stop belongs to no caller's deadline
         await self._send_stop(turn.chat_id)
         future = self._pending.get(turn.message_id)
         if future is None or future.done():
             return
-        if turn.detached and turn.origin == "user":
+        if turn.detached and turn.origin in ("user", "channel"):
             # The person was told the answer would follow; tell them it won't.
             await self._relay_orphan_reply(turn.message_id, text)
         self._fail(turn, future, text)
 
-    def _end_running_turn(self, chat_id: str, text: str) -> None:
-        """A person's /stop, /new or /reset ended the running turn in hermes."""
+    def _end_running_turn(self, chat_id: str, text: str, *, only: str) -> None:
+        """A person's /stop, /new or /reset ended the running turn in hermes:
+        the turn ``only`` names, the one running when the command went out. A
+        turn that started since then is not the one the person meant."""
         turn = self._running_turn(chat_id)
-        if turn is None:
+        if turn is None or not only or turn.message_id != only:
             return
         future = self._pending.get(turn.message_id)
         if future is not None:
@@ -2173,11 +2441,14 @@ class HermesAgentProxyExecutor(AgentExecutor):
     def _origin_of(self, message_id: str) -> str:
         return self._origin_entry(message_id)[0]
 
-    def _already_delivered(self, message_id: str, content: str) -> bool:
+    def _already_delivered(
+        self, message_id: str, content: str, within: Optional[float] = None
+    ) -> bool:
         import time
 
         ts = self._delivered.get(self._content_key(message_id, content))
-        return ts is not None and (time.monotonic() - ts) < self._DELIVERED_TTL
+        window = self._DELIVERED_TTL if within is None else within
+        return ts is not None and (time.monotonic() - ts) < window
 
     async def _relay_orphan_reply(self, reply_to: str, content: str) -> bool:
         """Push a late gateway reply to the canvas chat via /notify.

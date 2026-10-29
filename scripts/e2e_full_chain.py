@@ -88,6 +88,13 @@ TOOL_MARKER = "use one tool"
 # calls of `sleep <seconds>`, one after another, then the text "slept:<tag>".
 # That gives a turn of a known length made of real hermes tool calls.
 SLEEP_RE = re.compile(r"\[e2e:sleep:(\d+(?:\.\d+)?):(\d+)\]\s*(\S+)")
+# "[e2e:silent]": the stub answers with a bare silence marker.
+SILENT_MARKER = "[e2e:silent]"
+# "[e2e:bg]": the stub starts a background job with notify_on_complete, then
+# answers "bg-started". The job prints BG_OUTPUT; the run hermes starts when it
+# ends is answered "bg-reacted".
+BG_MARKER = "[e2e:bg]"
+BG_OUTPUT = "bg-done-e2e"
 
 
 def _tool_call_for(tools: list, probe: str) -> tuple[str, dict] | None:
@@ -144,6 +151,20 @@ async def _stub_llm_server(port: int, observed: dict):
                 reply = "no-terminal-tool"
             else:
                 reply = f"slept:{tag}"
+        elif SILENT_MARKER in last_user:
+            reply = "[SILENT]"
+        elif BG_OUTPUT in last_user:
+            # The run hermes started itself when the job ended.
+            reply = "bg-reacted"
+        elif BG_MARKER in last_user and body.get("tools"):
+            if any(m.get("role") == "tool" for m in messages[last_user_at + 1:]):
+                reply = "bg-started"
+            else:
+                tool_call = ("terminal", {
+                    "command": f"sleep 1; echo {BG_OUTPUT}",
+                    "background": True,
+                    "notify_on_complete": True,
+                })
         elif marker_at >= 0 and body.get("tools"):
             observed["offered"] = sorted(
                 ((t or {}).get("function") or {}).get("name") or "?" for t in body["tools"]
@@ -578,6 +599,59 @@ async def _turn_supervision_scenarios(
         "turn ran on as busy and its answer was relayed to the chat"
     )
 
+    # G. A turn hermes ends silently: the model answers with a bare silence
+    # marker, which hermes drops on these internal turns, so nothing comes back
+    # under the turn's id. It is settled once the gateway has been idle for the
+    # settle window, instead of holding the chat for the stall window.
+    policy(stall_seconds=120.0, max_seconds=0.0)
+    settle = base_policy.settle_seconds
+    if not settle:
+        return "the settle window is off although HERMES_AGENT_NOTIFY_INTERVAL is set"
+    silent_q = _CapturingQueue()
+    silent_at = time.monotonic()
+    try:
+        await asyncio.wait_for(
+            executor.execute(_ctx(f"{SILENT_MARKER} nothing to say", task_id="t-silent"), silent_q),
+            settle + 30,
+        )
+    except asyncio.TimeoutError:
+        return f"a silent turn was not settled within {settle + 30:g}s"
+    silent_for = time.monotonic() - silent_at
+    if _texts(silent_q) != [executor_mod._NO_RESPONSE]:
+        return f"silent turn answer: {_texts(silent_q)!r}"
+    if not await _until(idle, 5):
+        return "busy not released after the silent turn"
+    print(
+        f"OK: a turn hermes ended silently was settled after {silent_for:.1f}s "
+        f"(settle window {settle:g}s, stall window 120 s)"
+    )
+
+    # H. A run hermes starts itself. The turn starts a background job with
+    # notify_on_complete (the terminal tool tells models to); when it ends,
+    # hermes wakes the agent with a run of its own, whose answer has no
+    # reply_to. That answer reaches the chat; it used to be dropped.
+    policy(stall_seconds=60.0, max_seconds=0.0)
+    bg_q = _CapturingQueue()
+    relayed_before = len(observed.get("notified", []))
+    try:
+        await asyncio.wait_for(executor.execute(_ctx(f"{BG_MARKER} start", task_id="t-bg"), bg_q), 60)
+    except asyncio.TimeoutError:
+        return "the background-job turn was not answered"
+    if _texts(bg_q) != ["bg-started"]:
+        return f"background-job turn answer: {_texts(bg_q)!r}"
+    if not await _until(lambda: relayed("bg-reacted"), 60):
+        return (
+            "the answer of the run hermes started itself never reached the chat: "
+            f"relayed={observed.get('notified', [])[relayed_before:]!r} "
+            f"model saw={[t[:160] for t in observed.get('user_texts', [])[-3:]]!r}"
+        )
+    if not await _until(idle, 5):
+        return "busy not released after the background job"
+    print(
+        "OK: a background job woke hermes on its own when it ended; that run's answer, "
+        "sent with no reply_to, reached the chat"
+    )
+
     # E. A gateway that dies mid-turn: the turn is abandoned one stall window
     # later, and the message waiting behind it fails at once rather than
     # waiting out a stall window of its own.
@@ -908,6 +982,7 @@ async def _amain() -> int:
     print("    stall window, routine self-wakes dropped and delegation results queued,")
     print("    one message at a time per chat (#393) with commands answered mid-turn,")
     print("    the cap's /stop ending a real run, the reply deadline with a late relay,")
+    print("    a silent turn settled, a run hermes started itself reaching the chat,")
     print("    a killed gateway abandoned without stranding the message behind it")
     return 0
 

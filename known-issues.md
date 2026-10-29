@@ -46,9 +46,10 @@ Molecule image boots through `Dockerfile` and `start.sh`.
 
 On the plugin transport (the image default) a turn has no fixed timeout. It
 ends when Hermes answers it, when the gateway shows no sign of life for the
-stall window, or at the turn cap, which sends Hermes' `/stop`. The workspace
-reports busy for as long as a turn runs. A caller still waiting at the reply
-deadline gets an interim reply, before the platform's own 30-minute limit, and
-the turn's answer follows in the chat. See "Turn supervision" in
+stall window, at the turn cap, which sends Hermes' `/stop`, or once a healthy
+gateway has gone quiet on it for the settle window (Hermes ended it without an
+answer under its id). The workspace reports busy for as long as a turn runs. A
+caller still waiting at the reply deadline gets an interim reply, before its
+own request gives up, and the turn's answer follows in the chat. See "Turn supervision" in
 `docs/CONFIGURATION.md` for the knobs and what a caller sees. The
 chat-completions fallback keeps its fixed request timeout in `executor.py`.
