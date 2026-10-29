@@ -389,8 +389,17 @@ async def _turn_supervision_scenarios(
         return f"no gateway progress sends reached the executor during a {elapsed:.0f}s turn"
     if any("e2e-wake" in text for text in observed.get("user_texts", [])):
         return "the dropped self-wake reached the model anyway"
-    if not any(name == "terminal" and "sleep 12" in (summary or "") for name, summary, _ in chips):
-        return f"the gateway's tool call never became an activity row: {chips!r}"
+    if not await _until(
+        lambda: any(name == "terminal" and "sleep 12" in (summary or "") for name, summary, _ in chips),
+        5,
+    ):
+        activity_file = os.environ.get("MOLECULE_TOOL_ACTIVITY_FILE", "")
+        try:
+            record = Path(activity_file).read_text(encoding="utf-8")[:400]
+        except OSError as exc:
+            record = f"<unreadable: {exc}>"
+        return (f"the gateway's tool call never became an activity row: chips={chips!r} "
+                f"activity file={record!r}")
     if not await _until(idle, 5):
         return f"busy not released after the turn: active_tasks={heartbeat.active_tasks}"
     print(

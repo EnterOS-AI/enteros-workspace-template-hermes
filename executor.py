@@ -1479,6 +1479,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if chat_id:
             # Any send for the chat proves the gateway is working on it.
             self._chat_activity[chat_id] = now
+        # The turn's last tool call lands in the activity file just before its
+        # answer; read it now so that call is reported ahead of the reply,
+        # not on the supervisor's next tick.
+        self._poll_tool_activity(now)
 
         if not reply_to:
             # A send with no anchor is mid-run output: interim text, the
