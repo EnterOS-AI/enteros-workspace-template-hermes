@@ -502,7 +502,9 @@ async def _turn_supervision_scenarios(
 
     # D. The cap ends a real run, and the message waiting behind it still gets
     # a run of its own: /stop goes out, the run makes no more tool calls, and the
-    # waiting message reaches the gateway once /stop is answered.
+    # waiting message reaches the gateway once /stop is answered. Hermes starts
+    # it only when the stopped run lets go of the session (its tool call in
+    # flight ends first), and prefixes it with a note about the interrupted turn.
     policy(stall_seconds=30.0, max_seconds=4.0)
     cap_q, after_q = _CapturingQueue(), _CapturingQueue()
     capped = asyncio.create_task(
@@ -515,6 +517,8 @@ async def _turn_supervision_scenarios(
         await asyncio.wait_for(capped, 30)
     except asyncio.TimeoutError:
         return "the turn cap did not end a 30 s turn"
+    # The cap was for the capped turn; the production cap is an hour.
+    policy(stall_seconds=30.0, max_seconds=0.0)
     if len(_texts(cap_q)) != 1 or "turn cap" not in _texts(cap_q)[0]:
         return f"capped turn answer: {_texts(cap_q)!r}"
     stop_answered = tap.first_at(r"/stop on .* answered")
@@ -525,7 +529,8 @@ async def _turn_supervision_scenarios(
         await asyncio.wait_for(after, 20)
     except asyncio.TimeoutError:
         return "the message waiting behind the capped turn was never answered"
-    if _texts(after_q) != ["echo[after cap]"]:
+    after_text = (_texts(after_q) or [""])[0]
+    if len(_texts(after_q)) != 1 or not (after_text.startswith("echo[") and after_text.endswith("after cap]")):
         return f"message waiting behind the cap: {_texts(after_q)!r}"
     after_reached = reached_model("after cap")
     if after_reached is None or after_reached < stop_answered:
