@@ -129,11 +129,9 @@ async def _stub_llm_server(port: int, observed: dict):
             (i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1
         )
         sleep = SLEEP_RE.search(last_user)
-        marker_at = max(
-            (i for i, m in enumerate(messages)
-             if m.get("role") == "user" and TOOL_MARKER in _text(m)),
-            default=-1,
-        )
+        # Only the turn being answered decides: the whole session is resent on
+        # every request, and an earlier tool turn must not shape a later one.
+        marker_at = last_user_at if TOOL_MARKER in last_user else -1
         if sleep and body.get("tools"):
             seconds, calls, tag = sleep.group(1), int(sleep.group(2)), sleep.group(3)
             done = sum(1 for m in messages[last_user_at + 1:] if m.get("role") == "tool")
