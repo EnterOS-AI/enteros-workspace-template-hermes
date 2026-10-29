@@ -152,15 +152,18 @@ What a caller sees:
 - A routine self-wake dropped while busy is answered with
   `[autonomous wake skipped — …]`.
 
-Runs Hermes starts itself. A background job started with `notify_on_complete`
-(the terminal tool tells models to use it) wakes the agent with a run of its
-own when the job ends, and that run's answer carries no reply_to. Hermes marks
-every final `notify` and every mid-run send `_interim_send`, so the executor
-tells such an answer from progress. With nothing of ours running it goes to the
-chat through the idle digest's forwarder. While one of our turns runs it is
-held: a message that reached Hermes during such a run is answered under the
-run's anchor too, after the run's own answer. The turn's own answer, or the
-settle window, decides; whatever is not the turn's answer then goes to the chat.
+Runs Hermes starts itself. A final that arrives with no reply_to is the answer
+of a run the executor did not send, such as the wake Hermes runs when a
+`notify_on_complete` background job ends. Hermes marks every final `notify` and
+every mid-run send `_interim_send`, so the executor tells such an answer from
+progress. With nothing of ours running it goes to the chat through the idle
+digest's forwarder. While one of our turns runs it is held: a message that
+reached Hermes during such a run is answered under the run's anchor too, after
+the run's own answer. The turn's own answer, or the settle window, decides;
+whatever is not the turn's answer then goes to the chat. The pinned Hermes
+refuses the background-job wake itself for molecule-a2a chats (`Watch
+notification not admitted …: not_found`, hermes-platform-molecule-a2a#14), so
+today an agent is not told that its background job ended.
 
 Not covered here: another workspace's synchronous `delegate_task` cannot be
 told apart from a person, and the runtime's client gives up after 300 s and

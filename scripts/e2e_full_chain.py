@@ -90,11 +90,6 @@ TOOL_MARKER = "use one tool"
 SLEEP_RE = re.compile(r"\[e2e:sleep:(\d+(?:\.\d+)?):(\d+)\]\s*(\S+)")
 # "[e2e:silent]": the stub answers with a bare silence marker.
 SILENT_MARKER = "[e2e:silent]"
-# "[e2e:bg]": the stub starts a background job with notify_on_complete, then
-# answers "bg-started". The job prints BG_OUTPUT; the run hermes starts when it
-# ends is answered "bg-reacted".
-BG_MARKER = "[e2e:bg]"
-BG_OUTPUT = "bg-done-e2e"
 
 
 def _tool_call_for(tools: list, probe: str) -> tuple[str, dict] | None:
@@ -153,18 +148,6 @@ async def _stub_llm_server(port: int, observed: dict):
                 reply = f"slept:{tag}"
         elif SILENT_MARKER in last_user:
             reply = "[SILENT]"
-        elif BG_OUTPUT in last_user:
-            # The run hermes started itself when the job ended.
-            reply = "bg-reacted"
-        elif BG_MARKER in last_user and body.get("tools"):
-            if any(m.get("role") == "tool" for m in messages[last_user_at + 1:]):
-                reply = "bg-started"
-            else:
-                tool_call = ("terminal", {
-                    "command": f"sleep 1; echo {BG_OUTPUT}",
-                    "background": True,
-                    "notify_on_complete": True,
-                })
         elif marker_at >= 0 and body.get("tools"):
             observed["offered"] = sorted(
                 ((t or {}).get("function") or {}).get("name") or "?" for t in body["tools"]
@@ -625,32 +608,11 @@ async def _turn_supervision_scenarios(
         f"OK: a turn hermes ended silently was settled after {silent_for:.1f}s "
         f"(settle window {settle:g}s, stall window 120 s)"
     )
-
-    # H. A run hermes starts itself. The turn starts a background job with
-    # notify_on_complete (the terminal tool tells models to); when it ends,
-    # hermes wakes the agent with a run of its own, whose answer has no
-    # reply_to. That answer reaches the chat; it used to be dropped.
-    policy(stall_seconds=60.0, max_seconds=0.0)
-    bg_q = _CapturingQueue()
-    relayed_before = len(observed.get("notified", []))
-    try:
-        await asyncio.wait_for(executor.execute(_ctx(f"{BG_MARKER} start", task_id="t-bg"), bg_q), 60)
-    except asyncio.TimeoutError:
-        return "the background-job turn was not answered"
-    if _texts(bg_q) != ["bg-started"]:
-        return f"background-job turn answer: {_texts(bg_q)!r}"
-    if not await _until(lambda: relayed("bg-reacted"), 60):
-        return (
-            "the answer of the run hermes started itself never reached the chat: "
-            f"relayed={observed.get('notified', [])[relayed_before:]!r} "
-            f"model saw={[t[:160] for t in observed.get('user_texts', [])[-3:]]!r}"
-        )
-    if not await _until(idle, 5):
-        return "busy not released after the background job"
-    print(
-        "OK: a background job woke hermes on its own when it ended; that run's answer, "
-        "sent with no reply_to, reached the chat"
-    )
+    # A run hermes starts itself (a notify_on_complete background job ending)
+    # is not tested here: the pinned gateway refuses that wake for molecule-a2a
+    # chats ("Watch notification not admitted ...: not_found",
+    # hermes-platform-molecule-a2a#14). tests/test_turn_supervision.py covers
+    # what the executor does with such a run's answer.
 
     # E. A gateway that dies mid-turn: the turn is abandoned one stall window
     # later, and the message waiting behind it fails at once rather than
@@ -982,8 +944,8 @@ async def _amain() -> int:
     print("    stall window, routine self-wakes dropped and delegation results queued,")
     print("    one message at a time per chat (#393) with commands answered mid-turn,")
     print("    the cap's /stop ending a real run, the reply deadline with a late relay,")
-    print("    a silent turn settled, a run hermes started itself reaching the chat,")
-    print("    a killed gateway abandoned without stranding the message behind it")
+    print("    a silent turn settled, a killed gateway abandoned without stranding the")
+    print("    message behind it")
     return 0
 
 
