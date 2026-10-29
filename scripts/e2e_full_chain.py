@@ -336,10 +336,12 @@ async def _turn_supervision_scenarios(
     from molecule_runtime.runtime_inbox import any_turn_in_flight
 
     os.environ["PLATFORM_URL"] = platform_url
+    base_policy = executor._turn_policy
 
     def policy(**changes):
+        """The production policy with this scenario's changes, and only those."""
         executor._turn_policy = dataclasses.replace(
-            executor._turn_policy, poll_seconds=0.2, control_seconds=15.0, **changes
+            base_policy, poll_seconds=0.2, control_seconds=15.0, **changes
         )
 
     def sleeps(tag):
