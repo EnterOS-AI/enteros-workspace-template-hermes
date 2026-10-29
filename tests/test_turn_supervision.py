@@ -1304,10 +1304,12 @@ async def test_a_final_with_no_anchor_and_nothing_running_reaches_the_chat(monke
     gateway = FakeGateway()
     await gateway.start()
     monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    monkeypatch.setattr(executor_mod, "_ATTACHMENT_WINDOW_SECONDS", 0.2)
     ex = _executor(monkeypatch, gateway)
     await ex.start()
     try:
         await _one_turn(ex, gateway)
+        await asyncio.sleep(0.3)  # past the window for that turn's attachments
         done = "The build finished: 0 errors."
         assert await gateway.send(done, metadata=_final()) == (200, {"ok": True, "relayed": True})
         assert platform.notified == [{"message": done}]
@@ -1426,3 +1428,109 @@ async def test_a_quiet_turn_on_a_gateway_that_does_not_answer_waits_for_the_stal
     finally:
         await ex.stop()
         await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_finals_attachments_follow_its_own_origin(monkeypatch):
+    """hermes sends an answer's image links and file notices right after it,
+    with its notify metadata and no reply_to. They belong to that answer: a
+    person's reach the chat, a peer's stay off it, and none is held on the
+    message that went out next."""
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        delegated = asyncio.create_task(
+            ex.execute(_ctx("draw the chart", message_meta={"delegation_id": "d-2"}), _Queue())
+        )
+        await _dispatched(gateway, "draw the chart")
+        nxt_queue = _Queue()
+        nxt = asyncio.create_task(ex.execute(_ctx("and then?"), nxt_queue))
+        await gateway.answer("draw the chart", "Here it is.")
+        await asyncio.wait_for(delegated, 3)
+        await _dispatched(gateway, "and then?")
+        assert await gateway.send("chart\nhttps://x.test/chart.png", metadata=_final()) == (
+            200, {"ok": True, "stale": True}
+        )
+        assert platform.notified == []
+        assert all(not t.unanchored for t in ex._turns.values())
+        await gateway.answer("and then?", "Done.")
+        await asyncio.wait_for(nxt, 3)
+        assert nxt_queue.texts() == ["Done."]
+        # The person's answer's attachment reaches the chat.
+        assert await gateway.send("chart\nhttps://x.test/2.png", metadata=_final()) == (
+            200, {"ok": True, "stale": True, "relayed": True}
+        )
+        assert platform.notified == [{"message": "chart\nhttps://x.test/2.png"}]
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
+
+
+@pytest.mark.asyncio
+async def test_a_canvas_message_is_a_persons_turn(monkeypatch):
+    """The platform stamps source=canvas_user on every canvas message; only
+    other sources are channel plugins."""
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_TURN_REPLY_DEADLINE_SECONDS="0.3")
+    await ex.start()
+    try:
+        queue = _Queue()
+        meta = {"source": "canvas_user", "user_identity_status": "AUTHENTICATED"}
+        await asyncio.wait_for(ex.execute(_ctx("hi", request_meta=meta), queue), 3)
+        assert "will appear in this chat when it is ready" in queue.texts()[0], queue.texts()
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_persons_stop_ends_the_turn_whose_post_is_still_out(monkeypatch):
+    gateway = FakeGateway(answer_stop=False)
+    gateway.post_delay = 0.4  # the plugin is slow to accept, well inside the POST timeout
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+    try:
+        queue = _Queue()
+        running = asyncio.create_task(ex.execute(_ctx("long job"), queue))
+        await _dispatched(gateway, "long job")
+        stopping = asyncio.create_task(ex.execute(_ctx("/stop"), _Queue()))
+        await _dispatched(gateway, "/stop")
+        await asyncio.sleep(0.5)  # both POSTs have returned
+        await gateway.answer("/stop", "⚡ Stopped.")
+        await asyncio.wait_for(asyncio.gather(stopping, running), 3)
+        assert queue.texts() == ["[the turn was interrupted by /stop]"]
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_person_told_to_wait_hears_when_the_turn_ended_silently(monkeypatch):
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway()
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(
+        monkeypatch, gateway,
+        HERMES_TURN_REPLY_DEADLINE_SECONDS="0.2", HERMES_TURN_SETTLE_SECONDS="0.5",
+    )
+    await ex.start()
+    try:
+        queue = _Queue()
+        await asyncio.wait_for(ex.execute(_ctx("anything?"), queue), 3)
+        assert "will appear in this chat" in queue.texts()[0]
+        assert await _until(lambda: platform.notified == [{"message": executor_mod._NO_RESPONSE}], 3)
+        assert await _until(lambda: ex._turns == {})
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()

@@ -214,6 +214,14 @@ _NO_RESPONSE = "(no response generated)"
 # A retried send of the same unanchored text arrives within seconds; the same
 # text later is a new message.
 _UNANCHORED_DEDUP_SECONDS = 120.0
+# hermes sends a final's attachments (an image link, the notice for a file it
+# could not deliver) right after the final, with the final's notify metadata and
+# no reply_to (base._deliver_attachments). A send like that within this window
+# of a chat's last anchored one belongs to that message.
+_ATTACHMENT_WINDOW_SECONDS = 10.0
+# The source the platform stamps on a person's canvas message (molecule-core
+# a2a_proxy_helpers.injectCanvasUserIdentity); any other source is a channel's.
+_CANVAS_SOURCE = "canvas_user"
 
 # Fast-ack for a routine self-wake that arrives while a turn runs. The
 # "[autonomous " prefix is the one the idle digest's reply forwarder suppresses,
@@ -981,6 +989,9 @@ class HermesAgentProxyExecutor(AgentExecutor):
         self._slot_waiters: Dict[str, asyncio.Future] = {}
         # chat_id -> monotonic time of the gateway's last send for that chat.
         self._chat_activity: Dict[str, float] = {}
+        # chat_id -> (message_id, monotonic ts) of the last send that carried a
+        # reply_to, which the attachments sent right after it belong to.
+        self._last_anchored: Dict[str, tuple] = {}
         # chat_id -> turns holding a busy slot.
         self._busy_chats: Dict[str, int] = {}
         self._supervisor: Optional[asyncio.Task] = None
@@ -1273,7 +1284,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         elif (
             isinstance(request_meta, dict)
             and isinstance(request_meta.get("source"), str)
-            and request_meta["source"].strip()
+            and request_meta["source"].strip() not in ("", _CANVAS_SOURCE)
         ):
             # The runtime stamps a channel plugin's id there (channel_events).
             origin = "channel"
@@ -1522,8 +1533,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
             ):
                 kind = "command"
                 if command in _INTERRUPTING_COMMANDS:
-                    running = self._running_turn(chat_id)
-                    target = running.message_id if running is not None else ""
+                    # The turn holding the chat, posted or still being posted:
+                    # either way hermes has it before this command.
+                    holder = self._turns.get(self._slot.get(chat_id, ""))
+                    target = holder.message_id if holder is not None and holder.kind == "turn" else ""
             else:
                 kind = "turn"
             if kind == "turn" and len(self._queue.get(chat_id, ())) >= self._turn_policy.queue_max:
@@ -1685,21 +1698,21 @@ class HermesAgentProxyExecutor(AgentExecutor):
     async def _post_inbound(self, payload: Dict[str, Any], headers: Dict[str, str]) -> Optional[str]:
         """POST one message to the plugin's /a2a/inbound; the error text, or None.
 
-        A request that was sent but not answered in time counts as delivered:
-        the plugin may already have the message, and treating it as refused
-        would let the next one land behind it. The stall window catches a
-        gateway that is really gone.
+        A request that was sent whole but not answered in time counts as
+        delivered: the plugin may already have the message, and treating it as
+        refused would let the next one land behind it. The stall window catches
+        a gateway that is really gone.
         """
         inbound_url = f"http://{self._plugin_host}:{self._plugin_port}/a2a/inbound"
         try:
             async with httpx.AsyncClient(timeout=_INBOUND_POST_TIMEOUT) as client:
                 resp = await client.post(inbound_url, json=payload, headers=headers)
                 resp.raise_for_status()
-        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+        except httpx.ReadTimeout:
             logger.warning(
-                "hermes plugin: no answer to the POST of message_id=%s within %gs (%s); "
+                "hermes plugin: no answer to the POST of message_id=%s within %gs; "
                 "treating it as delivered",
-                payload.get("message_id"), _INBOUND_POST_TIMEOUT, type(exc).__name__,
+                payload.get("message_id"), _INBOUND_POST_TIMEOUT,
             )
         except httpx.HTTPError as exc:
             logger.exception("hermes plugin POST failed")
@@ -1887,20 +1900,26 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if not reply_to:
             self._note_progress(chat_id)
             metadata = body.get("metadata")
-            if (
+            if not (
                 isinstance(metadata, dict)
                 and metadata.get("notify") is True
                 and not metadata.get("_interim_send")
             ):
-                # hermes marks a final notify (base._mark_notify_metadata) and a
-                # mid-run send _interim_send. A final with no anchor answered a
-                # run hermes started itself, or one of ours that ran inside it.
+                # Mid-run output: interim text, the "still working" notice, a
+                # compaction notice. Liveness only; refusing it (the old 400)
+                # only made hermes log a failed send.
+                return web.json_response({"ok": True, "progress": True})
+            # hermes marks a final notify (base._mark_notify_metadata) and a
+            # mid-run send _interim_send. Right after an anchored final this is
+            # one of its attachments; otherwise it answered a run hermes
+            # started itself, or one of ours that ran inside it.
+            last = self._last_anchored.get(chat_id) if chat_id else None
+            if last is None or now - last[1] > _ATTACHMENT_WINDOW_SECONDS:
                 return await self._take_unanchored_final(chat_id, content)
-            # Mid-run output: interim text, the "still working" notice, a
-            # compaction notice. Liveness only; refusing it (the old 400) only
-            # made hermes log a failed send.
-            return web.json_response({"ok": True, "progress": True})
+            reply_to = last[0]
         reply_to = str(reply_to)
+        if chat_id:
+            self._last_anchored[chat_id] = (reply_to, now)
 
         future = self._pending.get(reply_to)
         if future is not None and not future.done():
@@ -2233,7 +2252,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if not await self._gateway_alive():
             return
         future = self._pending.get(turn.message_id)
-        if future is None or future.done() or self._running_turn(turn.chat_id) is not turn:
+        if (
+            future is None or future.done() or turn.stopping
+            or self._running_turn(turn.chat_id) is not turn
+        ):
             return
         now = time.monotonic()
         quiet = now - self._last_sign(turn, now)
@@ -2249,8 +2271,24 @@ class HermesAgentProxyExecutor(AgentExecutor):
         )
         self._mark_delivered(turn.message_id, answer)
         future.set_result(answer)
-        if turn.detached and held:
-            await self._deliver_late(turn.message_id, answer)
+        if not turn.detached:
+            return
+        # Its caller was told the answer would follow: deliver it, or tell a
+        # person there is none.
+        if held:
+            delivered = False
+            for pause in (0.0, 2.0, 5.0):
+                await asyncio.sleep(pause)
+                resp = await self._deliver_late(turn.message_id, answer)
+                if resp.status < 300:
+                    delivered = True
+                    break
+            if not delivered:
+                logger.error(
+                    "hermes turn %s: its answer could not be delivered late", turn.message_id
+                )
+        elif turn.origin in ("user", "channel"):
+            await self._relay_orphan_reply(turn.message_id, _NO_RESPONSE)
 
     async def _gateway_alive(self) -> bool:
         url = f"http://{self._plugin_host}:{self._plugin_port}/a2a/health"
@@ -2290,10 +2328,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
 
     def _end_running_turn(self, chat_id: str, text: str, *, only: str) -> None:
         """A person's /stop, /new or /reset ended the running turn in hermes:
-        the turn ``only`` names, the one running when the command went out. A
-        turn that started since then is not the one the person meant."""
-        turn = self._running_turn(chat_id)
-        if turn is None or not only or turn.message_id != only:
+        the turn ``only`` names, the one holding the chat when the command went
+        out. A turn that started since then is not the one the person meant."""
+        turn = self._turns.get(only) if only else None
+        if turn is None or self._slot.get(chat_id) != only:
             return
         future = self._pending.get(turn.message_id)
         if future is not None:
@@ -2423,6 +2461,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
         for chat_id, ts in list(activity.items()):
             if ts < late_cutoff and chat_id not in live_chats:
                 activity.pop(chat_id, None)
+        anchored = getattr(self, "_last_anchored", {})
+        for chat_id, (_, ts) in list(anchored.items()):
+            if ts < late_cutoff:
+                anchored.pop(chat_id, None)
 
     def _record_origin(self, message_id: str, origin: str, source_type: str = "") -> None:
         import time

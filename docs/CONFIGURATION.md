@@ -152,11 +152,14 @@ What a caller sees:
 - A routine self-wake dropped while busy is answered with
   `[autonomous wake skipped — …]`.
 
-Runs Hermes starts itself. A final that arrives with no reply_to is the answer
-of a run the executor did not send, such as the wake Hermes runs when a
-`notify_on_complete` background job ends. Hermes marks every final `notify` and
-every mid-run send `_interim_send`, so the executor tells such an answer from
-progress. With nothing of ours running it goes to the chat through the idle
+Runs Hermes starts itself. Hermes marks every final `notify` and every mid-run
+send `_interim_send`. A final's attachments (an image link, the notice for a
+file it could not deliver) follow it with the same marks and no reply_to; one
+that arrives within 10 s of the chat's last anchored send belongs to that
+message and goes where that message's late answer would. Any other final with
+no reply_to is the answer of a run the executor did not send, such as the wake
+Hermes runs when a `notify_on_complete` background job ends. With nothing of
+ours running it goes to the chat through the idle
 digest's forwarder. While one of our turns runs it is held: a message that
 reached Hermes during such a run is answered under the run's anchor too, after
 the run's own answer. The turn's own answer, or the settle window, decides;
