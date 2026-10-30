@@ -1229,6 +1229,7 @@ jobs:
           tests/test_context_overflow_autoheal.py
           tests/test_cron_approval_mode.py
           tests/test_memory_skill_knobs.py
+          tests/test_compression_ceiling.py
           tests/test_session_reset_policy.py
           tests/test_bundled_node_path.py
           tests/test_executor_plugin_path.py

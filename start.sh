@@ -826,7 +826,7 @@ fi
   # operation, and PyYAML reads 010 as octal. Anything else is refused with a
   # WARNING.
   # skills_render later merges skills.external_dirs into this same mapping.
-  hermes_int_knob() {  # $1 = env var name, $2 = minimum; prints the value or nothing
+  hermes_int_knob() {  # $1 = env var name, $2 = minimum, $3 = what applies instead; prints the value or nothing
     local value="${!1:-}"
     [ -n "$value" ] || return 0
     case "$value" in
@@ -839,7 +839,7 @@ fi
         ;;
     esac
     echo "[start.sh] WARNING: $1='${value}' is not a whole number >= $2 (no sign," \
-         "no leading zero); ignored, hermes keeps its built-in default." >&2
+         "no leading zero); ignored, ${3:-hermes keeps its built-in default}." >&2
   }
   _MEMORY_CHARS="$(hermes_int_knob HERMES_MEMORY_CHAR_LIMIT 1)"
   _USER_CHARS="$(hermes_int_knob HERMES_USER_CHAR_LIMIT 1)"
@@ -854,6 +854,28 @@ fi
   if [ -n "$_SKILL_NUDGE" ]; then
     echo "skills:"
     echo "  creation_nudge_interval: ${_SKILL_NUDGE}"
+  fi
+  # --- Compaction ceiling ---
+  # hermes compacts at a share of the model window: at least 0.75 below 512K,
+  # its 0.50 default at or above. MiniMax-M3 is a 1M window (hermes assumes
+  # 1,000,000 when the provider reports none), so it compacts near 500,000
+  # tokens, at M3's 512K price tier, and every call on the way there re-sends
+  # the whole prompt. compression.threshold_tokens makes hermes compact at the
+  # lower of the two: any trigger above it (a window above ~350K) comes down,
+  # a 204,800-token window (153,600) is unchanged. "off" leaves only the ratio.
+  _COMPACT_DEFAULT=262144
+  _COMPACT_AT=$_COMPACT_DEFAULT
+  case "$(printf '%s' "${HERMES_COMPRESSION_THRESHOLD_TOKENS:-}" | tr '[:upper:]' '[:lower:]')" in
+    "") ;;
+    off) _COMPACT_AT="" ;;
+    *)
+      _COMPACT_AT="$(hermes_int_knob HERMES_COMPRESSION_THRESHOLD_TOKENS 64000 "the template default ${_COMPACT_DEFAULT} applies")"
+      [ -n "$_COMPACT_AT" ] || _COMPACT_AT=$_COMPACT_DEFAULT
+      ;;
+  esac
+  if [ -n "$_COMPACT_AT" ]; then
+    echo "compression:"
+    echo "  threshold_tokens: ${_COMPACT_AT}"
   fi
   # --- Molecule A2A platform plugin ---
   # Loaded into hermes via the hermes_agent.plugins entry point baked
