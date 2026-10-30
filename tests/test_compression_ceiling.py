@@ -67,13 +67,14 @@ def test_the_hermes_minimum_context_is_accepted(tmp_path):
     assert "WARNING" not in stderr
 
 
-def test_off_leaves_hermes_on_the_window_ratio(tmp_path):
-    cfg, stderr = _render(tmp_path / "config.yaml", **{KNOB: "off"})
+@pytest.mark.parametrize("raw", ["off", "OFF", "Off"])
+def test_off_leaves_hermes_on_the_window_ratio(tmp_path, raw):
+    cfg, stderr = _render(tmp_path / "config.yaml", **{KNOB: raw})
     assert "compression" not in cfg
     assert "WARNING" not in stderr
 
 
-@pytest.mark.parametrize("raw", ["abc", "-5", "1.5", "0", "010", " 262144", "63999", "1e6", "9999999999", "OFF"])
+@pytest.mark.parametrize("raw", ["abc", "-5", "1.5", "0", "010", " 262144", "63999", "1e6", "9999999999", "offf"])
 def test_an_invalid_value_keeps_the_ceiling_and_says_so(tmp_path, raw):
     cfg, stderr = _render(tmp_path / "config.yaml", **{KNOB: raw})
     # A typo must not silently remove the ceiling.

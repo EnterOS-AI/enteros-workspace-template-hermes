@@ -99,16 +99,19 @@ plugin transport, which is the image default.
 
 | Variable | Effect | Accepted values |
 |---|---|---|
-| `HERMES_COMPRESSION_THRESHOLD_TOKENS` | `compression.threshold_tokens`: Hermes compacts at the lower of this and its window ratio | integer `>= 64000`, or `off` for the ratio alone; default `262144` |
+| `HERMES_COMPRESSION_THRESHOLD_TOKENS` | `compression.threshold_tokens`: Hermes compacts at the lower of this and its window ratio | integer `>= 64000`, or `off` (any case) for the ratio alone; default `262144` |
 
 Hermes compacts at 75% of a window below 512K tokens and at 50% of a larger
-one. For MiniMax-M3 (1,048,576 tokens) that is 524,288 tokens, past M3's 512K
-price tier, and every call on the way there re-sends the whole prompt, so
-`start.sh` writes `262144` unless this variable says otherwise. A
-204,800-token model still compacts at 153,600. An invalid value is logged at
-WARNING and the default applies. A compaction leaves the summary, the recent
-turns, the system prompt and the tool schemas behind (80-95K tokens on a busy
-agent), so a ceiling close to that makes Hermes compact every few steps.
+one. MiniMax-M3 has a 1M window (Hermes assumes 1,000,000 when the provider
+reports none), so without a ceiling it compacts near 500,000 tokens, at M3's
+512K price tier, and every call on the way there re-sends the whole prompt.
+`start.sh` therefore writes `262144` unless this variable says otherwise. Any
+model whose own trigger is higher (a window above about 350K) compacts at the
+ceiling; a 204,800-token model still compacts at 153,600. An invalid value is
+logged at WARNING and the default applies. A compaction leaves the summary,
+the recent turns, the system prompt and the tool schemas behind (80-95K tokens
+on a busy agent), so a ceiling close to that makes Hermes compact every few
+steps.
 
 ## Turn supervision
 

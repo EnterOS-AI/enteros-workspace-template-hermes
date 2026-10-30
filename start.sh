@@ -857,18 +857,20 @@ fi
   fi
   # --- Compaction ceiling ---
   # hermes compacts at a share of the model window: at least 0.75 below 512K,
-  # its 0.50 default at or above. On MiniMax-M3 (1,048,576 tokens) that is
-  # 524,288 tokens, past M3's 512K price tier, and every call on the way there
-  # re-sends the whole prompt. compression.threshold_tokens makes hermes
-  # compact at the lower of the two, so a 204,800-token window (153,600) is
-  # unchanged. "off" leaves only the ratio.
-  _COMPACT_AT=262144
-  case "${HERMES_COMPRESSION_THRESHOLD_TOKENS:-}" in
+  # its 0.50 default at or above. MiniMax-M3 is a 1M window (hermes assumes
+  # 1,000,000 when the provider reports none), so it compacts near 500,000
+  # tokens, at M3's 512K price tier, and every call on the way there re-sends
+  # the whole prompt. compression.threshold_tokens makes hermes compact at the
+  # lower of the two: any trigger above it (a window above ~350K) comes down,
+  # a 204,800-token window (153,600) is unchanged. "off" leaves only the ratio.
+  _COMPACT_DEFAULT=262144
+  _COMPACT_AT=$_COMPACT_DEFAULT
+  case "$(printf '%s' "${HERMES_COMPRESSION_THRESHOLD_TOKENS:-}" | tr '[:upper:]' '[:lower:]')" in
     "") ;;
     off) _COMPACT_AT="" ;;
     *)
-      _COMPACT_AT="$(hermes_int_knob HERMES_COMPRESSION_THRESHOLD_TOKENS 64000 "the template default 262144 applies")"
-      [ -n "$_COMPACT_AT" ] || _COMPACT_AT=262144
+      _COMPACT_AT="$(hermes_int_knob HERMES_COMPRESSION_THRESHOLD_TOKENS 64000 "the template default ${_COMPACT_DEFAULT} applies")"
+      [ -n "$_COMPACT_AT" ] || _COMPACT_AT=$_COMPACT_DEFAULT
       ;;
   esac
   if [ -n "$_COMPACT_AT" ]; then
