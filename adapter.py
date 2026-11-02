@@ -96,8 +96,9 @@ class HermesAgentAdapter(BaseAdapter):
           progress events at the platform's cadence; we keep emitting
           WORKSPACE_HEARTBEAT every 30s from heartbeat.py so the canvas
           UI's idle indicator stays accurate.
-        - provides_native_scheduler: hermes-agent has no built-in cron;
-          platform scheduler keeps owning it.
+        - provides_native_scheduler: hermes-agent does ship a scheduler
+          (the cronjob_manage tool + the gateway's ticker), but start.sh
+          turns it off (#400); the platform scheduler owns schedules.
         - provides_native_status_mgmt: hermes-agent doesn't surface a
           ready/degraded/failed signal back to us; platform's
           error_rate inference still drives the workspace status.
