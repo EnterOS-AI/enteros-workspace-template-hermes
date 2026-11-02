@@ -143,6 +143,7 @@ secrets; an invalid value is logged at WARNING and the default is used.
 | `HERMES_AGENT_NOTIFY_INTERVAL` | Seconds between the gateway's "still working" sends during a turn, the liveness signal inside one long tool call. Keep it well under the stall window; the executor warns at boot when it is not. | `60` (set by `start.sh`; upstream Hermes defaults to `180`) |
 | `HERMES_TURN_POLL_SECONDS` | How often the executor checks the running turns and the tool-activity file | `1` |
 | `HERMES_CONTROL_REPLY_SECONDS` | How long the executor waits for Hermes to answer `/new` or `/stop` | `120` |
+| `HERMES_AGENT_CRON` | hermes' own scheduler: the `cronjob_manage` tool, and the gateway ticker that runs the jobs it creates outside Molecule's scheduler, turn cap and pause. Off by default: start.sh puts `cronjob` in `agent.disabled_toolsets` and, before the gateway starts, pauses every job already in `$HERMES_HOME/cron/jobs.json`, logging one `hermes cron: paused job …` line each. `allow` keeps the tool and leaves stored jobs alone; jobs paused earlier stay paused until resumed. Any other value is ignored with a WARNING. Schedules belong in the platform scheduler. | off |
 | `HERMES_DROP_SELF_PINGS_WHEN_BUSY` | Fast-ack and drop a routine self-wake (idle digest, cron, scheduler, goal nudge, lifecycle wake) that arrives while a turn runs or waits, as the runtime's native executor does. Delegation results are never dropped: a Hermes turn has no other copy of them. `0` makes routine wakes wait their turn as well. | `1` |
 
 What a caller sees:

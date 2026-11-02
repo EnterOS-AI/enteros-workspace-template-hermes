@@ -1228,6 +1228,7 @@ jobs:
           tests/test_github_cli_present.py
           tests/test_context_overflow_autoheal.py
           tests/test_cron_approval_mode.py
+          tests/test_agent_cron_disabled.py
           tests/test_memory_skill_knobs.py
           tests/test_compression_ceiling.py
           tests/test_session_reset_policy.py
