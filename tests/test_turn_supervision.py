@@ -19,11 +19,15 @@ import json
 import os
 import socket
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
 import pytest
+from a2a.server.agent_execution import RequestContext
+from a2a.server.context import ServerCallContext
+from a2a.types import Message, Part, Role, SendMessageRequest
 from aiohttp import ClientSession, ClientTimeout, web
 
 import executor as executor_mod
@@ -54,7 +58,8 @@ def _ctx(
     message_meta: Optional[dict] = None, request_meta: Optional[dict] = None,
 ):
     """A RequestContext stub. ``source_type`` goes where the runtime's own
-    self-wakes put it: the request-level metadata, not the message's."""
+    self-wakes put it: the request-level metadata, not the message's. Unlike
+    the real one (``_wire_ctx``), a message without metadata has None there."""
     part = MagicMock()
     part.text = text
     part.kind = "text"
@@ -70,6 +75,32 @@ def _ctx(
     ctx.message = msg
     ctx.metadata = dict(request_meta or {}, **({"source_type": source_type} if source_type else {})) or None
     return ctx
+
+
+# A scheduler tick's request metadata once the runtime's trigger lane has
+# stamped it (the scheduler's channel_sdk.build_trigger_message_send_request,
+# then the runtime's channel_events._stamp_trigger_source); the message itself
+# carries none.
+_TICK_META = {
+    "schedule_name": "a-continuous-agent-tick",
+    "source_type": "self-scheduler",
+    "source": "molecule-scheduler",
+}
+
+
+def _wire_ctx(
+    text: str, *, request_meta: Optional[dict] = None, message_meta: Optional[dict] = None,
+) -> RequestContext:
+    """The RequestContext a2a-sdk 1.x builds for a message/send: protobuf
+    throughout, so every metadata field is a Struct, empty rather than None
+    when the sender set none."""
+    message = Message(message_id=uuid.uuid4().hex, role=Role.ROLE_USER, parts=[Part(text=text)])
+    if message_meta:
+        message.metadata.update(message_meta)
+    request = SendMessageRequest(message=message)
+    if request_meta:
+        request.metadata.update(request_meta)
+    return RequestContext(call_context=ServerCallContext(), request=request)
 
 
 class _Queue:
@@ -316,6 +347,35 @@ def test_scheduled_marker_is_read_from_request_level_metadata():
     ctx = _ctx("tick", source_type="self-scheduler")
     assert HermesAgentProxyExecutor._derive_source_type(ctx) == "self-scheduler"
     assert HermesAgentProxyExecutor._derive_source_type(_ctx("tick", source_type="self-idle")) == ""
+
+
+def test_the_marker_is_read_off_the_request_a2a_sdk_builds():
+    """#401: a2a-sdk 1.x gives a message without metadata an empty Struct, not
+    None. The runtime's extractor then read nothing, so no tick was droppable."""
+    tick = _wire_ctx("tick", request_meta=_TICK_META)
+    assert tick.message.metadata is not None and not isinstance(tick.message.metadata, dict)
+    assert executor_mod._message_source_type(tick) == "self-scheduler"
+    assert executor_mod._is_droppable_self_ping(tick, "tick")
+    assert HermesAgentProxyExecutor._derive_source_type(tick) == "self-scheduler"
+
+    wake = _wire_ctx("wake", message_meta={"source_type": "self-idle"})
+    assert executor_mod._message_source_type(wake) == "self-idle"
+
+    history = [{"role": "user", "parts": [{"kind": "text", "text": "earlier"}]}]
+    person = _wire_ctx("hi", request_meta={"source": "canvas_user"}, message_meta={"history": history})
+    assert executor_mod._message_source_type(person) == ""
+    assert not executor_mod._is_droppable_self_ping(person, "hi")
+
+
+def test_a_tick_off_the_wire_is_the_agents_own_turn():
+    """Read as untyped, a tick was a channel turn (the trigger lane stamps the
+    plugin's id as its source): the channel's 540 s deadline, which is why the
+    scheduler logged each fire 9 minutes late, and its late answers in the chat."""
+    ex = HermesAgentProxyExecutor(AdapterConfig(model="m", system_prompt="s"))
+    tick = ex._caller_of(_wire_ctx("tick", request_meta=_TICK_META), "tick")
+    assert (tick.origin, tick.source_type, tick.deadline) == ("self", "self-scheduler", 1500.0)
+    person = ex._caller_of(_wire_ctx("hi", request_meta={"source": "canvas_user"}), "hi")
+    assert (person.origin, person.source_type) == ("user", "")
 
 
 def test_tool_chip_summary_previews_redacts_and_truncates():
@@ -675,6 +735,63 @@ async def test_a_routine_self_wake_is_dropped_while_a_turn_runs(monkeypatch):
     finally:
         await ex.stop()
         await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_a_scheduler_tick_off_the_wire_is_dropped_until_the_turn_has_ended(monkeypatch, caplog):
+    """#401 (DineCall SEO, 2026-11-02): a tick every 30 min, every turn run to
+    the 1 h cap. Each tick queued instead and held a busy slot, so active_tasks
+    climbed by one an hour. The turn's caller answered at the deadline, then
+    the cap's /stop still out: neither frees the chat."""
+    caplog.set_level("INFO", logger="executor")
+    hb = SimpleNamespace(active_tasks=0, current_task="")
+    platform = FakePlatform()
+    await platform.start()
+    gateway = FakeGateway(answer_stop=False)
+    await gateway.start()
+    monkeypatch.setenv("PLATFORM_URL", f"http://127.0.0.1:{platform.port}")
+    ex = _executor(
+        monkeypatch, gateway, heartbeat=hb,
+        HERMES_TURN_REPLY_DEADLINE_SECONDS="0.5", HERMES_TURN_MAX_SECONDS="1.5",
+    )
+    await ex.start()
+
+    async def tick(text: str) -> List[str]:
+        queue = _Queue()
+        await asyncio.wait_for(ex.execute(_wire_ctx(text, request_meta=_TICK_META), queue), 1)
+        return queue.texts()
+
+    try:
+        first = _Queue()
+        running = asyncio.create_task(ex.execute(_wire_ctx("tick 0", request_meta=_TICK_META), first))
+        mid = await _dispatched(gateway, "tick 0")
+        assert await tick("tick 1") == [executor_mod._SELF_PING_SKIPPED]
+
+        await asyncio.wait_for(running, 3)
+        assert first.texts()[0].startswith("[autonomous turn still running after 0.5s"), first.texts()
+        assert ex._turns[mid].detached
+        assert await tick("tick 2") == [executor_mod._SELF_PING_SKIPPED]
+
+        assert await _until(lambda: "/stop" in gateway.contents(), 3)
+        assert await tick("tick 3") == [executor_mod._SELF_PING_SKIPPED]
+        assert hb.active_tasks == 1
+        await gateway.answer("/stop", "⚡ Stopped. You can continue this session.")
+        assert await _until(lambda: ex._turns == {} and hb.active_tasks == 0)
+
+        later = _Queue()
+        woke = asyncio.create_task(ex.execute(_wire_ctx("tick 4", request_meta=_TICK_META), later))
+        await _dispatched(gateway, "tick 4")
+        await gateway.answer("tick 4", "tick 4 done")
+        await asyncio.wait_for(woke, 3)
+        assert later.texts() == ["tick 4 done"]
+
+        assert gateway.contents() == ["tick 0", "/stop", "tick 4"]
+        assert caplog.text.count("routine self-wake (self-scheduler) while a turn is in flight") == 3
+        assert platform.notified == [], "a tick's answer is not a message for the chat"
+    finally:
+        await ex.stop()
+        await gateway.close()
+        await platform.close()
 
 
 @pytest.mark.asyncio
