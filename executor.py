@@ -60,6 +60,7 @@ import socket
 import time
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Deque, Dict, List, Optional, Set
@@ -793,18 +794,34 @@ class _Turn:
     probed_at: float = 0.0
 
 
-def _message_metadata(context: Any) -> Optional[dict]:
-    """The inbound envelope metadata, message level first, then the request
-    level the runtime's own self-wakes stamp (executor_helpers SSOT)."""
-    try:
-        from molecule_runtime.executor_helpers import get_message_metadata
+def _metadata_dict(value: Any) -> Optional[dict]:
+    """A metadata field as a dict, or None. a2a-sdk 1.x builds the
+    RequestContext from protobuf, where a metadata field is a Struct: a
+    Mapping, not a dict."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return dict(value)
+        except Exception:  # noqa: BLE001
+            return None
+    return None
 
-        return get_message_metadata(context)
-    except Exception:  # noqa: BLE001 — an older runtime without the helper
-        metadata = getattr(getattr(context, "message", None), "metadata", None)
-        if metadata is None:
-            metadata = getattr(context, "metadata", None)
-        return metadata if isinstance(metadata, dict) else None
+
+def _message_metadata(context: Any) -> Optional[dict]:
+    """The inbound envelope metadata: the message's, else the request's, where
+    the runtime's own self-wakes and the scheduler's trigger lane stamp
+    source_type.
+
+    Not the runtime's executor_helpers.get_message_metadata: it falls back to
+    the request only when the message's metadata is None, and accepts only a
+    dict. On a2a-sdk 1.x a message without metadata carries an empty Struct, so
+    that helper returns None for every message, and no source_type is ever
+    read (#401)."""
+    metadata = _metadata_dict(getattr(getattr(context, "message", None), "metadata", None))
+    if not metadata:
+        metadata = _metadata_dict(getattr(context, "metadata", None))
+    return metadata
 
 
 def _message_source_type(context: Any) -> str:
@@ -812,22 +829,38 @@ def _message_source_type(context: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _routine_self_source_types() -> frozenset:
+    try:
+        from molecule_runtime.a2a_executor import _ROUTINE_SELF_SOURCE_TYPES
+
+        return frozenset(_ROUTINE_SELF_SOURCE_TYPES)
+    except Exception:  # noqa: BLE001
+        return _ROUTINE_SELF_SOURCE_TYPES_FALLBACK
+
+
 def _is_droppable_self_ping(context: Any, text: str) -> bool:
     """A self-wake that may be dropped while a turn runs: the runtime's own
     drop-not-queue rule (a2a_executor._is_routine_self_message) for cron, idle,
     scheduler and lifecycle wakes, minus delegation results (see
-    _UNDROPPABLE_SELF_SOURCE_TYPES)."""
+    _UNDROPPABLE_SELF_SOURCE_TYPES).
+
+    A typed wake is judged here on the runtime's routine set: the runtime's
+    rule reads source_type through get_message_metadata, which never sees it
+    (see _message_metadata). Only an untyped message goes to the rule, for its
+    legacy text prefixes."""
     source_type = _message_source_type(context)
     if source_type in _UNDROPPABLE_SELF_SOURCE_TYPES:
         return False
-    if not source_type and (text or "").lstrip().startswith(_DELEGATION_RESULTS_PREFIX):
+    if source_type:
+        return source_type in _routine_self_source_types()
+    if (text or "").lstrip().startswith(_DELEGATION_RESULTS_PREFIX):
         return False
     try:
         from molecule_runtime.a2a_executor import _is_routine_self_message
 
         return bool(_is_routine_self_message(context, text))
     except Exception:  # noqa: BLE001
-        return source_type in _ROUTINE_SELF_SOURCE_TYPES_FALLBACK
+        return False
 
 
 def _command_of(text: str) -> str:
@@ -2634,7 +2667,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         Returns "" for anything not in ``_SCHEDULED_SOURCE_TYPES`` — see the
         note there for why this is an allow-list and not a passthrough.
 
-        Read with the runtime's own extractor: message metadata first, then the
+        Read with _message_metadata: message metadata first, then the
         request-level metadata where the runtime's self-sends (the scheduler's
         trigger lane among them) put the marker. Reading only the message
         level missed every one of those.

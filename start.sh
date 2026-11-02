@@ -745,6 +745,31 @@ fi
   echo "tools:"
   echo "  tool_search:"
   echo "    enabled: \"off\""
+  # --- hermes' own scheduler: off (#400) ---
+  # hermes ships a cron of its own: the `cronjob_manage` tool (toolset
+  # `cronjob`) lets the agent create jobs that the gateway then runs in fresh
+  # sessions. Those runs never pass through Molecule: no /schedules entry, no
+  # turn cap, no drop-while-busy, and pausing the workspace only suspends them.
+  # On 2026-10-30 a concierge used one to re-send an expiring approval link
+  # every 15 minutes for days. The platform scheduler owns schedules, so the
+  # toolset goes. agent.disabled_toolsets is applied last in hermes' tool
+  # selection (hermes_cli/tools_config.py::_get_platform_tools), over every
+  # platform's own list. Jobs created before this are paused before the
+  # gateway starts (below). HERMES_AGENT_CRON=allow keeps both as they were.
+  case "$(printf '%s' "${HERMES_AGENT_CRON:-}" | tr '[:upper:]' '[:lower:]')" in
+    allow) _AGENT_CRON=allow ;;
+    "") _AGENT_CRON=off ;;
+    *)
+      echo "[start.sh] WARNING: HERMES_AGENT_CRON='${HERMES_AGENT_CRON}' is not 'allow';" \
+           "hermes' own cron stays off." >&2
+      _AGENT_CRON=off
+      ;;
+  esac
+  if [ "$_AGENT_CRON" != allow ]; then
+    echo "agent:"
+    echo "  disabled_toolsets:"
+    echo "  - cronjob"
+  fi
   # --- Unattended-session approvals (issue #370) ---
   # hermes gates the destructive session commands (/new, /reset, /clear,
   # /undo) behind an interactive confirm — `approvals.
@@ -1132,6 +1157,19 @@ sys.exit(0 if "molecule_a2a" in {e.name for e in entry_points(group="hermes_agen
     echo "[start.sh] ERROR the molecule_a2a plugin is not installed in hermes'" \
          "dependency environment (${HERMES_AGENT_PYTHON}); the A2A platform will not" \
          "start. Boot CONTINUES." >&2
+  fi
+fi
+
+# --- hermes cron jobs created before the toolset was removed (#400) ---
+# They sit in $HERMES_HOME/cron/jobs.json on the persistent /configs volume, and
+# the gateway's ticker would keep firing them. Pause them before it starts; the
+# script logs one line per job it paused and never fails the boot.
+if [ "${_AGENT_CRON:-off}" != allow ] && [ -d "${HERMES_HOME}/cron" ]; then
+  PAUSE_CRON_SCRIPT="/app/scripts/pause-hermes-cron-jobs.py"
+  [ -f "$PAUSE_CRON_SCRIPT" ] || PAUSE_CRON_SCRIPT="$(dirname "$0")/scripts/pause-hermes-cron-jobs.py"
+  if [ -f "$PAUSE_CRON_SCRIPT" ]; then
+    # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
+    ${AS_AGENT} python3 -I "$PAUSE_CRON_SCRIPT" "${HERMES_HOME}/cron" || true
   fi
 fi
 
