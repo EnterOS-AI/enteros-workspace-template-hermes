@@ -114,29 +114,84 @@ def test_start_sh_pauses_stored_jobs_before_the_gateway_starts():
 # --- the pause script --------------------------------------------------------
 
 
+def _assert_paused(mod, job: dict) -> None:
+    assert job["enabled"] is False
+    assert job["state"] == "paused"
+    assert job["paused_at"] == NOW.isoformat()
+    assert job["paused_reason"] == mod.REASON
+    assert not mod._runnable(job)
+
+
 def test_runnable_jobs_are_paused_the_way_hermes_pause_job_does(tmp_path):
     mod = _pause_module()
     cron = tmp_path / "cron"
     already = _job("b", enabled=False, state="paused", paused_at="2026-10-31T00:00:00+00:00", paused_reason="by hand")
     done = _job("c", state="completed")
-    broken = _job("d", state="error")
     disabled = _job("e", enabled=False, state="scheduled")
-    path = _store(cron, [_job("a"), already, done, broken, disabled, "junk"], version=3)
+    once_error = _job("f", state="error", schedule={"kind": "once", "run_at": "2026-10-30T00:00:00+00:00", "display": "once"})
+    path = _store(cron, [_job("a"), already, done, disabled, once_error, "junk"], version=3)
 
     paused = mod.pause_all(str(cron), now=NOW)
 
-    assert [j["id"] for j in paused] == ["a"]
+    assert [job_id for job_id, _ in paused] == ["a"]
     data = json.loads(path.read_text(encoding="utf-8"))
     first = data["jobs"][0]
-    assert first["enabled"] is False
-    assert first["state"] == "paused"
-    assert first["paused_at"] == NOW.isoformat()
-    assert first["paused_reason"] == mod.REASON
+    _assert_paused(mod, first)
     assert first["schedule"] == {"kind": "interval", "minutes": 3, "display": "every 3m"}
-    assert data["jobs"][1:] == [already, done, broken, disabled, "junk"]
+    assert first["next_run_at"] == "2026-11-02T21:03:00+00:00"
+    assert data["jobs"][1:] == [already, done, disabled, once_error, "junk"]
     assert data["updated_at"] == NOW.isoformat()
     assert data["version"] == 3
-    assert not mod._runnable(first)
+
+
+@pytest.mark.parametrize("kind", ["cron", "interval"])
+def test_a_recurring_job_in_error_is_paused_too(tmp_path, kind):
+    # hermes marks a recurring job `error` when it cannot compute the next run, leaves it enabled,
+    # and its due scan re-arms it to `scheduled` (cron/jobs.py _recover_missing_next_run): not final.
+    mod = _pause_module()
+    cron = tmp_path / "cron"
+    path = _store(cron, [_job("d", state="error", schedule={"kind": kind, "expr": "*/3 * * * *", "display": "*/3"})])
+    assert [job_id for job_id, _ in mod.pause_all(str(cron), now=NOW)] == ["d"]
+    _assert_paused(mod, json.loads(path.read_text(encoding="utf-8"))["jobs"][0])
+
+
+def test_an_id_keyed_store_is_paused_in_place(tmp_path):
+    # hermes flattens {"jobs": {id: job}} on load (cron/jobs.py load_jobs); the key is the id.
+    mod = _pause_module()
+    cron = tmp_path / "cron"
+    keyed = _job("x")
+    del keyed["id"]
+    path = _store(cron, {"k1": keyed, "k2": _job("k2", state="completed"), "k3": "junk"})
+    paused = mod.pause_all(str(cron), now=NOW)
+    assert [job_id for job_id, _ in paused] == ["k1"]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    _assert_paused(mod, data["jobs"]["k1"])
+    assert data["jobs"]["k2"]["state"] == "completed" and data["jobs"]["k3"] == "junk"
+
+
+def test_a_bare_list_store_is_paused_in_place(tmp_path):
+    # hermes wraps a bare list on load (cron/jobs.py load_jobs).
+    mod = _pause_module()
+    cron = tmp_path / "cron"
+    cron.mkdir()
+    path = cron / "jobs.json"
+    path.write_text(json.dumps([_job("a")]), encoding="utf-8")
+    assert [job_id for job_id, _ in mod.pause_all(str(cron), now=NOW)] == ["a"]
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(data, list)
+    _assert_paused(mod, data[0])
+
+
+@pytest.mark.parametrize("payload", ['{"jobs": "x"}', "42", '"jobs"'])
+def test_a_store_without_a_job_list_is_reported_and_left_alone(tmp_path, capsys, payload):
+    mod = _pause_module()
+    cron = tmp_path / "cron"
+    cron.mkdir()
+    path = cron / "jobs.json"
+    path.write_text(payload, encoding="utf-8")
+    assert mod.pause_all(str(cron), now=NOW) == []
+    assert path.read_text(encoding="utf-8") == payload
+    assert "jobs NOT paused" in capsys.readouterr().out
 
 
 def test_a_store_with_nothing_runnable_is_not_rewritten(tmp_path):

@@ -29,9 +29,7 @@ REASON = (
 # hermes' own writers poll the same lock for up to 30 s; at boot nothing should
 # hold it, so a short wait is enough and keeps a wedged holder from stalling boot.
 LOCK_TIMEOUT_SECONDS = 10.0
-# hermes keeps these states whatever `enabled` says (cron/jobs.py
-# effective_job_state); they never fire again, so there is nothing to pause.
-_TERMINAL_STATES = {"completed", "error"}
+_RECURRING_KINDS = {"cron", "interval"}
 
 
 def _log(message: str) -> None:
@@ -39,13 +37,35 @@ def _log(message: str) -> None:
 
 
 def _runnable(job: dict) -> bool:
-    """hermes' is_job_runnable (enabled and no pause marker), minus terminal jobs."""
+    """hermes' is_job_runnable (enabled and no pause marker), minus jobs that can never fire again.
+
+    ``completed`` is final. ``error`` is not, for a recurring job: hermes sets it when it could not
+    compute the next run, leaves the job enabled, and the due scan re-arms it to ``scheduled``
+    (cron/jobs.py ``_is_recoverable_error_job`` / ``_recover_missing_next_run``), so it is paused too.
+    """
     if not job.get("enabled", True):
         return False
     state = str(job.get("state") or "").strip()
     if state == "paused" or job.get("paused_at"):
         return False
-    return state not in _TERMINAL_STATES
+    if state == "completed":
+        return False
+    if state == "error":
+        schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+        return schedule.get("kind") in _RECURRING_KINDS
+    return True
+
+
+def _job_records(data) -> list[tuple[str, dict]] | None:
+    """(id, job) for every job in the store shapes hermes reads (cron/jobs.py load_jobs):
+    ``{"jobs": [...]}``, an id-keyed ``{"jobs": {id: job}}`` and a bare list. None = no job list."""
+    if isinstance(data, dict):
+        data = data.get("jobs")
+        if isinstance(data, dict):
+            return [(str(j.get("id") or key), j) for key, j in data.items() if isinstance(j, dict)]
+    if isinstance(data, list):
+        return [(str(j.get("id", "?")), j) for j in data if isinstance(j, dict)]
+    return None
 
 
 def _acquire_lock(cron_dir: str):
@@ -62,7 +82,7 @@ def _acquire_lock(cron_dir: str):
             time.sleep(0.1)
 
 
-def _write_atomically(path: str, data: dict) -> None:
+def _write_atomically(path: str, data) -> None:
     # The volume is what makes these jobs survive restarts, so a torn write here
     # would lose every job: write beside, fsync, rename, fsync the directory.
     target = os.path.realpath(path)
@@ -91,8 +111,8 @@ def _write_atomically(path: str, data: dict) -> None:
         os.close(dir_fd)
 
 
-def pause_all(cron_dir: str, now: datetime.datetime | None = None) -> list[dict]:
-    """Pause every runnable job in ``<cron_dir>/jobs.json``; return the jobs paused."""
+def pause_all(cron_dir: str, now: datetime.datetime | None = None) -> list[tuple[str, dict]]:
+    """Pause every runnable job in ``<cron_dir>/jobs.json``; return (id, job) for each one paused."""
     jobs_file = os.path.join(cron_dir, "jobs.json")
     if not os.path.isfile(jobs_file):
         return []
@@ -107,17 +127,20 @@ def pause_all(cron_dir: str, now: datetime.datetime | None = None) -> list[dict]
         except (OSError, ValueError) as exc:
             _log(f"cannot read {jobs_file} ({exc}); jobs NOT paused")
             return []
-        jobs = data.get("jobs") if isinstance(data, dict) else None
-        if not isinstance(jobs, list):
+        records = _job_records(data)
+        if records is None:
+            _log(f"{jobs_file} holds no job list hermes would read; jobs NOT paused")
             return []
         stamp = (now or datetime.datetime.now(datetime.timezone.utc)).isoformat()
         paused = []
-        for job in jobs:
-            if isinstance(job, dict) and _runnable(job):
+        for job_id, job in records:
+            if _runnable(job):
                 job.update(enabled=False, state="paused", paused_at=stamp, paused_reason=REASON)
-                paused.append(job)
+                paused.append((job_id, job))
         if paused:
-            data["updated_at"] = stamp
+            # Same shape back: hermes normalises the store itself on its next load.
+            if isinstance(data, dict):
+                data["updated_at"] = stamp
             _write_atomically(jobs_file, data)
         return paused
     finally:
@@ -127,10 +150,10 @@ def pause_all(cron_dir: str, now: datetime.datetime | None = None) -> list[dict]
             lock.close()
 
 
-def _describe(job: dict) -> str:
+def _describe(job_id: str, job: dict) -> str:
     schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
     when = job.get("schedule_display") or schedule.get("display") or schedule.get("expr") or schedule.get("kind") or "?"
-    return f"{job.get('id', '?')} ({job.get('name') or 'unnamed'}, {when})"
+    return f"{job_id} ({job.get('name') or 'unnamed'}, {when})"
 
 
 def main(argv: list[str]) -> int:
@@ -142,8 +165,8 @@ def main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001 - never fail the boot
         _log(f"pausing failed ({type(exc).__name__}: {exc}); jobs NOT paused")
         return 0
-    for job in paused:
-        _log(f"paused job {_describe(job)}")
+    for job_id, job in paused:
+        _log(f"paused job {_describe(job_id, job)}")
     return 0
 
 
