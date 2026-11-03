@@ -144,7 +144,7 @@ secrets; an invalid value is logged at WARNING and the default is used.
 | `HERMES_TURN_POLL_SECONDS` | How often the executor checks the running turns and the tool-activity file | `1` |
 | `HERMES_CONTROL_REPLY_SECONDS` | How long the executor waits for Hermes to answer `/new` or `/stop` | `120` |
 | `HERMES_AGENT_CRON` | hermes' own scheduler: the `cronjob_manage` tool, and the gateway ticker that runs the jobs it creates outside Molecule's scheduler, turn cap and pause. Off by default: start.sh puts `cronjob` in `agent.disabled_toolsets` and, before the gateway starts, pauses every job already in `$HERMES_HOME/cron/jobs.json`, logging one `hermes cron: paused job …` line each. `allow` keeps the tool and leaves stored jobs alone; jobs paused earlier stay paused until resumed. Any other value is ignored with a WARNING. Schedules belong in the platform scheduler. | off |
-| `HERMES_DROP_SELF_PINGS_WHEN_BUSY` | Fast-ack and drop a routine self-wake (idle digest, cron, scheduler, goal nudge, lifecycle wake) that arrives while a turn runs or waits, as the runtime's native executor does. Delegation results are never dropped: a Hermes turn has no other copy of them. `0` makes routine wakes wait their turn as well. | `1` |
+| `HERMES_DROP_SELF_PINGS_WHEN_BUSY` | Coalesce routine self-wakes (idle digest, cron, scheduler fire, goal nudge, lifecycle wake): one that repeats a wake already waiting or running on the chat is fast-acked and dropped, because that one does the job. A scheduler fire repeats a fire with the same `schedule_name`; any other routine wake, a scheduler tick that names no schedule included, repeats one with the same `source_type`. Every other wake waits its turn like any message, so a fire of another schedule runs after the current turn, and at most one wake per schedule or type waits. Delegation results are never dropped: a Hermes turn has no other copy of them. `0` makes every wake wait its turn, repeats included. | `1` |
 
 What a caller sees:
 
@@ -168,7 +168,7 @@ What a caller sees:
   interim reply, that text goes to the chat instead.
 - A message refused because `HERMES_TURN_QUEUE_MAX` messages are already
   waiting gets `{"status":"busy","retry":true}`.
-- A routine self-wake dropped while busy is answered with
+- A routine self-wake dropped as a repeat is answered with
   `[autonomous wake skipped — …]`.
 
 Runs Hermes starts itself. Hermes marks every final `notify` and every mid-run
