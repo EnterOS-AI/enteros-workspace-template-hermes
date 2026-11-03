@@ -224,12 +224,11 @@ _ATTACHMENT_WINDOW_SECONDS = 10.0
 # a2a_proxy_helpers.injectCanvasUserIdentity); any other source is a channel's.
 _CANVAS_SOURCE = "canvas_user"
 
-# Fast-ack for a routine self-wake that arrives while a turn runs. The
-# "[autonomous " prefix is the one the idle digest's reply forwarder suppresses,
-# so the skip never becomes a chat bubble.
+# Fast-ack for a routine self-wake that repeats one already queued or running
+# (see _should_skip_self_ping). The "[autonomous " prefix is the one the idle
+# digest's reply forwarder suppresses, so the skip never becomes a chat bubble.
 _SELF_PING_SKIPPED = (
-    "[autonomous wake skipped — a turn is already in flight; this routine wake "
-    "recurs next cycle]"
+    "[autonomous wake skipped — the same wake is already queued or running]"
 )
 # The runtime's own backpressure reply (a2a_executor, inbox at capacity).
 _QUEUE_FULL_REPLY = '{"status":"busy","retry":true}'
@@ -739,6 +738,7 @@ class _Caller:
     brief: str
     deadline: float  # seconds, 0 = none; named in the interim reply
     deadline_at: Optional[float]  # monotonic
+    wake: str = ""  # see _routine_wake
 
 
 # Set by execute() for the whole turn, so the turn's every dispatch (the turn,
@@ -792,6 +792,10 @@ class _Turn:
     unanchored: List[str] = field(default_factory=list)
     # When the supervisor last asked the gateway whether a quiet turn is over.
     probed_at: float = 0.0
+    # The routine self-wake this message is for (see _routine_wake), or "". A
+    # /new sent ahead of a wake's turn is for that wake too, so a repeat that
+    # lands while the /new runs is still a repeat.
+    wake: str = ""
 
 
 def _metadata_dict(value: Any) -> Optional[dict]:
@@ -839,10 +843,10 @@ def _routine_self_source_types() -> frozenset:
 
 
 def _is_droppable_self_ping(context: Any, text: str) -> bool:
-    """A self-wake that may be dropped while a turn runs: the runtime's own
-    drop-not-queue rule (a2a_executor._is_routine_self_message) for cron, idle,
-    scheduler and lifecycle wakes, minus delegation results (see
-    _UNDROPPABLE_SELF_SOURCE_TYPES).
+    """A self-wake that may be dropped as a repeat (see _routine_wake): the
+    runtime's own drop-not-queue rule (a2a_executor._is_routine_self_message)
+    for cron, idle, scheduler and lifecycle wakes, minus delegation results
+    (see _UNDROPPABLE_SELF_SOURCE_TYPES).
 
     A typed wake is judged here on the runtime's routine set: the runtime's
     rule reads source_type through get_message_metadata, which never sees it
@@ -861,6 +865,22 @@ def _is_droppable_self_ping(context: Any, text: str) -> bool:
         return bool(_is_routine_self_message(context, text))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _routine_wake(context: Any, text: str) -> str:
+    """Which job a droppable self-wake asks for, or "" for any other message.
+    Two wakes for the same job are one: a scheduler fire is its schedule (the
+    trigger lane's request metadata names it); any other routine wake, the
+    mailbox kernel's scheduler tick that names none included, is its
+    source_type. Also the name the drop is logged under."""
+    if not _is_droppable_self_ping(context, text):
+        return ""
+    source_type = _message_source_type(context)
+    if source_type == "self-scheduler":
+        name = (_message_metadata(context) or {}).get("schedule_name")
+        if isinstance(name, str) and name:
+            return f"self-scheduler {name!r}"
+    return source_type or "untyped"
 
 
 def _command_of(text: str) -> str:
@@ -1217,11 +1237,12 @@ class HermesAgentProxyExecutor(AgentExecutor):
         prompt = text
 
         if self._use_plugin:
-            # A routine self-wake (idle digest, cron, scheduler, harvester)
-            # that lands while a turn runs is dropped, as the runtime's native
-            # executor drops it: it recurs next cycle, and forwarding it would
-            # queue it in the gateway behind the running turn, where a backlog
-            # of stale wakes runs for hours once the turn ends.
+            # A routine self-wake (idle digest, cron, scheduler fire) that
+            # repeats one already queued or running on the chat is dropped:
+            # that one does the job, and queueing every repeat behind a long
+            # turn built a backlog that ran for hours once the turn ended. Any
+            # other wake waits its turn, so another schedule's fire still runs
+            # (#407).
             if self._should_skip_self_ping(context, prompt):
                 await event_queue.enqueue_event(new_text_message(_SELF_PING_SKIPPED))
                 return
@@ -1336,6 +1357,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
             brief=_brief(prompt),
             deadline=deadline,
             deadline_at=time.monotonic() + deadline if deadline else None,
+            wake=_routine_wake(context, prompt),
         )
 
     async def _run_plugin_turn(
@@ -1657,6 +1679,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
             deadline=deadline,
             deadline_at=deadline_at,
             target=target,
+            wake=caller.wake if caller is not None else "",
         )
         self._turns[message_id] = turn
         if kind != "control":
@@ -2125,20 +2148,39 @@ class HermesAgentProxyExecutor(AgentExecutor):
         _touch_turn_lease()
 
     def _should_skip_self_ping(self, context: RequestContext, text: str) -> bool:
+        """A routine self-wake whose job is already queued or running on the
+        chat (see _routine_wake). At most one of each waits, however long the
+        running turn takes."""
         policy = getattr(self, "_turn_policy", None)
         if policy is None or not policy.drop_self_pings:
             return False
-        chat_id = self._derive_chat_id(context)
-        if not self._chat_busy(chat_id):
+        wake = _routine_wake(context, text)
+        if not wake:
             return False
-        if not _is_droppable_self_ping(context, text):
+        chat_id = self._derive_chat_id(context)
+        held = self._queued_or_running(chat_id, wake)
+        if held is None:
             return False
         logger.info(
             "hermes plugin: routine self-wake (%s) while a turn is in flight on "
-            "%s — fast-ack + drop (recurs next cycle)",
+            "%s — fast-ack + drop: duplicate of a %s %s",
             _message_source_type(context) or "untyped", chat_id,
+            "running" if self._slot.get(chat_id) == held.message_id else "queued",
+            wake,
         )
         return True
+
+    def _queued_or_running(self, chat_id: str, wake: str) -> Optional[_Turn]:
+        """The chat's unanswered message for ``wake``, or None. A turn whose
+        caller was answered at the reply deadline, or that is being stopped,
+        is still the one doing the job."""
+        for turn in self._turns.values():
+            if turn.chat_id != chat_id or turn.wake != wake:
+                continue
+            future = self._pending.get(turn.message_id)
+            if future is not None and not future.done():
+                return turn
+        return None
 
     # --- busy signals -------------------------------------------------
     # active_tasks (heartbeat) gates the runtime's idle loop; the runtime

@@ -103,6 +103,20 @@ def _wire_ctx(
     return RequestContext(call_context=ServerCallContext(), request=request)
 
 
+_TICK = _TICK_META["schedule_name"]
+_BLOG = "c-weekly-blog-post"
+
+
+def _fire(schedule: str, text: str) -> RequestContext:
+    """A fire of ``schedule`` off the wire, stamped like _TICK_META."""
+    return _wire_ctx(text, request_meta=dict(_TICK_META, schedule_name=schedule))
+
+
+def _idle_wake(text: str) -> RequestContext:
+    """The idle digest's wake off the wire: its poster stamps the request."""
+    return _wire_ctx(text, request_meta={"source_type": "self-idle"})
+
+
 class _Queue:
     def __init__(self) -> None:
         self.events: List[Any] = []
@@ -339,6 +353,25 @@ def test_delegation_result_wakes_are_never_droppable():
         assert executor_mod._is_droppable_self_ping(_ctx("tick", source_type=source_type), "tick")
     for source_type in (None, "self-restart-context", "self-stall", "self-nudge"):
         assert not executor_mod._is_droppable_self_ping(_ctx("hello", source_type=source_type), "hello")
+
+
+def test_a_routine_wake_is_named_by_its_schedule_or_else_its_type():
+    """What makes two wakes the same job (#407)."""
+    name = executor_mod._routine_wake
+    assert name(_fire(_TICK, "t"), "t") == f"self-scheduler '{_TICK}'"
+    assert name(_fire(_BLOG, "t"), "t") == f"self-scheduler '{_BLOG}'"
+    # The mailbox kernel's own tick carries the same marker and no schedule.
+    kernel_tick = _wire_ctx("t", request_meta={"source_type": "self-scheduler"})
+    assert name(kernel_tick, "t") == "self-scheduler"
+    assert name(_idle_wake("w"), "w") == "self-idle"
+    for source_type in ("self-cron", "self-goal-nudge", "self-lifecycle"):
+        assert name(_ctx("w", source_type=source_type), "w") == source_type
+    legacy = "This is your own scheduled work tick. Carry on."
+    assert name(_ctx(legacy), legacy) == "untyped"
+    # Never a job another wake can stand in for.
+    for source_type in ("self-harvester", "self-delegation-result", "self-restart-context", None):
+        assert name(_ctx("w", source_type=source_type), "w") == "", source_type
+    assert name(_wire_ctx("hi", request_meta={"source": "canvas_user"}), "hi") == ""
 
 
 def test_scheduled_marker_is_read_from_request_level_metadata():
@@ -702,36 +735,41 @@ async def test_stop_gives_back_busy_slots_and_fails_waiters(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_routine_self_wake_is_dropped_while_a_turn_runs(monkeypatch):
+async def test_a_routine_self_wake_waits_its_turn_and_a_repeat_of_it_is_dropped(monkeypatch):
+    """Each kind of routine wake gets one place behind a person's turn; a
+    repeat of one that is waiting is fast-acked and dropped."""
+    kinds = ("self-idle", "self-scheduler", "self-cron", "self-goal-nudge", "self-lifecycle")
     gateway = FakeGateway()
     await gateway.start()
     ex = _executor(monkeypatch, gateway)
     await ex.start()
     try:
-        queue = _Queue()
-        running = asyncio.create_task(ex.execute(_ctx("real work"), queue))
+        running = asyncio.create_task(ex.execute(_ctx("real work"), _Queue()))
         mid = await _dispatched(gateway, "real work")
-        for source_type in ("self-idle", "self-scheduler", "self-cron"):
-            wake = _Queue()
-            await asyncio.wait_for(
-                ex.execute(_ctx(f"<SYSTEM IDLE PROMPT> {source_type}", source_type=source_type), wake),
-                1,
+        waiting = []
+        for source_type in kinds:
+            queue = _Queue()
+            task = asyncio.create_task(
+                ex.execute(_ctx(f"wake {source_type}", source_type=source_type), queue)
             )
-            assert wake.texts() == [executor_mod._SELF_PING_SKIPPED]
+            await asyncio.sleep(0.02)
+            assert not task.done(), (source_type, queue.texts())
+            waiting.append((task, queue))
+            repeat = _Queue()
+            await asyncio.wait_for(
+                ex.execute(_ctx(f"again {source_type}", source_type=source_type), repeat), 1
+            )
+            assert repeat.texts() == [executor_mod._SELF_PING_SKIPPED], source_type
         assert gateway.contents() == ["real work"]
 
         await gateway.send("work done", reply_to=mid)
         await asyncio.wait_for(running, 5)
-
-        # Idle again: the next wake is a turn like any other.
-        later = _Queue()
-        woke = asyncio.create_task(
-            ex.execute(_ctx("<SYSTEM IDLE PROMPT> later", source_type="self-idle"), later)
-        )
-        wake_id = await _dispatched(gateway, "<SYSTEM IDLE PROMPT> later")
-        await gateway.send("(idle)", reply_to=wake_id)
-        await asyncio.wait_for(woke, 5)
-        assert later.texts() == ["(idle)"]
+        for source_type, (task, queue) in zip(kinds, waiting):
+            await _dispatched(gateway, f"wake {source_type}")
+            await gateway.answer(f"wake {source_type}", f"done {source_type}")
+            await asyncio.wait_for(task, 5)
+            assert queue.texts() == [f"done {source_type}"]
+        assert gateway.contents() == ["real work", *(f"wake {s}" for s in kinds)]
     finally:
         await ex.stop()
         await gateway.close()
@@ -795,6 +833,95 @@ async def test_a_scheduler_tick_off_the_wire_is_dropped_until_the_turn_has_ended
 
 
 @pytest.mark.asyncio
+async def test_another_schedules_fire_waits_its_turn_and_a_repeat_is_dropped(monkeypatch, caplog):
+    """#407 (DineCall SEO): a */30 continuous tick beside a dozen daily, weekly
+    and monthly schedules, and tick turns that run most of the hour. Every fire
+    that landed during one was dropped, and the scheduler recorded it as done:
+    the day's job was lost. Only a repeat of a schedule that is already running
+    or waiting is dropped."""
+    caplog.set_level("INFO", logger="executor")
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway)
+    await ex.start()
+
+    async def dropped(ctx: RequestContext) -> bool:
+        queue = _Queue()
+        await asyncio.wait_for(ex.execute(ctx, queue), 1)
+        return queue.texts() == [executor_mod._SELF_PING_SKIPPED]
+
+    try:
+        tick_q, blog_q = _Queue(), _Queue()
+        tick = asyncio.create_task(ex.execute(_fire(_TICK, "tick 0"), tick_q))
+        await _dispatched(gateway, "tick 0")
+        assert await dropped(_fire(_TICK, "tick 1")), "a repeat of the running schedule"
+
+        blog = asyncio.create_task(ex.execute(_fire(_BLOG, "blog 0"), blog_q))
+        await _not_dispatched(gateway, "blog 0", 0.1)
+        assert not blog.done(), blog_q.texts()
+        assert await dropped(_fire(_BLOG, "blog 1")), "a repeat of the waiting schedule"
+        assert gateway.contents() == ["tick 0"]
+
+        await gateway.answer("tick 0", "tick done")
+        await asyncio.wait_for(tick, 5)
+        assert tick_q.texts() == ["tick done"]
+        await _dispatched(gateway, "blog 0")
+        # The tick's turn is over, so its next fire is no repeat: it waits too.
+        later_q = _Queue()
+        later = asyncio.create_task(ex.execute(_fire(_TICK, "tick 2"), later_q))
+        await _not_dispatched(gateway, "tick 2", 0.1)
+        assert not later.done(), later_q.texts()
+        await gateway.answer("blog 0", "posted")
+        await asyncio.wait_for(blog, 5)
+        assert blog_q.texts() == ["posted"]
+        await _dispatched(gateway, "tick 2")
+        await gateway.answer("tick 2", "tick done again")
+        await asyncio.wait_for(later, 5)
+        assert later_q.texts() == ["tick done again"]
+
+        assert gateway.contents() == ["tick 0", "blog 0", "tick 2"]
+        assert f"duplicate of a running self-scheduler '{_TICK}'" in caplog.text
+        assert f"duplicate of a queued self-scheduler '{_BLOG}'" in caplog.text
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_an_idle_wake_waits_behind_a_tick_and_absorbs_the_next_one(monkeypatch, caplog):
+    """The idle digest's poster gives up long before a tick's turn ends: it is
+    answered at the self-turn deadline, and the wake keeps its place. The
+    digest's next wake finds it still waiting."""
+    caplog.set_level("INFO", logger="executor")
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS="0.3")
+    await ex.start()
+    try:
+        tick = asyncio.create_task(ex.execute(_fire(_TICK, "tick"), _Queue()))
+        await _dispatched(gateway, "tick")
+        first = _Queue()
+        await asyncio.wait_for(ex.execute(_idle_wake("<SYSTEM IDLE PROMPT> 1"), first), 3)
+        assert first.texts()[0].startswith("[autonomous turn still running after 0.3s"), first.texts()
+        second = _Queue()
+        await asyncio.wait_for(ex.execute(_idle_wake("<SYSTEM IDLE PROMPT> 2"), second), 1)
+        assert second.texts() == [executor_mod._SELF_PING_SKIPPED]
+        assert gateway.contents() == ["tick"]
+
+        await gateway.answer("tick", "tick done")
+        await asyncio.wait_for(tick, 5)
+        await _dispatched(gateway, "<SYSTEM IDLE PROMPT> 1")
+        await gateway.answer("<SYSTEM IDLE PROMPT> 1", "(idle)")
+        assert await _until(lambda: ex._turns == {})
+        assert gateway.contents() == ["tick", "<SYSTEM IDLE PROMPT> 1"]
+        assert "routine self-wake (self-idle) while a turn is in flight" in caplog.text
+        assert "duplicate of a queued self-idle" in caplog.text
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
 async def test_a_delegation_results_wake_queues_and_is_acked_in_time(monkeypatch):
     """The harvester gives up on its POST after 120 s and resends the results
     if it does; answering it at the self-wake deadline commits them once."""
@@ -820,6 +947,44 @@ async def test_a_delegation_results_wake_queues_and_is_acked_in_time(monkeypatch
         await _dispatched(gateway, "Delegation results are ready: ...")
         status, body = await gateway.answer("Delegation results are ready: ...", "Reviewed.")
         assert (status, body) == (200, {"ok": True, "stale": True})  # not shown to anyone
+        assert await _until(lambda: ex._turns == {})
+    finally:
+        await ex.stop()
+        await gateway.close()
+
+
+@pytest.mark.asyncio
+async def test_delegation_results_are_never_taken_for_a_repeat(monkeypatch):
+    """Each delegation-results wake carries results the agent has no other copy
+    of, so every one waits its turn, however many there are."""
+    texts = [f"Delegation results are ready: {n}" for n in ("one", "two", "three", "four")]
+    gateway = FakeGateway()
+    await gateway.start()
+    ex = _executor(monkeypatch, gateway, HERMES_SELF_TURN_REPLY_DEADLINE_SECONDS="0.3")
+    await ex.start()
+    try:
+        tick = asyncio.create_task(ex.execute(_fire(_TICK, "tick"), _Queue()))
+        await _dispatched(gateway, "tick")
+        waiting = []
+        for text, source_type in zip(texts, ("self-harvester", "self-harvester", "self-delegation-result")):
+            waiting.append(asyncio.create_task(
+                ex.execute(_wire_ctx(text, request_meta={"source_type": source_type}), _Queue())
+            ))
+            await asyncio.sleep(0.02)
+        await _not_dispatched(gateway, texts[0], 0.1)
+        await gateway.answer("tick", "tick done")
+        await asyncio.wait_for(tick, 5)
+        await _dispatched(gateway, texts[0])
+        # One more while the first of them runs.
+        waiting.append(asyncio.create_task(
+            ex.execute(_wire_ctx(texts[3], request_meta={"source_type": "self-harvester"}), _Queue())
+        ))
+        await _not_dispatched(gateway, texts[3], 0.1)
+        for text in texts:
+            await _dispatched(gateway, text)
+            await gateway.answer(text, "Reviewed.")
+        await asyncio.wait_for(asyncio.gather(*waiting), 5)
+        assert gateway.contents() == ["tick", *texts]
         assert await _until(lambda: ex._turns == {})
     finally:
         await ex.stop()
@@ -859,19 +1024,26 @@ async def test_people_peers_and_platform_wakes_wait_their_turn(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dropping_self_wakes_can_be_switched_off(monkeypatch):
+    """Off, even a repeat of a wake that is running or waiting waits its turn."""
+    texts = ["tick 0", "tick 1", "idle 0", "idle 1"]
+    contexts = [_fire(_TICK, "tick 0"), _fire(_TICK, "tick 1"), _idle_wake("idle 0"), _idle_wake("idle 1")]
     gateway = FakeGateway()
     await gateway.start()
     ex = _executor(monkeypatch, gateway, HERMES_DROP_SELF_PINGS_WHEN_BUSY="0")
     await ex.start()
     try:
-        running = asyncio.create_task(ex.execute(_ctx("busy"), _Queue()))
-        await _dispatched(gateway, "busy")
-        wake = asyncio.create_task(ex.execute(_ctx("tick", source_type="self-idle"), _Queue()))
-        await _not_dispatched(gateway, "tick", 0.1)
-        await gateway.answer("busy", "ok")
-        await _dispatched(gateway, "tick")
-        await gateway.answer("tick", "ok")
-        await asyncio.wait_for(asyncio.gather(running, wake), 5)
+        tasks = []
+        for ctx in contexts:
+            tasks.append(asyncio.create_task(ex.execute(ctx, _Queue())))
+            await asyncio.sleep(0.02)
+        await _dispatched(gateway, "tick 0")
+        await _not_dispatched(gateway, "tick 1", 0.1)
+        assert not any(task.done() for task in tasks)
+        for text in texts:
+            await _dispatched(gateway, text)
+            await gateway.answer(text, "ok")
+        await asyncio.wait_for(asyncio.gather(*tasks), 5)
+        assert gateway.contents() == texts
     finally:
         await ex.stop()
         await gateway.close()

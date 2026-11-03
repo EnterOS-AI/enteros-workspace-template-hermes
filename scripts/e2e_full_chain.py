@@ -379,23 +379,40 @@ async def _turn_supervision_scenarios(
                 f"in_flight={any_turn_in_flight()}")
     print("OK: busy reported while the turn runs (active_tasks=1, is_busy)")
 
-    # B. Self-wakes that land mid-turn. A routine one (the idle digest) is
-    # fast-acked and dropped: production queued 32 of these behind one turn and
-    # ran them for hours. Delegation results are the agent's only copy of them,
-    # so they wait their turn instead, and the harvester is answered at the
+    # B. Self-wakes that land mid-turn. A routine one (the idle digest) waits
+    # its turn, one of a kind: production queued 32 idle wakes behind one turn
+    # and ran them for hours, so a repeat of a wake that is already waiting is
+    # fast-acked and dropped. The waiting wake's poster is answered at the
+    # self-turn deadline. Delegation results are the agent's only copy of them,
+    # so they wait their turn as well, and the harvester is answered at the
     # self-turn deadline, before its own 120 s request gives up.
     wake_q = _CapturingQueue()
-    wake_at = time.monotonic()
+    wake = asyncio.create_task(executor.execute(
+        _ctx("<SYSTEM IDLE PROMPT> e2e-wake", task_id="t-wake", source_type="self-idle"), wake_q
+    ))
+    await asyncio.sleep(0.2)
+    repeat_q = _CapturingQueue()
+    repeat_at = time.monotonic()
     await asyncio.wait_for(
         executor.execute(
-            _ctx("<SYSTEM IDLE PROMPT> e2e-wake", task_id="t-wake", source_type="self-idle"),
-            wake_q,
+            _ctx("<SYSTEM IDLE PROMPT> e2e-repeat", task_id="t-repeat", source_type="self-idle"),
+            repeat_q,
         ),
         5,
     )
-    if _texts(wake_q) != [executor_mod._SELF_PING_SKIPPED]:
-        return f"a self-idle wake during a turn was not fast-acked: {_texts(wake_q)!r}"
-    print(f"OK: a self-idle wake during the turn was fast-acked in {time.monotonic() - wake_at:.2f}s")
+    repeat_acked = time.monotonic() - repeat_at
+    if _texts(repeat_q) != [executor_mod._SELF_PING_SKIPPED]:
+        return f"a repeat of a waiting self-idle wake was not fast-acked: {_texts(repeat_q)!r}"
+    try:
+        await asyncio.wait_for(wake, 10)
+    except asyncio.TimeoutError:
+        return "the waiting self-idle wake's poster was not answered at the self-turn deadline"
+    if len(_texts(wake_q)) != 1 or not _texts(wake_q)[0].startswith("[autonomous turn still running"):
+        return f"a self-idle wake during a turn did not wait its turn: {_texts(wake_q)!r}"
+    print(
+        "OK: a self-idle wake during the turn waited its turn, its poster answered at the "
+        f"self-turn deadline; a repeat of it was fast-acked in {repeat_acked:.2f}s"
+    )
 
     harvest_q = _CapturingQueue()
     harvest_at = time.monotonic()
@@ -437,8 +454,6 @@ async def _turn_supervision_scenarios(
     ]
     if not progress or progress[0] < 1:
         return f"no gateway progress sends reached the executor during a {elapsed:.0f}s turn"
-    if any("e2e-wake" in text for text in observed.get("user_texts", [])):
-        return "the dropped self-wake reached the model anyway"
     if not await _until(
         lambda: any(name == "terminal" and "sleep 12" in (summary or "") for name, summary, _ in chips),
         5,
@@ -455,20 +470,31 @@ async def _turn_supervision_scenarios(
         f"{progress[0]} progress sends); its tool call became an activity row"
     )
 
-    # The queued delegation results run once the long turn is answered, as a
-    # turn of their own. Their answer is the agent's business: it reports
+    # The waiting idle wake, then the queued delegation results, run once the
+    # long turn is answered, each as a turn of its own; the repeat never does.
+    # The delegation results' answer is the agent's business: it reports
     # results with its own tools, so nothing is relayed to the chat.
     if not await _until(lambda: reached_model("e2e-harvest") is not None, 30):
         return "the queued delegation results never reached the model"
     if reached_model("e2e-harvest") < long_q.at[0]:
         return "the delegation results reached the model before the running turn was answered"
+    wake_reached = reached_model("e2e-wake")
+    if wake_reached is None or wake_reached < long_q.at[0]:
+        return "the waiting self-idle wake did not run after the running turn was answered"
+    if reached_model("e2e-harvest") < wake_reached:
+        return "the delegation results ran ahead of the self-idle wake that waited before them"
+    if reached_model("e2e-repeat") is not None:
+        return "the dropped repeat of the self-idle wake reached the model anyway"
     if not await _until(lambda: tap.matching(r"late reply .* source=self-harvester — not relayed"), 30):
         return "the delegation-results turn was never answered"
     if relayed("e2e-harvest"):
         return "a delegation-results answer was relayed to the user's chat"
     if not await _until(idle, 5):
         return f"busy not released after the turns: active_tasks={heartbeat.active_tasks}"
-    print("OK: the queued delegation results then ran as their own turn; busy released")
+    print(
+        "OK: the waiting self-idle wake, then the queued delegation results, ran as turns "
+        "of their own; busy released"
+    )
 
     # C. hermes#393. A message sent while a turn ran used to wait in hermes' own
     # queue, run inside that turn, and come back under the running turn's id.
@@ -941,7 +967,7 @@ async def _amain() -> int:
     print("  → executor reply server → execute() emits on event_queue")
     print("  + hermes tool call → molecule_turn_activity → runtime turn lease")
     print("  + turn supervision: busy for the whole turn, a 12 s tool call past an 8 s")
-    print("    stall window, routine self-wakes dropped and delegation results queued,")
+    print("    stall window, repeats of routine self-wakes dropped and delegation results queued,")
     print("    one message at a time per chat (#393) with commands answered mid-turn,")
     print("    the cap's /stop ending a real run, the reply deadline with a late relay,")
     print("    a silent turn settled, a killed gateway abandoned without stranding the")
