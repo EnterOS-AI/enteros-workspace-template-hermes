@@ -1,0 +1,57 @@
+# Light runs: what a run's copy of this agent's volume leaves out (contract C2).
+#
+# A Light run pod's init container copies the parked agent's volume into the
+# run's private directory with molecule-runtime-light-copy, which reads this
+# file through MOLECULE_LIGHT_COPY_EXCLUDE_FILE (see the Dockerfile).
+#
+# One pattern per line, relative to the volume root: configs/... is /configs,
+# and HERMES_HOME (/tmp/.hermes) links to /configs/.hermes (start.sh). A
+# pattern is matched with fnmatch.fnmatchcase against the whole path, where *
+# also matches /, so files are named in full rather than as *.log. A trailing /
+# matches a directory and everything under it. The runtime itself always leaves
+# out configs/.auth_token, configs/.platform_inbound_secret and lost+found/.
+#
+# Everything else is copied: the agent's identity and config (SOUL.md,
+# config.yaml, .env), credentials (auth.json, mcp-tokens/), skills, memories,
+# plugins and the workspace's own files. tests/test_light_copy_exclude.py checks
+# every line against a measured claim and runs a real copy.
+
+# Conversation history: a run starts a fresh session.
+configs/.hermes/state.db*
+configs/.hermes/sessions/
+configs/.hermes/response_store.db*
+configs/.hermes/runs_idempotency.db*
+configs/.hermes/.hermes_history
+# Copies of the session store: /snapshot and pre-update snapshots, and backups.
+configs/.hermes/state-snapshots/
+configs/.hermes/backups/
+# Media people sent the agent or got from it, the citations ledger and
+# tool-output spill. The rest of cache/ is rebuilt on use.
+configs/.hermes/cache/
+
+# Logs: hermes writes logs/, start.sh the two files.
+configs/.hermes/logs/
+configs/.hermes/gateway.log
+configs/.hermes/molecule-mcp-server.log
+
+# The agent's own gateway and processes: PID, lock and state files that
+# describe the agent's container (hermes never imports them into another one),
+# and the background-process list the gateway recovers when it starts.
+configs/.hermes/gateway.pid
+configs/.hermes/gateway.lock
+configs/.hermes/gateway_state.json
+configs/.hermes/processes.json
+configs/.hermes/cron.pid
+# A pending restart notice: the run's gateway would announce a restart to the
+# chat that asked the agent for one.
+configs/.hermes/.restart_notify.json
+configs/.hermes/.restart_pending.json
+
+# Work the gateway starts by itself. Its cron ticker fires the due jobs in
+# cron/, and its kanban dispatcher (kanban.dispatch_in_gateway, on by default)
+# starts ready tasks and reclaims orphaned ones, so a copy would do the agent's
+# scheduled and board work a second time. A run therefore sees neither the
+# agent's hermes cron jobs nor its kanban board.
+configs/.hermes/cron/
+configs/.hermes/kanban.db*
+configs/.hermes/kanban/

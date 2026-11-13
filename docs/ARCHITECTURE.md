@@ -45,6 +45,13 @@ the chat-completions fallback on port 8642.
    `/health`, and verify that Hermes sees the `molecule` MCP server.
 6. Execute `molecule-runtime` as `agent` with `CONFIGS_DIR=/configs`.
 
+A Light run pod (`MOLECULE_RUN_MODE=once`) runs the same sequence on a private
+copy of a parked agent's volume, and `molecule-runtime` then runs one scheduled
+prompt and exits. `start.sh` differs in three places: `molecule-runtime-prepare`
+must succeed, no MCP reconcile watcher starts, and the executor's reply
+deadline and turn cap become the run's deadline. See "Light runs" in
+`docs/CONFIGURATION.md`.
+
 Gateway and MCP logs live under `/tmp/.hermes` in the current image. Do not
 document `/var/log` or `/home/agent/.hermes` as the active log/config path.
 

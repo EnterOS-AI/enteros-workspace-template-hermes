@@ -201,6 +201,27 @@ Those rows are also the activity the platform's stall watchdog needs from a
 workspace that is busy for a long time: without them it probes, and then
 restarts, a busy workspace that records no activity for about 17 minutes.
 
+## Light runs
+
+A Light run pod boots this image on a private copy of a parked agent's volume,
+runs one scheduled prompt through `molecule-runtime`'s once mode and exits. The
+control plane sets the run's variables; `molecule-runtime` documents them.
+
+| Variable | Effect in this image |
+|---|---|
+| `MOLECULE_RUN_MODE` | Unset or blank: a normal boot, unchanged. `once`: a Light run, where `start.sh` starts no MCP reconcile watcher (a gateway restart would end the run's turn) and requires `molecule-runtime-prepare` (a failure refuses the run with exit 1, because nothing else would give the gateway the agent's MCP servers). Any other value refuses to boot (exit 2). |
+| `MOLECULE_RUN_DEADLINE_SECONDS` | The run's deadline, `3600` when blank. In a run, `start.sh` sets `HERMES_TURN_REPLY_DEADLINE_SECONDS` and `HERMES_TURN_MAX_SECONDS` to it, over the agent's own values, so neither ends a run before `molecule-runtime`'s own deadline. |
+| `MOLECULE_LIGHT_COPY_EXCLUDE_FILE` | Set by the image to `/app/light-copy-exclude.txt`, the list of what the run's copy leaves out: conversation history and its copies, logs, the agent's own gateway and process files, and Hermes' cron jobs and kanban boards, which the run's gateway would otherwise run a second time. A run therefore sees neither the agent's Hermes cron jobs nor its kanban board. |
+
+In a run, every reply the executor composes itself, instead of relaying
+Hermes' answer (the turn-supervision replies above, a full queue, an empty
+prompt, a context overflow the auto-heal could not clear, and the
+chat-completions fallback's errors), is a FAILED task status carrying the same
+text, so the run is recorded as failed. Outside a run it stays the plain reply.
+An error Hermes itself answers in plain text, such as a provider's quota or
+authentication failure, is Hermes' answer, so the run is recorded as
+succeeded with that text.
+
 ## Bundled Node.js
 
 Hermes' package manager installs Node.js and npm into its tool store

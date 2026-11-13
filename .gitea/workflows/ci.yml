@@ -1241,4 +1241,7 @@ jobs:
           tests/test_start_sh_tmpdir.py
           tests/test_turn_activity_plugin.py
           tests/test_turn_supervision.py
+          tests/test_start_sh_run_mode.py
+          tests/test_light_copy_exclude.py
+          tests/test_run_once_failure_signal.py
           -v

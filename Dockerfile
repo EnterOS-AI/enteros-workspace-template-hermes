@@ -365,6 +365,12 @@ RUN set -eu; \
       "$store_python" "$agent_python" "$source_snapshot" > /etc/hermes-pm-layout.env; \
     cat /etc/hermes-pm-layout.env
 
+# Light runs (contract C2): what a run's copy of the agent's volume leaves out.
+# molecule-runtime-light-copy, in a run pod's init container, reads it through
+# MOLECULE_LIGHT_COPY_EXCLUDE_FILE below. Copied after the hermes install, so
+# editing the list rebuilds nothing else.
+COPY light-copy-exclude.txt /app/light-copy-exclude.txt
+
 ENV ADAPTER_MODULE=adapter \
     HERMES_API_BASE=http://127.0.0.1:8642/v1 \
     API_SERVER_ENABLED=true \
@@ -374,7 +380,8 @@ ENV ADAPTER_MODULE=adapter \
     MOLECULE_A2A_PLATFORM_HOST=127.0.0.1 \
     MOLECULE_A2A_PLATFORM_PORT=8645 \
     MOLECULE_A2A_CALLBACK_HOST=127.0.0.1 \
-    MOLECULE_A2A_CALLBACK_PORT=8646
+    MOLECULE_A2A_CALLBACK_PORT=8646 \
+    MOLECULE_LIGHT_COPY_EXCLUDE_FILE=/app/light-copy-exclude.txt
 
 # start.sh boots `hermes gateway` in the background, waits for :8642
 # readiness, then exec's molecule-runtime on :8000.

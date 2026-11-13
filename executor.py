@@ -77,6 +77,7 @@ except ImportError:  # pragma: no cover
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.helpers import new_text_message
+from a2a.types import TaskState, TaskStatus, TaskStatusUpdateEvent
 
 from molecule_runtime.adapters.base import AdapterConfig
 from molecule_runtime.executor_helpers import (
@@ -982,6 +983,44 @@ def _read_tool_event(path: str) -> Optional[dict]:
     return record
 
 
+# --- Light runs: a turn the executor gave up on (contract C6) -----------------
+# A Light run pod (MOLECULE_RUN_MODE=once) sends one scheduled prompt through
+# execute() and records the run from what was enqueued: an answer is a
+# succeeded run, a FAILED task status a failed one. Every reply this executor
+# composes itself instead of relaying hermes' answer (a stall, the turn cap, a
+# refused POST, the interim reply at the reply deadline, a cancellation, ...)
+# goes through _give_up, so a run records it as the failure it is rather than
+# as an answer. Outside a run the caller gets the same text as a plain reply,
+# exactly as before.
+
+
+def _run_once_mode() -> bool:
+    """True in a Light run pod (MOLECULE_RUN_MODE=once), by the runtime's own
+    rule, read live; False on a runtime without once mode."""
+    try:
+        from molecule_runtime.workspace_mode import RUN_MODE_ONCE, resolve_run_mode
+
+        return resolve_run_mode() == RUN_MODE_ONCE
+    except Exception:  # noqa: BLE001 — an older runtime, or a mode it refuses to boot in
+        return False
+
+
+def _failed_status(text: str) -> TaskStatusUpdateEvent:
+    """A FAILED task status whose message is ``text``. A run's event queue reads
+    only the state and the message, so the task and context ids stay empty."""
+    return TaskStatusUpdateEvent(
+        status=TaskStatus(state=TaskState.TASK_STATE_FAILED, message=new_text_message(text))
+    )
+
+
+async def _give_up(event_queue: EventQueue, text: str) -> None:
+    """Answer the caller of a turn that did not run to hermes' answer with ``text``."""
+    if _run_once_mode():
+        await event_queue.enqueue_event(_failed_status(text))
+    else:
+        await event_queue.enqueue_event(new_text_message(text))
+
+
 class HermesAgentProxyExecutor(AgentExecutor):
     """Forwards every A2A turn to hermes-agent."""
 
@@ -1227,11 +1266,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if not text.strip():
             # Truly empty — actionable per
             # feedback_surface_actionable_failure_reason_to_user.
-            await event_queue.enqueue_event(
-                new_text_message(
-                    "Your message was empty. Please send text or a file "
-                    "with instructions."
-                )
+            await _give_up(
+                event_queue,
+                "Your message was empty. Please send text or a file "
+                "with instructions.",
             )
             return
         prompt = text
@@ -1244,7 +1282,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
             # other wake waits its turn, so another schedule's fire still runs
             # (#407).
             if self._should_skip_self_ping(context, prompt):
-                await event_queue.enqueue_event(new_text_message(_SELF_PING_SKIPPED))
+                await _give_up(event_queue, _SELF_PING_SKIPPED)
                 return
             # Plugin path → hermes daemon owns session state natively
             # (gateway/session.py SessionStore: SQLite + JSONL, keyed by
@@ -1465,6 +1503,13 @@ class HermesAgentProxyExecutor(AgentExecutor):
                     )
                 text = retry
 
+        if _run_once_mode() and _is_context_overflow(text):
+            # The heal above could not clear it (the /new failed, or the replay
+            # overflowed again): in a Light run that is the run's failure, not
+            # its answer.
+            await _give_up(event_queue, text)
+            return
+
         await event_queue.enqueue_event(
             _reply_message_with_tool_trace(
                 text, _tool_trace_from_session_delta(session_snapshot)
@@ -1599,7 +1644,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
                     "hermes plugin: %d messages already waiting on %s; refusing another",
                     len(self._queue.get(chat_id, ())), chat_id,
                 )
-                await event_queue.enqueue_event(new_text_message(_QUEUE_FULL_REPLY))
+                await _give_up(event_queue, _QUEUE_FULL_REPLY)
                 return None
 
         loop = asyncio.get_running_loop()
@@ -1687,9 +1732,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         if self._spawn(self._drive(turn, payload, headers, future)) is None:
             self._retire(turn)
             if event_queue is not None:
-                await event_queue.enqueue_event(
-                    new_text_message("[hermes plugin error] executor shutting down")
-                )
+                await _give_up(event_queue, "[hermes plugin error] executor shutting down")
             return None
         try:
             if kind == "control":
@@ -1869,25 +1912,21 @@ class HermesAgentProxyExecutor(AgentExecutor):
                         "the turn keeps running and its answer will be delivered late",
                         turn.message_id, turn.deadline,
                     )
-                    await event_queue.enqueue_event(
-                        new_text_message(self._interim_reply(turn, turn.deadline))
-                    )
+                    await _give_up(event_queue, self._interim_reply(turn, turn.deadline))
                     return None
                 timeout = min(timeout, remaining)
             await asyncio.wait({future}, timeout=timeout)
             self._ensure_supervisor()
         if future.cancelled():
-            await event_queue.enqueue_event(
-                new_text_message("[hermes plugin error] the turn was cancelled")
-            )
+            await _give_up(event_queue, "[hermes plugin error] the turn was cancelled")
             return None
         try:
             text = future.result()
         except HermesTurnAbandoned as exc:
-            await event_queue.enqueue_event(new_text_message(str(exc)))
+            await _give_up(event_queue, str(exc))
             return None
         except Exception as exc:
-            await event_queue.enqueue_event(new_text_message(f"[hermes plugin error] {exc!s}"))
+            await _give_up(event_queue, f"[hermes plugin error] {exc!s}")
             return None
         logger.info(
             "hermes turn %s answered after %.1fs (%d progress sends)",
@@ -2771,23 +2810,20 @@ class HermesAgentProxyExecutor(AgentExecutor):
                         await event_queue.enqueue_event(new_text_message(text))
                         return
 
-                # Exhausted tool rounds — emit whatever we have
+                # Exhausted tool rounds — emit whatever we have. The round cap
+                # gave up on the turn, so a Light run records it as failed.
                 text = self._extract_assistant_text(data)
-                await event_queue.enqueue_event(new_text_message(text))
+                await _give_up(event_queue, text)
 
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:500] if exc.response is not None else ""
             logger.error("hermes-agent %s: %s", exc.response.status_code, body)
-            await event_queue.enqueue_event(
-                new_text_message(
-                    f"[hermes-agent error {exc.response.status_code}] {body}"
-                )
+            await _give_up(
+                event_queue, f"[hermes-agent error {exc.response.status_code}] {body}"
             )
         except httpx.RequestError as exc:
             logger.exception("hermes-agent transport error")
-            await event_queue.enqueue_event(
-                new_text_message(f"[hermes-agent unreachable] {exc!s}")
-            )
+            await _give_up(event_queue, f"[hermes-agent unreachable] {exc!s}")
 
     def _build_initial_messages(
         self,
