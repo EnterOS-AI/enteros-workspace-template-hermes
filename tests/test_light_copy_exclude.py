@@ -64,6 +64,21 @@ UNMEASURED = {
     "configs/.hermes/.restart_notify.json": "gateway/run_notifications.py _send_restart_notification",
     "configs/.hermes/.restart_pending.json": "gateway/run.py _planned_restart_notification_path",
     "configs/.hermes/kanban/": "hermes_cli/backup.py _QUICK_STATE_FILES kanban/boards",
+    "configs/.hermes/pending_messages/": (
+        "gateway/shutdown_flush.py _get_flush_dir: queued messages, the overflow FIFO and spooled "
+        "transcript rows; recover_pending_spool replays them when the gateway starts"
+    ),
+    "configs/.hermes/gateway-starts.log": (
+        "gateway/status.py record_start_and_check_storm: the respawn-storm ledger "
+        "hermes_cli/gateway.py _respawn_storm_backoff reads at gateway start"
+    ),
+    "configs/.hermes/.update_*": (
+        "gateway/run_notifications_update.py: .update_pending(.claimed).json, .update_output.txt, "
+        ".update_exit_code, .update_prompt.json, .update_response; hermes_cli/profiles.py .update_check"
+    ),
+    "configs/.hermes/checkpoints/": "tools/checkpoint_manager.py CHECKPOINT_BASE; checkpoints.enabled is off",
+    "configs/.hermes/moa-traces/": "agent/moa_trace.py, per-session MoA traces; moa.save_traces is off",
+    "configs/.hermes/a2a_conversations/": "plugins/platforms/a2a/protocol.py, hermes' own A2A platform; not enabled",
 }
 
 LEAVE_OUT = [
@@ -76,20 +91,29 @@ LEAVE_OUT = [
     "configs/.hermes/response_store.db", "configs/.hermes/response_store.db-wal",
     "configs/.hermes/runs_idempotency.db", "configs/.hermes/runs_idempotency.db-wal",
     "configs/.hermes/.hermes_history",
+    "configs/.hermes/pending_messages/pending-0f3c9a7e5b.json",
+    "configs/.hermes/pending_messages/pending-77aa01.json.bad",
     "configs/.hermes/state-snapshots/20261101-040000/state.db",
     "configs/.hermes/backups/hermes-backup-20261101.zip",
     "configs/.hermes/cache/images/img_1.png", "configs/.hermes/cache/documents/report.pdf",
     "configs/.hermes/cache/models_dev.json",
     # logs
     "configs/.hermes/logs/agent.log", "configs/.hermes/logs/errors.log", "configs/.hermes/logs/gateway.log",
-    "configs/.hermes/gateway.log", "configs/.hermes/molecule-mcp-server.log",
+    "configs/.hermes/gateway.log", "configs/.hermes/molecule-mcp-server.log", "configs/.hermes/gateway-starts.log",
     # the agent's own gateway and its processes
     "configs/.hermes/gateway.pid", "configs/.hermes/gateway.lock", "configs/.hermes/gateway_state.json",
     "configs/.hermes/processes.json", "configs/.hermes/cron.pid",
     "configs/.hermes/.restart_notify.json", "configs/.hermes/.restart_pending.json",
+    "configs/.hermes/.update_pending.json", "configs/.hermes/.update_pending.claimed.json",
+    "configs/.hermes/.update_output.txt", "configs/.hermes/.update_exit_code",
+    "configs/.hermes/.update_prompt.json", "configs/.hermes/.update_response", "configs/.hermes/.update_check",
     # work the gateway starts by itself
     "configs/.hermes/cron/jobs.json", "configs/.hermes/cron/output/a1b2/2026-11-12_09-00.md",
     "configs/.hermes/kanban.db", "configs/.hermes/kanban.db-shm", "configs/.hermes/kanban/boards/ops/kanban.db",
+    # per-session history of features this image keeps off
+    "configs/.hermes/checkpoints/store/HEAD", "configs/.hermes/checkpoints/indexes/9f2c.json",
+    "configs/.hermes/moa-traces/20261112_093000_abc.jsonl",
+    "configs/.hermes/a2a_conversations/peer-1.jsonl",
 ]
 
 KEEP = [
@@ -117,6 +141,10 @@ KEEP = [
     "configs/.hermes/skills/x/gateway.log", "configs/.hermes/skills/cron/SKILL.md",
     "configs/.hermes/skills/kanban/SKILL.md", "configs/.hermes/memories/state.db-notes.md",
     "configs/.hermes/plugins/p/cache/data.json",
+    "configs/.hermes/skills/ops/pending_messages/README.md", "configs/.hermes/skills/x/gateway-starts.log",
+    "configs/.hermes/skills/ops/.update_pending.json", "configs/.hermes/.updated",
+    "configs/.hermes/memories/checkpoints/plan.md", "configs/.hermes/skills/moa-traces/SKILL.md",
+    "configs/.hermes/plugins/p/a2a_conversations/x.jsonl",
 ]
 
 
