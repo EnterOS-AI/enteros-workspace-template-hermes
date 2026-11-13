@@ -127,7 +127,8 @@ def _run_env(**over: Optional[str]) -> dict:
 @pytest.mark.parametrize(
     "raw",
     [None, "", " ", "\t", "\n", "once", "ONCE", " Once ", "\tonce\n",
-     "twice", "serve", "1", "true", "on ce", "onc", "once1"],
+     "twice", "serve", "1", "true", "on ce", "onc", "once1",
+     "on\nce", "once\nonce", "tw\rice"],
 )
 def test_run_mode_agrees_with_the_runtime(tmp_path, raw):
     try:
@@ -144,6 +145,29 @@ def test_run_mode_agrees_with_the_runtime(tmp_path, raw):
         assert (r.rc, r.run_once, r.stderr) == (0, "1", "")
         assert r.stdout.startswith("[start.sh] MOLECULE_RUN_MODE=once: Light run pod")
         assert len(r.stdout.splitlines()) == 1
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "raw,shown",
+    [
+        ("on\nce", "on\\nce"),
+        ("once\nrm -rf /", "once\\nrm -rf /"),
+        ("tw\r\nice", "tw\\r\\nice"),
+        ("a\tb\x1bc", "a\\tb?c"),
+        ("x" * 39 + "\n" + "y" * 60, "x" * 39 + "\\n"),  # at most 40 characters of it
+    ],
+)
+def test_a_refused_value_is_shown_on_one_line(tmp_path, raw, shown):
+    # A value can hold any byte: the refusal names it with its control
+    # characters escaped, as molecule-runtime's own refusal does, so one log
+    # line stays one line, and it shows at most 40 characters of the value.
+    r = _run_block(tmp_path, MOLECULE_RUN_MODE=raw)
+    assert (r.rc, r.stdout) == (2, "")
+    assert r.stderr == (
+        f"[start.sh] MOLECULE_RUN_MODE='{shown}' is not a run mode this image knows "
+        "(unset or 'once'); refusing to boot\n"
+    )
 
 
 @posix_only

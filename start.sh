@@ -126,7 +126,15 @@ case "${_run_mode,,}" in
          "reply deadline and turn cap = ${HERMES_TURN_REPLY_DEADLINE_SECONDS}s"
     ;;
   *)
-    echo "[start.sh] MOLECULE_RUN_MODE='${_run_mode:0:40}' is not a run mode this image" \
+    # Shown on one line whatever it holds, as molecule-runtime's own refusal
+    # shows it: newline, carriage return and tab escaped, any other control
+    # character as '?'.
+    _shown="${_run_mode:0:40}"
+    _shown="${_shown//$'\n'/\\n}"
+    _shown="${_shown//$'\r'/\\r}"
+    _shown="${_shown//$'\t'/\\t}"
+    _shown="${_shown//[[:cntrl:]]/?}"
+    echo "[start.sh] MOLECULE_RUN_MODE='${_shown}' is not a run mode this image" \
          "knows (unset or 'once'); refusing to boot" >&2
     exit 2
     ;;
