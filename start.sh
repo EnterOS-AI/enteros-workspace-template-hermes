@@ -1157,6 +1157,10 @@ fi
 # (HOME=/tmp so config resolves to /tmp/.hermes -> /configs/.hermes) so the
 # pre-written block is byte-identical to what the real serve rewrites — the
 # hardened watcher then sees no genuine post-launch change and stays dormant.
+#
+# A Light run pod (RUN_ONCE=1, see the Light run pod block) starts no watcher,
+# so there this step is the only way the gateway gets the agent's MCP servers:
+# a failed or missing prepare refuses the run instead of falling back.
 if command -v molecule-runtime-prepare >/dev/null 2>&1; then
   echo "[start.sh] pre-materializing MCP config (molecule-runtime-prepare) before gateway launch"
   # shellcheck disable=SC2086 -- AS_AGENT is a deliberately word-split prefix.
@@ -1164,9 +1168,21 @@ if command -v molecule-runtime-prepare >/dev/null 2>&1; then
     echo "[start.sh] config pre-materialized — gateway will discover all MCP servers on first boot (no reconcile restart)"
   else
     _prep_rc=$?
+    if [ "$RUN_ONCE" = 1 ]; then
+      echo "[start.sh] Light run: molecule-runtime-prepare did not complete (rc=${_prep_rc})." \
+           "A run has no reconcile watcher to repair the MCP config after the gateway" \
+           "starts, so it would run without the agent's MCP servers. Refusing. Last log lines:" >&2
+      tail -40 "$LOG_FILE" >&2 || true
+      exit 1
+    fi
     echo "[start.sh] molecule-runtime-prepare did not complete (rc=${_prep_rc}); falling back to the post-launch reconcile watcher" >&2
   fi
 else
+  if [ "$RUN_ONCE" = 1 ]; then
+    echo "[start.sh] Light run: this runtime wheel has no molecule-runtime-prepare, and a run" \
+         "has no reconcile watcher to fall back to. Refusing." >&2
+    exit 1
+  fi
   echo "[start.sh] molecule-runtime-prepare not in this runtime wheel; using the post-launch reconcile watcher"
 fi
 
@@ -1274,7 +1290,16 @@ echo "[start.sh] hermes gateway ready on :${API_SERVER_PORT:-8642} (pid ${GATEWA
 # (scripts/test-mcp-reconcile-watch.sh) and exercised per-PR. Full
 # rationale lives in that script's header. Backgrounded; survives the
 # exec of molecule-runtime below.
-MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LAUNCH_CMD="exec ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH=${GATEWAY_PATH} bash -c 'cd /tmp && hermes gateway'" MCPWATCH_HEALTH_URL="http://127.0.0.1:${API_SERVER_PORT:-8642}/health" MCPWATCH_LOG_FILE="$LOG_FILE" MCPWATCH_MARKER="/tmp/.hermes/.clean_shutdown"   bash /usr/local/bin/mcp-reconcile-watch.sh &
+#
+# A Light run pod starts none: the watcher restarts the gateway when
+# config.yaml changes, which would end the run's only turn, and the gateway
+# already started on the prepared config (a failed prepare refused the run).
+if [ "$RUN_ONCE" = 1 ]; then
+  echo "[start.sh] Light run: no MCP reconcile watcher (the gateway started on the" \
+       "prepared config; a restart would end the run's turn)"
+else
+  MCPWATCH_CONFIG="$HERMES_CONFIG" MCPWATCH_GATEWAY_PID="$GATEWAY_PID" MCPWATCH_LAUNCH_CMD="exec ${AS_AGENT} env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH=${GATEWAY_PATH} bash -c 'cd /tmp && hermes gateway'" MCPWATCH_HEALTH_URL="http://127.0.0.1:${API_SERVER_PORT:-8642}/health" MCPWATCH_LOG_FILE="$LOG_FILE" MCPWATCH_MARKER="/tmp/.hermes/.clean_shutdown"   bash /usr/local/bin/mcp-reconcile-watch.sh &
+fi
 
 # --- Smoke: confirm hermes sees the molecule MCP server in `mcp list` ---
 # Belt-and-braces check: even if config.yaml has mcp_servers.molecule

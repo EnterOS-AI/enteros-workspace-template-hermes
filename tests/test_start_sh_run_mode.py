@@ -8,9 +8,13 @@ standing in for the processes it launches.
 """
 from __future__ import annotations
 
+import collections
+import json
 import os
 import pathlib
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -179,3 +183,207 @@ def test_the_mode_is_decided_before_the_first_boot_step():
     block = next(i for i, line in enumerate(_start_sh_lines()) if line.startswith(BLOCK_START))
     first_step = next(i for i, line in code if i > smoke_exec and ("chown" in line or "install " in line))
     assert smoke_exec < block < first_step, "decide the run mode after the smoke branch, before any boot step"
+
+
+# --- the boot from the MCP server to molecule-runtime ---------------------------
+#
+# The tail of start.sh runs for real under bash: from the Molecule MCP server's
+# launch to the exec of molecule-runtime. Stubs on PATH stand in for every
+# process it starts and record their name, arguments and environment; the
+# reconcile watcher's absolute path is pointed at a stub too. A preamble supplies
+# what the earlier part of start.sh would have set, and the real run-mode block.
+
+TAIL_START = "# --- Start the Molecule A2A MCP HTTP server ---"
+WATCHER_PATH = "/usr/local/bin/mcp-reconcile-watch.sh"
+GATEWAY_PATH_SEED = 'GATEWAY_PATH="/home/agent/.local/bin:'
+RECORDED_ENV = (
+    "HOME", "CONFIGS_DIR", "MOLECULE_RUNTIME_PREPARE_ONLY", "MOLECULE_RUN_MODE",
+    "HERMES_TURN_REPLY_DEADLINE_SECONDS", "HERMES_TURN_MAX_SECONDS", "HERMES_GATEWAY_BUSY_INPUT_MODE",
+)
+
+# One recorder behind every stub: argv[1] names the stub.
+_RECORDER = '''
+import json, os, sys
+name, argv = sys.argv[1], sys.argv[2:]
+if name == "python3":
+    if argv[:2] != ["-m", "molecule_runtime.a2a_mcp_server"]:
+        os.execv({python!r}, [{python!r}, *argv])
+    name = "mcp-server"
+elif name == "hermes":
+    name = {{("gateway",): "gateway", ("mcp", "list"): "mcp-list"}}.get(tuple(argv), "hermes " + " ".join(argv))
+elif name in ("curl", "install"):
+    if name == "install" and argv and not argv[-1].startswith("-"):
+        if "-d" in argv:
+            os.makedirs(argv[-1], exist_ok=True)
+        else:
+            open(argv[-1], "a").close()
+    sys.exit(0)
+env = {{k: os.environ[k] for k in {recorded!r} if k in os.environ}}
+env.update({{k: v for k, v in os.environ.items() if k.startswith("MCPWATCH_")}})
+if name == "gateway":
+    env["PATH"] = os.environ.get("PATH", "")
+with open({log!r}, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({{"name": name, "argv": argv, "env": env}}) + "\\n")
+if name == "mcp-list":
+    print("  molecule      http://127.0.0.1:9100/mcp   enabled")
+if name == "prepare":
+    sys.exit({prepare_rc})
+'''
+
+
+@dataclass
+class Boot:
+    rc: int
+    stdout: str
+    stderr: str
+    records: list
+    gateway_path: str
+
+    def cmds(self) -> list:
+        return [r["name"] for r in self.records]
+
+    def env(self, name: str) -> dict:
+        (record,) = [r for r in self.records if r["name"] == name]
+        return record["env"]
+
+
+def _tail() -> str:
+    text = START_SH.read_text(encoding="utf-8")
+    assert text.count(TAIL_START) == 1
+    return text[text.index(TAIL_START):]
+
+
+def _boot_tail(
+    tmp_path: pathlib.Path, *, mode: Optional[str] = None, deadline: Optional[str] = None,
+    prepare_rc: int = 0, prepare: bool = True,
+) -> Boot:
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    log = tmp_path / "records.jsonl"
+    recorder = stubs / "record.py"
+    recorder.write_text(
+        _RECORDER.format(python=sys.executable, recorded=RECORDED_ENV, log=str(log), prepare_rc=prepare_rc),
+        encoding="utf-8",
+    )
+    names = {"python3": "python3", "curl": "curl", "install": "install", "hermes": "hermes",
+             "molecule-runtime": "runtime", "watcher.sh": "watcher"}
+    if prepare:
+        names["molecule-runtime-prepare"] = "prepare"
+    for file_name, stub_name in names.items():
+        stub = stubs / file_name
+        stub.write_text(f'#!/bin/bash\nexec "{sys.executable}" "{recorder}" {stub_name} "$@"\n', encoding="utf-8")
+        stub.chmod(0o755)
+
+    tail = _tail()
+    assert tail.count(WATCHER_PATH) == 1 and tail.count(GATEWAY_PATH_SEED) == 1
+    tail = tail.replace(WATCHER_PATH, str(stubs / "watcher.sh"))
+    tail = tail.replace(GATEWAY_PATH_SEED, f'GATEWAY_PATH="{stubs}:/home/agent/.local/bin:')
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    preamble = "\n".join([
+        "set -euo pipefail",
+        f'HERMES_HOME="{hermes_home}"',
+        'HERMES_CONFIG="$HERMES_HOME/config.yaml"',
+        'LOG_FILE="$HERMES_HOME/gateway.log"',
+        ': >"$LOG_FILE"',
+        'AS_AGENT=""',
+        'HERMES_AGENT_PYTHON=""',
+        ". scripts/process-liveness.sh",
+        "mirror_log_to_stdout() { :; }",
+    ])
+    block = _block() if BLOCK_START in START_SH.read_text(encoding="utf-8") else ""
+    env = {
+        k: v for k, v in os.environ.items()
+        if not k.startswith(("MOLECULE_", "HERMES_", "API_SERVER_", "MCPWATCH_"))
+    }
+    env["PATH"] = f"{stubs}:/usr/bin:/bin"
+    if mode is not None:
+        env["MOLECULE_RUN_MODE"] = mode
+    if deadline is not None:
+        env["MOLECULE_RUN_DEADLINE_SECONDS"] = deadline
+    proc = subprocess.run(
+        ["bash", "-c", "\n".join([preamble, block, tail])],
+        capture_output=True, text=True, env=env, cwd=ROOT, timeout=120, check=False,
+    )
+    # The MCP server, the gateway and the watcher are started in the background:
+    # give their records a moment to land, then a little more for anything late.
+    deadline_at = time.monotonic() + 5
+    want = {"mcp-server", "gateway"} if proc.returncode == 0 else set()
+    while time.monotonic() < deadline_at:
+        names_seen = {r["name"] for r in _records(log)}
+        if want <= names_seen:
+            break
+        time.sleep(0.05)
+    time.sleep(0.5)
+    gateway_path = f"{stubs}:/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    return Boot(proc.returncode, proc.stdout, proc.stderr, _records(log), gateway_path)
+
+
+def _records(log: pathlib.Path) -> list:
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+@posix_only
+def test_a_normal_boot_tail_is_unchanged(tmp_path):
+    b = _boot_tail(tmp_path)
+    assert b.rc == 0, b.stderr
+    assert collections.Counter(b.cmds()) == collections.Counter(
+        ["mcp-server", "prepare", "gateway", "watcher", "mcp-list", "runtime"]
+    )
+    assert b.cmds().index("prepare") < b.cmds().index("gateway")
+    assert b.cmds().index("mcp-list") < b.cmds().index("runtime")
+    (server,) = [r for r in b.records if r["name"] == "mcp-server"]
+    assert server["argv"] == ["-m", "molecule_runtime.a2a_mcp_server", "--transport", "http", "--port", "9100"]
+    assert server["env"] == {"HOME": "/tmp", "CONFIGS_DIR": "/configs"}
+    assert b.env("prepare") == {"HOME": "/tmp", "CONFIGS_DIR": "/configs", "MOLECULE_RUNTIME_PREPARE_ONLY": "1"}
+    assert b.env("gateway") == {"HOME": "/tmp", "HERMES_GATEWAY_BUSY_INPUT_MODE": "queue", "PATH": b.gateway_path}
+    watcher = {k: v for k, v in b.env("watcher").items() if k.startswith("MCPWATCH_")}
+    assert watcher.pop("MCPWATCH_GATEWAY_PID").isdigit()
+    assert watcher == {
+        "MCPWATCH_CONFIG": str(tmp_path / "hermes" / "config.yaml"),
+        "MCPWATCH_LAUNCH_CMD": (
+            f"exec  env HOME=/tmp HERMES_GATEWAY_BUSY_INPUT_MODE=queue PATH={b.gateway_path}"
+            " bash -c 'cd /tmp && hermes gateway'"
+        ),
+        "MCPWATCH_HEALTH_URL": "http://127.0.0.1:8642/health",
+        "MCPWATCH_LOG_FILE": str(tmp_path / "hermes" / "gateway.log"),
+        "MCPWATCH_MARKER": "/tmp/.hermes/.clean_shutdown",
+    }
+    assert b.env("runtime") == {"HOME": "/tmp", "CONFIGS_DIR": "/configs"}
+    assert "Light run" not in b.stdout + b.stderr
+
+
+@posix_only
+@pytest.mark.parametrize("prepare_rc,prepare", [(1, True), (0, False)])
+def test_a_normal_boot_still_falls_back_to_the_watcher(tmp_path, prepare_rc, prepare):
+    b = _boot_tail(tmp_path, prepare_rc=prepare_rc, prepare=prepare)
+    assert b.rc == 0, b.stderr
+    assert {"gateway", "watcher", "runtime"} <= set(b.cmds())
+
+
+@posix_only
+def test_a_run_keeps_mcp_server_prepare_and_gateway_and_starts_no_watcher(tmp_path):
+    b = _boot_tail(tmp_path, mode="once", deadline="900")
+    assert b.rc == 0, b.stderr
+    assert collections.Counter(b.cmds()) == collections.Counter(
+        ["mcp-server", "prepare", "gateway", "mcp-list", "runtime"]
+    )
+    assert b.cmds().index("prepare") < b.cmds().index("gateway")
+    # molecule-runtime-prepare sees the run mode, so the runtime's prepare is quiet too.
+    assert b.env("prepare")["MOLECULE_RUN_MODE"] == "once"
+    assert b.env("gateway")["HERMES_GATEWAY_BUSY_INPUT_MODE"] == "queue"
+    runtime = b.env("runtime")
+    assert runtime["MOLECULE_RUN_MODE"] == "once"
+    assert runtime["HERMES_TURN_REPLY_DEADLINE_SECONDS"] == runtime["HERMES_TURN_MAX_SECONDS"] == "900"
+    assert "Light run: no MCP reconcile watcher" in b.stdout
+
+
+@posix_only
+@pytest.mark.parametrize("prepare_rc,prepare", [(1, True), (0, False)])
+def test_a_run_without_its_prepared_config_refuses(tmp_path, prepare_rc, prepare):
+    b = _boot_tail(tmp_path, mode="once", prepare_rc=prepare_rc, prepare=prepare)
+    assert b.rc == 1
+    assert not {"gateway", "watcher", "runtime"} & set(b.cmds())
+    assert "Light run" in b.stderr and "molecule-runtime-prepare" in b.stderr
