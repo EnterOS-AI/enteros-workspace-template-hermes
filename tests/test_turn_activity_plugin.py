@@ -27,6 +27,24 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 PLUGIN_DIR = REPO / "hermes_plugins" / "molecule_turn_activity"
 START_SH = REPO / "start.sh"
 ENV = "MOLECULE_TOOL_ACTIVITY_FILE"
+MODEL_CALL_ENV = "MOLECULE_MODEL_CALL_FILE"
+
+# What hermes passes the two model-call observers (agent/api_request_hooks.py and
+# agent/turn_response_intake.py at HERMES_COMMIT), for the Phase 1 gate's call:
+# the platform LLM answered 402 insufficient_balance.
+REFUSED_CALL = dict(
+    task_id="t1", turn_id="turn-1", api_request_id="turn-1:api:1", session_id="s1", platform="molecule-a2a",
+    model="minimax/MiniMax-M2.7", provider="custom", base_url="http://llm-proxy.internal/v1",
+    api_mode="chat_completions", api_call_count=1, api_duration=0.4, started_at=1.0, ended_at=1.4,
+    status_code=402, retry_count=0, max_retries=3, retryable=False, reason="billing",
+    error={"type": "APIStatusError", "message": "Error code: 402 - {'error': {'code': 'insufficient_balance'}}"},
+    request={"method": "POST", "body": {"messages": [{"role": "user", "content": "write the weekly report"}]}},
+)
+ANSWERED_CALL = dict(
+    task_id="t1", turn_id="turn-1", api_request_id="turn-1:api:2", session_id="s1", platform="molecule-a2a",
+    model="minimax/MiniMax-M2.7", provider="custom", api_call_count=2, finish_reason="stop",
+    response={"assistant_message": {"content": "the weekly report"}}, usage={"total_tokens": 9},
+)
 
 
 def _plugin():
@@ -49,12 +67,26 @@ class _Ctx:
 # --- the plugin ------------------------------------------------------------------
 
 
-def test_registers_only_the_post_tool_call_observer():
+@pytest.mark.parametrize(
+    "model_call_file,want",
+    [
+        (None, ["post_tool_call"]),  # a workspace: exactly as before
+        ("/tmp/molecule-turn-lease/model_call", ["post_tool_call", "post_api_request", "api_request_error"]),
+    ],
+)
+def test_registers_observers_only(monkeypatch, model_call_file, want):
     """pre_tool_call is a policy hook: a callback that raises or times out
-    there blocks the tool. A liveness ping must never be able to do that."""
+    there blocks the tool. A liveness ping must never be able to do that. The
+    two model-call observers exist only in a Light run, where start.sh sets
+    MOLECULE_MODEL_CALL_FILE; a workspace's gateway registers nothing new, so
+    hermes builds no extra hook payloads there."""
+    if model_call_file is None:
+        monkeypatch.delenv(MODEL_CALL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(MODEL_CALL_ENV, model_call_file)
     ctx = _Ctx()
     _plugin().register(ctx)
-    assert [name for name, _ in ctx.hooks] == ["post_tool_call"]
+    assert [name for name, _ in ctx.hooks] == want
 
 
 def test_manifest_matches_what_start_sh_enables():
@@ -62,7 +94,7 @@ def test_manifest_matches_what_start_sh_enables():
     assert manifest["name"] == PLUGIN_DIR.name == "molecule_turn_activity"
     # Explicit, so hermes never auto-detects it as a memory/model provider.
     assert manifest["kind"] == "standalone"
-    assert manifest["provides_hooks"] == ["post_tool_call"]
+    assert manifest["provides_hooks"] == ["post_tool_call", "post_api_request", "api_request_error"]
 
 
 def test_touch_advances_the_mtime(tmp_path, monkeypatch):
@@ -154,6 +186,66 @@ def test_the_executor_reads_what_the_plugin_writes(tmp_path, monkeypatch):
     assert executor._tool_chip_summary(record["tool"], record["args"]) == "🛠 terminal: pwd"
 
 
+# --- model calls (Light runs) ------------------------------------------------------
+
+
+def test_a_refused_model_call_is_recorded_as_hermes_classified_it(tmp_path, monkeypatch):
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv(MODEL_CALL_ENV, str(model_calls))
+    before = time.time()
+    assert _plugin().record_model_call_error(**REFUSED_CALL) is None
+    record = json.loads(model_calls.read_text(encoding="utf-8"))
+    assert record.pop("ts") >= before
+    assert record == {
+        "v": 1, "ok": False, "status_code": 402, "reason": "billing", "retryable": False,
+        "provider": "custom", "model": "minimax/MiniMax-M2.7",
+    }
+    # The verdict only: neither the provider's error text nor the request (the
+    # prompt) leaves the gateway through this file. Private, no temp file left.
+    text = model_calls.read_text(encoding="utf-8")
+    assert "insufficient_balance" not in text and "weekly report" not in text
+    assert [p.name for p in tmp_path.iterdir()] == ["model_call"]
+    assert stat.S_IMODE(model_calls.stat().st_mode) & 0o077 == 0
+
+
+def test_a_model_call_that_answered_replaces_the_refusal(tmp_path, monkeypatch):
+    # A retry or a fallback provider that answers after a refusal: the turn
+    # recovered, so the last record must say so.
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv(MODEL_CALL_ENV, str(model_calls))
+    plugin = _plugin()
+    plugin.record_model_call_error(**REFUSED_CALL)
+    assert plugin.record_model_call_ok(**ANSWERED_CALL) is None
+    record = json.loads(model_calls.read_text(encoding="utf-8"))
+    assert (record["ok"], record["status_code"], record["reason"]) == (True, None, "")
+
+
+def test_model_call_records_need_the_variable_and_never_raise(tmp_path, monkeypatch):
+    monkeypatch.delenv(MODEL_CALL_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    plugin = _plugin()
+    assert plugin.record_model_call_error(**REFUSED_CALL) is None
+    assert plugin.record_model_call_ok(**ANSWERED_CALL) is None
+    assert list(tmp_path.iterdir()) == []
+    monkeypatch.setenv(MODEL_CALL_ENV, str(tmp_path / "no-such-dir" / "model_call"))
+    assert plugin.record_model_call_error(**REFUSED_CALL) is None
+    assert plugin.record_model_call_error(status_code="402", retryable="no", reason=None) is None
+
+
+def test_the_executor_reads_what_the_plugin_records_for_a_model_call(tmp_path, monkeypatch):
+    """The model-call record is a contract between two processes; pin both ends."""
+    import executor
+
+    monkeypatch.setenv(MODEL_CALL_ENV, str(tmp_path / "model_call"))
+    turn_started = time.time()
+    _plugin().record_model_call_error(**REFUSED_CALL)
+    assert executor._provider_refusal(turn_started) == (
+        "the model provider refused the call (billing, HTTP 402; custom minimax/MiniMax-M2.7)"
+    )
+    _plugin().record_model_call_ok(**ANSWERED_CALL)
+    assert executor._provider_refusal(turn_started) is None
+
+
 # --- start.sh: enabling it ----------------------------------------------------------
 
 _SEED_RE = re.compile(r"^\{$\n(.*?)^\} >\"\$HERMES_CONFIG\"$", re.M | re.S)
@@ -212,7 +304,9 @@ install() {
 '''
 
 
-def _run_block(tmp_path: pathlib.Path, *, cwd: pathlib.Path = REPO, **env: str):
+def _run_block(tmp_path: pathlib.Path, *, cwd: pathlib.Path = REPO, run_once: str | None = None, **env: str):
+    """Run the liveness block; ``run_once`` is the RUN_ONCE the run-mode block
+    above it left (None: not set at all, as in a start.sh without that block)."""
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir(exist_ok=True)
     log = tmp_path / "install.log"
@@ -220,8 +314,10 @@ def _run_block(tmp_path: pathlib.Path, *, cwd: pathlib.Path = REPO, **env: str):
         "set -euo pipefail",
         _INSTALL_STUB,
         f'HERMES_HOME="{hermes_home}"',
+        *([f"RUN_ONCE={run_once}"] if run_once is not None else []),
         _liveness_block(),
         'printf "EXPORTED=%s\\n" "$(printenv MOLECULE_TOOL_ACTIVITY_FILE)"',
+        'printf "MODEL_CALL=%s\\n" "$(printenv MOLECULE_MODEL_CALL_FILE || echo "<unset>")"',
     ])
     proc = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, cwd=cwd, check=False,
@@ -232,6 +328,22 @@ def _run_block(tmp_path: pathlib.Path, *, cwd: pathlib.Path = REPO, **env: str):
     exported = re.search(r"^EXPORTED=(.*)$", proc.stdout, re.M).group(1)
     calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
     return exported, calls, hermes_home, proc
+
+
+@pytest.mark.parametrize(
+    "run_once,preset,want",
+    [
+        (None, None, "<unset>"),
+        ("0", None, "<unset>"),  # a workspace: nothing new in its environment
+        ("1", None, "/tmp/molecule-turn-lease/model_call"),
+        # Beside the activity file, in the private directory both processes share.
+        ("1", "/var/run/molecule/activity", "/var/run/molecule/model_call"),
+    ],
+)
+def test_a_light_run_records_model_calls_beside_the_activity_file(tmp_path, run_once, preset, want):
+    env = {} if preset is None else {ENV: preset}
+    _exported, _calls, _home, proc = _run_block(tmp_path, run_once=run_once, **env)
+    assert re.search(r"^MODEL_CALL=(.*)$", proc.stdout, re.M).group(1) == want
 
 
 def test_default_path_is_exported_in_its_own_private_dir(tmp_path):
@@ -269,10 +381,14 @@ def test_exported_before_the_gateway_and_the_runtime_start():
         if not ln.lstrip().startswith("#")
     ]
     export = next(i for i, ln in code if ln.strip() == "export MOLECULE_TOOL_ACTIVITY_FILE")
+    # The plugin decides at registration, when the gateway loads it, whether to
+    # record model calls: the variable must be in the gateway's environment.
+    model_call = next(i for i, ln in code if ln.strip() == "export MOLECULE_MODEL_CALL_FILE")
     gateway = next(i for i, ln in code if "&& hermes gateway" in ln)
     runtime = next(i for i, ln in code if re.search(r"\bmolecule-runtime$", ln.strip()) and "exec" in ln
                    and "MOLECULE_SMOKE_MODE" not in ln and i > gateway)
     assert export < gateway < runtime
+    assert model_call < gateway
 
 
 def test_the_image_ships_the_plugin_source():

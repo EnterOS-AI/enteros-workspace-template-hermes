@@ -7,9 +7,11 @@
 # One pattern per line, relative to the volume root: configs/... is /configs,
 # and HERMES_HOME (/tmp/.hermes) links to /configs/.hermes (start.sh). A
 # pattern is matched with fnmatch.fnmatchcase against the whole path, where *
-# also matches /, so files are named in full rather than as *.log. A trailing /
-# matches a directory and everything under it. The runtime itself always leaves
-# out configs/.auth_token, configs/.platform_inbound_secret and lost+found/.
+# also matches /, so files are named in full rather than as *.log; a * only
+# ever follows a fixed name (state.db*, .update_*), which keeps it in its own
+# place. A trailing / matches a directory and everything under it. The runtime
+# itself always leaves out configs/.auth_token, configs/.platform_inbound_secret
+# and lost+found/.
 #
 # Everything else is copied: the agent's identity and config (SOUL.md,
 # config.yaml, .env), credentials (auth.json, mcp-tokens/), skills, memories,
@@ -22,6 +24,10 @@ configs/.hermes/sessions/
 configs/.hermes/response_store.db*
 configs/.hermes/runs_idempotency.db*
 configs/.hermes/.hermes_history
+# Messages the gateway queued or spooled to disk (queued user messages, the
+# overflow FIFO, transcript rows the in-memory cap dropped); its startup
+# recovery would replay them into the run's fresh session store.
+configs/.hermes/pending_messages/
 # Copies of the session store: /snapshot and pre-update snapshots, and backups.
 configs/.hermes/state-snapshots/
 configs/.hermes/backups/
@@ -29,10 +35,13 @@ configs/.hermes/backups/
 # tool-output spill. The rest of cache/ is rebuilt on use.
 configs/.hermes/cache/
 
-# Logs: hermes writes logs/, start.sh the two files.
+# Logs: hermes writes logs/, start.sh the two files. gateway-starts.log is the
+# gateway's respawn-storm ledger: a run copied soon after five agent gateway
+# starts would sleep 10-300 s before its own gateway came up.
 configs/.hermes/logs/
 configs/.hermes/gateway.log
 configs/.hermes/molecule-mcp-server.log
+configs/.hermes/gateway-starts.log
 
 # The agent's own gateway and processes: PID, lock and state files that
 # describe the agent's container (hermes never imports them into another one),
@@ -42,10 +51,12 @@ configs/.hermes/gateway.lock
 configs/.hermes/gateway_state.json
 configs/.hermes/processes.json
 configs/.hermes/cron.pid
-# A pending restart notice: the run's gateway would announce a restart to the
-# chat that asked the agent for one.
+# A pending restart or update notice: the run's gateway would announce a
+# restart, or relay an update's progress or prompt, to the chat that asked the
+# agent for one. .update_* also covers the update check's cache.
 configs/.hermes/.restart_notify.json
 configs/.hermes/.restart_pending.json
+configs/.hermes/.update_*
 
 # Work the gateway starts by itself. Its cron ticker fires the due jobs in
 # cron/, and its kanban dispatcher (kanban.dispatch_in_gateway, on by default)
@@ -55,3 +66,10 @@ configs/.hermes/.restart_pending.json
 configs/.hermes/cron/
 configs/.hermes/kanban.db*
 configs/.hermes/kanban/
+
+# Per-session history of hermes features this image keeps off, left out in case
+# one is turned on: code-edit checkpoints (checkpoints.enabled), MoA traces
+# (moa.save_traces), and hermes' own A2A platform's conversations.
+configs/.hermes/checkpoints/
+configs/.hermes/moa-traces/
+configs/.hermes/a2a_conversations/

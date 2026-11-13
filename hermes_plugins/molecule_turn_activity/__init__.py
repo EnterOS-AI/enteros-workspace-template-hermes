@@ -19,6 +19,10 @@ mtime are unaffected. ``boot`` changes when the gateway restarts, which resets
 raises and the tool result is unaffected. ``pre_tool_call`` is deliberately
 not used. It is a policy hook, so a callback that raises or times out there
 blocks the tool call.
+
+In a Light run only (``MOLECULE_MODEL_CALL_FILE`` set), two more observers,
+``post_api_request`` and ``api_request_error``, record how the latest model
+call ended; see "Light runs" below.
 """
 from __future__ import annotations
 
@@ -114,5 +118,62 @@ def touch_activity_file(**payload) -> None:
     return None
 
 
+# --- Light runs: how each model call ended ----------------------------------------
+# hermes answers a turn whose model call the provider refused (credits or billing
+# exhausted, a quota or rate limit it could not wait out, a rejected key) with its
+# own explanation as the reply text. Its verdict (the agent result's ``failed`` and
+# ``failure_reason``) never reaches the executor: the molecule-a2a callback
+# carries the text only. In a Light run (start.sh sets MOLECULE_MODEL_CALL_FILE
+# only there) this plugin records each main-loop model call's outcome as hermes
+# classified it, so the executor can report the run as failed (contract C6).
+# The record is the verdict only, never the provider's error text or the request.
+
+MODEL_CALL_FILE_ENV = "MOLECULE_MODEL_CALL_FILE"
+MODEL_CALL_VERSION = 1
+
+
+def _model_call_record(ok: bool, payload: dict) -> dict:
+    status = payload.get("status_code")
+    retryable = payload.get("retryable")
+    return {
+        "v": MODEL_CALL_VERSION,
+        "ok": ok,
+        "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
+        "reason": "" if ok else str(payload.get("reason") or ""),
+        "retryable": retryable if isinstance(retryable, bool) else None,
+        "provider": str(payload.get("provider") or ""),
+        "model": str(payload.get("model") or ""),
+        "ts": time.time(),
+    }
+
+
+def _record_model_call(ok: bool, payload: dict) -> None:
+    path = os.environ.get(MODEL_CALL_FILE_ENV, "").strip()
+    if not path:
+        return None
+    try:
+        _write_atomically(path, json.dumps(_model_call_record(ok, payload), ensure_ascii=False))
+    except Exception:
+        pass
+    return None
+
+
+def record_model_call_ok(**payload) -> None:
+    """post_api_request: the model answered (a retry or a fallback that recovered
+    replaces an earlier refusal). Never raises."""
+    return _record_model_call(True, payload)
+
+
+def record_model_call_error(**payload) -> None:
+    """api_request_error: hermes classified a failed model call (``reason`` is its
+    FailoverReason, ``status_code`` the provider's HTTP status). Never raises."""
+    return _record_model_call(False, payload)
+
+
 def register(ctx) -> None:
     ctx.register_hook("post_tool_call", touch_activity_file)
+    # Observers, like post_tool_call. Registered only in a Light run, so a
+    # workspace's gateway builds no extra hook payloads for its model calls.
+    if os.environ.get(MODEL_CALL_FILE_ENV, "").strip():
+        ctx.register_hook("post_api_request", record_model_call_ok)
+        ctx.register_hook("api_request_error", record_model_call_error)

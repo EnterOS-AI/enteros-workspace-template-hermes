@@ -1,9 +1,14 @@
 name: molecule_turn_activity
-version: "1.1.0"
+version: "1.2.0"
 description: >-
   Rewrites MOLECULE_TOOL_ACTIVITY_FILE with the latest tool event after every
   tool call, so the Molecule runtime's turn lease sees the gateway working and
-  the executor can report each tool call to the platform.
+  the executor can report each tool call to the platform. In a Light run
+  (MOLECULE_MODEL_CALL_FILE set) it also records how each model call ended, as
+  hermes classified it, so the executor can tell a provider's refusal from an
+  answer.
 kind: standalone
 provides_hooks:
   - post_tool_call
+  - post_api_request
+  - api_request_error

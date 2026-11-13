@@ -1021,6 +1021,53 @@ async def _give_up(event_queue: EventQueue, text: str) -> None:
         await event_queue.enqueue_event(new_text_message(text))
 
 
+# A model call the provider refused (C6). hermes answers such a turn with its own
+# explanation as the reply text, and its verdict (the agent result's `failed`,
+# `failure_reason`) never crosses the molecule-a2a callback, which carries the
+# text only. In a Light run the image's molecule_turn_activity plugin records how
+# each main-loop model call ended, as hermes classified it (api_request_error /
+# post_api_request), in MOLECULE_MODEL_CALL_FILE. A turn whose last model call
+# the provider refused is the run's failure: hermes' text is its explanation.
+_MODEL_CALL_FILE_ENV = "MOLECULE_MODEL_CALL_FILE"
+# hermes' FailoverReason values (agent/error_classifier.py at HERMES_COMMIT) for a
+# provider that refused the call: credits or billing, a quota or rate limit,
+# a rejected key, a model this account may not use.
+_PROVIDER_REFUSAL_REASONS = frozenset(
+    {"billing", "rate_limit", "upstream_rate_limit", "auth", "auth_permanent", "model_entitlement"}
+)
+# The provider statuses that refuse a call, whatever hermes made of them.
+_PROVIDER_REFUSAL_STATUSES = frozenset({401, 402, 403, 429})
+
+
+def _provider_refusal(since: float) -> str | None:
+    """Why the provider refused the last model call made since ``since`` (the
+    turn's dispatch, wall clock), or None: no record, an older one (another
+    turn's), a call that answered (a retry or a fallback that recovered), or a
+    failure that is not a refusal. Never raises."""
+    path = os.environ.get(_MODEL_CALL_FILE_ENV, "").strip()
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            record = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("ok") is not False:
+        return None
+    at = record.get("ts")
+    if not isinstance(at, (int, float)) or at < since:
+        return None
+    reason = str(record.get("reason") or "")
+    status = record.get("status_code")
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = None
+    if reason not in _PROVIDER_REFUSAL_REASONS and status not in _PROVIDER_REFUSAL_STATUSES:
+        return None
+    what = ", ".join(part for part in (reason, f"HTTP {status}" if status is not None else "") if part)
+    who = " ".join(str(record.get(key) or "") for key in ("provider", "model")).strip()
+    return f"the model provider refused the call ({what}{'; ' + who if who else ''})"
+
+
 class HermesAgentProxyExecutor(AgentExecutor):
     """Forwards every A2A turn to hermes-agent."""
 
@@ -1416,6 +1463,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
         # the session files before dispatch; the post-reply delta holds the
         # turn's assistant tool_calls.
         session_snapshot = _session_jsonl_snapshot()
+        dispatched_at = time.time()
 
         text = await self._dispatch_and_wait(
             content=prompt,
@@ -1508,6 +1556,13 @@ class HermesAgentProxyExecutor(AgentExecutor):
             # overflowed again): in a Light run that is the run's failure, not
             # its answer.
             await _give_up(event_queue, text)
+            return
+
+        refusal = _provider_refusal(dispatched_at) if _run_once_mode() else None
+        if refusal is not None:
+            # hermes' text explains why the provider refused the turn's last
+            # model call: in a Light run, the run's failure, not its answer.
+            await _give_up(event_queue, f"{refusal}: {text}")
             return
 
         await event_queue.enqueue_event(
@@ -2770,6 +2825,7 @@ class HermesAgentProxyExecutor(AgentExecutor):
             prompt, peers_blurb, history=history
         )
         headers = self._build_chat_completions_headers()
+        dispatched_at = time.time()
 
         try:
             async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
@@ -2807,6 +2863,10 @@ class HermesAgentProxyExecutor(AgentExecutor):
                         text = assistant_msg.get("content")
                         if not text:
                             text = self._extract_assistant_text(data)
+                        refusal = _provider_refusal(dispatched_at) if _run_once_mode() else None
+                        if refusal is not None:  # as on the plugin transport
+                            await _give_up(event_queue, f"{refusal}: {text}")
+                            return
                         await event_queue.enqueue_event(new_text_message(text))
                         return
 

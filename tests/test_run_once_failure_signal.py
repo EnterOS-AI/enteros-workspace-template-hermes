@@ -19,6 +19,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import json
 import pathlib
 import time
 from types import SimpleNamespace
@@ -372,6 +373,144 @@ async def test_an_answer_stays_an_answer_in_once_mode(monkeypatch, scenario):
     assert (result.status, result.output, result.exit_code) == ("succeeded", text, 0)
 
 
+# --- a model call the provider refused --------------------------------------------
+#
+# hermes answers such a turn with its own explanation as the reply text (the
+# Phase 1 gate's run: 402 insufficient_balance, recorded as succeeded). The
+# image's molecule_turn_activity plugin records each model call's outcome as
+# hermes classified it; these tests write that record the way the plugin does,
+# at the moment the gateway's model call ends: after the dispatch, before hermes
+# answers.
+
+# hermes' reply for the gate's 402 (agent/conversation_loop.py _billing_failure_result).
+_BILLING_TEXT = (
+    "Billing or credits exhausted: Error code: 402 - insufficient_balance\n\n"
+    "Custom reported that billing, credits, or account entitlement is exhausted for minimax/MiniMax-M2.7.\n"
+    "Add credits or update billing with that provider, then retry."
+)
+
+
+def _model_call(path: pathlib.Path, *, ok: bool, status=None, reason="", at=None) -> None:
+    path.write_text(json.dumps({
+        "v": 1, "ok": ok, "status_code": status, "reason": reason, "retryable": False,
+        "provider": "custom", "model": "minimax/MiniMax-M2.7", "ts": time.time() if at is None else at,
+    }), encoding="utf-8")
+
+
+async def _hermes_answers_after(monkeypatch, tmp_path, records, text=_BILLING_TEXT, *, before_turn=()):
+    """One turn on the plugin transport: ``records`` are written once the turn
+    is dispatched, ``before_turn`` before it starts; then hermes answers ``text``."""
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv("MOLECULE_MODEL_CALL_FILE", str(model_calls))
+    for record in before_turn:
+        _model_call(model_calls, **record)
+    async with _running(monkeypatch) as (ex, gateway):
+        queue = _Queue()
+        turn = asyncio.create_task(ex.execute(_run_ctx(), queue))
+        await _dispatched(gateway, SPEC.prompt)
+        for record in records:
+            _model_call(model_calls, **record)
+        await gateway.answer(SPEC.prompt, text)
+        await turn
+    return queue
+
+
+REFUSALS = {
+    # The gate's case: credits exhausted.
+    "billing-402": ({"status": 402, "reason": "billing"}, "billing, HTTP 402"),
+    # Quota or rate limit, retries exhausted.
+    "rate-limit-429": ({"status": 429, "reason": "rate_limit"}, "rate_limit, HTTP 429"),
+    "upstream-rate-limit-429": ({"status": 429, "reason": "upstream_rate_limit"}, "upstream_rate_limit, HTTP 429"),
+    # A key the provider rejects.
+    "auth-401": ({"status": 401, "reason": "auth_permanent"}, "auth_permanent, HTTP 401"),
+    "auth-403": ({"status": 403, "reason": "auth"}, "auth, HTTP 403"),
+    # This account may not use the model (no status: hermes read it from the body).
+    "entitlement": ({"reason": "model_entitlement"}, "model_entitlement"),
+    # A refusing status hermes could not classify (a WAF 403 in front of the provider).
+    "status-only-403": ({"status": 403, "reason": "upstream_blocked"}, "upstream_blocked, HTTP 403"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["serve", "once"])
+@pytest.mark.parametrize("case", list(REFUSALS))
+async def test_a_turn_the_provider_refused(monkeypatch, tmp_path, case, mode):
+    if mode == "once":
+        monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    record, reason = REFUSALS[case]
+    queue = await asyncio.wait_for(
+        _hermes_answers_after(monkeypatch, tmp_path, [{"ok": False, **record}]), 20
+    )
+    (event,) = queue.events
+    if mode == "serve":  # hermes' reply, byte for byte, as before
+        assert isinstance(event, Message) and _text(event) == _BILLING_TEXT
+        return
+    assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
+    assert _text(event.status.message) == (
+        f"the model provider refused the call ({reason}; custom minimax/MiniMax-M2.7): {_BILLING_TEXT}"
+    )
+    result = classify_turn(queue.events)
+    assert (result.status, result.output, result.exit_code) == ("failed", "", 1)
+    assert result.error.startswith(f"the model provider refused the call ({reason}")
+
+
+NOT_REFUSALS = {
+    # A retry or a fallback provider answered after the refusal.
+    "recovered": dict(records=[{"ok": False, "status": 429, "reason": "rate_limit"}, {"ok": True}]),
+    # Another turn's refusal, before this one started.
+    "earlier-turn": dict(records=[], before_turn=[{"ok": False, "status": 402, "reason": "billing", "at": 1.0}]),
+    # A failure that is not the provider refusing (outside C6's refusal set).
+    "server-error": dict(records=[{"ok": False, "status": 500, "reason": "server_error"}]),
+    "content-policy": dict(records=[{"ok": False, "reason": "content_policy_blocked"}]),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", list(NOT_REFUSALS))
+async def test_hermes_answer_stays_an_answer_unless_the_last_call_was_refused(monkeypatch, tmp_path, case):
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    queue = await asyncio.wait_for(
+        _hermes_answers_after(monkeypatch, tmp_path, text="the weekly report", **NOT_REFUSALS[case]), 20
+    )
+    (event,) = queue.events
+    assert isinstance(event, Message) and _text(event) == "the weekly report"
+    assert classify_turn(queue.events).status == "succeeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["serve", "once"])
+async def test_a_turn_the_provider_refused_on_the_chat_completions_fallback(monkeypatch, tmp_path, mode):
+    # hermes' API server answers a failed turn with finish_reason "error" and
+    # its explanation as the content; the plugin's record says why.
+    if mode == "once":
+        monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv("MOLECULE_MODEL_CALL_FILE", str(model_calls))
+
+    async def refused(_request):
+        _model_call(model_calls, ok=False, status=402, reason="billing")
+        return web.json_response({"choices": [{"finish_reason": "error", "message": {
+            "role": "assistant", "content": _BILLING_TEXT}}]})
+
+    async with _chat_completions(monkeypatch, refused) as ex:
+        queue = _Queue()
+        await asyncio.wait_for(ex.execute(_run_ctx(), queue), 20)
+    (event,) = queue.events
+    if mode == "serve":
+        assert isinstance(event, Message) and _text(event) == _BILLING_TEXT
+        return
+    assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
+    assert _text(event.status.message).startswith("the model provider refused the call (billing, HTTP 402")
+
+
+def test_the_refusal_reasons_are_hermes_own():
+    # Pinned to hermes' FailoverReason values at HERMES_COMMIT (agent/error_classifier.py).
+    assert executor_mod._PROVIDER_REFUSAL_REASONS == {
+        "billing", "rate_limit", "upstream_rate_limit", "auth", "auth_permanent", "model_entitlement",
+    }
+    assert executor_mod._PROVIDER_REFUSAL_STATUSES == {401, 402, 403, 429}
+
+
 # --- a Light run end to end ------------------------------------------------------
 
 
@@ -430,6 +569,29 @@ async def test_once_mode_records_a_hermes_answer_as_succeeded(monkeypatch):
     assert ledger.bodies[-1]["output"] == "the weekly report"
 
 
+@pytest.mark.asyncio
+async def test_once_mode_records_a_provider_refusal_as_failed(monkeypatch, tmp_path):
+    # The Phase 1 gate's run, end to end: was `succeeded` with hermes' text.
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv("MOLECULE_MODEL_CALL_FILE", str(model_calls))
+    hb = SimpleNamespace(active_tasks=0, current_task="")
+    ledger = _Ledger()
+    async with _running(monkeypatch, heartbeat=hb) as (ex, gateway):
+        run = asyncio.create_task(run_once(_spec(), ex, heartbeat=hb, report=ledger, settle_poll_seconds=0.02))
+        await _dispatched(gateway, SPEC.prompt)
+        _model_call(model_calls, ok=False, status=402, reason="billing")
+        await gateway.answer(SPEC.prompt, _BILLING_TEXT)
+        rc = await asyncio.wait_for(run, 20)
+    assert rc == 1
+    assert [(b["phase"], b["status"]) for b in ledger.bodies] == [("started", "running"), ("finished", "failed")]
+    finished = ledger.bodies[-1]
+    assert (finished["exit_code"], finished["output"]) == (1, "")
+    assert finished["error"].startswith("the model provider refused the call (billing, HTTP 402")
+    assert "account entitlement is exhausted" in finished["error"]
+    assert hb.active_tasks == 0
+
+
 # --- the switch and the sites ------------------------------------------------------
 
 
@@ -476,8 +638,9 @@ def test_every_reply_the_executor_composes_goes_through_give_up():
         "execute": 2,                        # P1 empty prompt, P2 repeat wake dropped
         "_dispatch_and_wait": 2,             # P3 queue full, P4 shutting down
         "_await_outcome": 4,                 # P5 interim, P6 cancelled, P7 abandoned, P8 other error
-        "_run_plugin_turn": 1,               # P9 overflow the heal could not clear
-        "_execute_via_chat_completions": 3,  # C3 tool-round cap, C1 HTTP error, C2 unreachable
+        "_run_plugin_turn": 2,               # P9 overflow the heal could not clear, P10 provider refusal
+        "_execute_via_chat_completions": 4,  # C4 provider refusal, C3 tool-round cap, C1 HTTP error,
+                                             # C2 unreachable
     }
 
 
