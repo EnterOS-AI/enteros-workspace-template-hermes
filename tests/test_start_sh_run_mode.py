@@ -294,7 +294,7 @@ def _boot_tail(
     block = _block() if BLOCK_START in START_SH.read_text(encoding="utf-8") else ""
     env = {
         k: v for k, v in os.environ.items()
-        if not k.startswith(("MOLECULE_", "HERMES_", "API_SERVER_", "MCPWATCH_"))
+        if not k.startswith(("MOLECULE_", "HERMES_", "API_SERVER_", "MCPWATCH_")) and k not in RECORDED_ENV
     }
     env["PATH"] = f"{stubs}:/usr/bin:/bin"
     if mode is not None:
