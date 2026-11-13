@@ -92,6 +92,47 @@ if [ "${MOLECULE_SMOKE_MODE:-0}" = "1" ]; then
   exec ${AS_AGENT} env HOME=/tmp CONFIGS_DIR=/configs molecule-runtime
 fi
 
+# --- Light run pod (Light runs, contract C1) ---
+# A Light run pod boots this image on a private copy of a parked agent's volume
+# with MOLECULE_RUN_MODE=once: molecule-runtime runs one scheduled prompt and
+# exits. The boot below is a workspace's boot -- the MCP server, the prepared
+# config and the gateway are what the prompt runs on -- with three differences:
+#   * molecule-runtime-prepare must succeed: with no reconcile watcher, it is
+#     the only way the gateway gets the agent's MCP servers;
+#   * no MCP reconcile watcher: it restarts the gateway when config.yaml
+#     changes, which would end the run's only turn;
+#   * the executor's reply deadline and turn cap are the run's deadline
+#     (MOLECULE_RUN_DEADLINE_SECONDS, blank = 3600), so neither ends a run
+#     before molecule-runtime's own deadline does. A value molecule-runtime
+#     refuses (not a positive whole number) stops the run there, before the
+#     executor reads these.
+# Unset or blank is a normal boot, unchanged. Any other value refuses to boot
+# (exit 2) before anything starts, as molecule-runtime itself would.
+RUN_ONCE=0
+light_trim() {  # $1 = text; prints it without leading and trailing whitespace
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  printf '%s' "${value%"${value##*[![:space:]]}"}"
+}
+_run_mode="$(light_trim "${MOLECULE_RUN_MODE:-}")"
+case "${_run_mode,,}" in
+  "") ;;
+  once)
+    RUN_ONCE=1
+    _run_deadline="$(light_trim "${MOLECULE_RUN_DEADLINE_SECONDS:-}")"
+    export HERMES_TURN_REPLY_DEADLINE_SECONDS="${_run_deadline:-3600}"
+    export HERMES_TURN_MAX_SECONDS="${_run_deadline:-3600}"
+    echo "[start.sh] MOLECULE_RUN_MODE=once: Light run pod (one prompt, then exit);" \
+         "reply deadline and turn cap = ${HERMES_TURN_REPLY_DEADLINE_SECONDS}s"
+    ;;
+  *)
+    echo "[start.sh] MOLECULE_RUN_MODE='${_run_mode:0:40}' is not a run mode this image" \
+         "knows (unset or 'once'); refusing to boot" >&2
+    exit 2
+    ;;
+esac
+# --- end Light run pod ---
+
 # --- Make /configs agent-owned (fleet contract) ---
 # The /configs volume is created by Docker/the provisioner as root, but
 # molecule_runtime/configs_dir.py's documented contract is that /configs
