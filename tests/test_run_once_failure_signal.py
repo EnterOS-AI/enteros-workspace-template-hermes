@@ -462,6 +462,10 @@ NOT_REFUSALS = {
     # A failure that is not the provider refusing (outside C6's refusal set).
     "server-error": dict(records=[{"ok": False, "status": 500, "reason": "server_error"}]),
     "content-policy": dict(records=[{"ok": False, "reason": "content_policy_blocked"}]),
+    # A call that answered decides, whatever else the record holds (review 21723
+    # N1: the plugin never writes a refusal on an `ok: true` record, so only this
+    # pins the executor's `ok is not False` guard).
+    "answered-with-refusal-fields": dict(records=[{"ok": True, "status": 429, "reason": "rate_limit"}]),
 }
 
 

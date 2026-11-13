@@ -89,6 +89,25 @@ def test_registers_observers_only(monkeypatch, model_call_file, want):
     assert [name for name, _ in ctx.hooks] == want
 
 
+def test_each_model_call_hook_runs_its_own_recorder(tmp_path, monkeypatch):
+    """Review 21723 O2: swapping the two callbacks in register() left every
+    other test green, and would have recorded the gate's 402 as `ok: true`, a
+    `succeeded` run. Call each hook through what register() wired to it."""
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv(MODEL_CALL_ENV, str(model_calls))
+    ctx = _Ctx()
+    _plugin().register(ctx)
+    hooks = dict(ctx.hooks)
+
+    hooks["api_request_error"](**REFUSED_CALL)
+    refused = json.loads(model_calls.read_text(encoding="utf-8"))
+    assert (refused["ok"], refused["status_code"], refused["reason"]) == (False, 402, "billing")
+
+    hooks["post_api_request"](**ANSWERED_CALL)
+    answered = json.loads(model_calls.read_text(encoding="utf-8"))
+    assert (answered["ok"], answered["status_code"], answered["reason"]) == (True, None, "")
+
+
 def test_manifest_matches_what_start_sh_enables():
     manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
     assert manifest["name"] == PLUGIN_DIR.name == "molecule_turn_activity"
