@@ -929,6 +929,24 @@ fi
     echo "skills:"
     echo "  creation_nudge_interval: ${_SKILL_NUDGE}"
   fi
+  # --- Light run pod: no background review (contract C6) ---
+  # After a turn that used enough tool iterations (skills.creation_nudge_interval,
+  # 10 by default), hermes forks a background memory/skill review: a full agent
+  # on the same session, started before the reply goes out
+  # (agent/turn_finalizer.py). Its model calls fire the same post_api_request /
+  # api_request_error hooks as the turn's, so in a run it could overwrite the
+  # model-call record before the executor reads it: a 429 on the fork's first
+  # call would fail a run whose turn answered, and its answer could hide the
+  # turn's refusal. In a run pod the fork buys nothing (its memory and skill
+  # writes land on the copy, deleted at exit), so a run turns it off. hermes
+  # reads auxiliary.background_review.enabled before every automatic review
+  # (agent/background_review.py, load_background_review_settings). A workspace
+  # keeps its review.
+  if [ "${RUN_ONCE:-0}" = 1 ]; then
+    echo "auxiliary:"
+    echo "  background_review:"
+    echo "    enabled: false"
+  fi
   # --- Compaction ceiling ---
   # hermes compacts at a share of the model window: at least 0.75 below 512K,
   # its 0.50 default at or above. MiniMax-M3 is a 1M window (hermes assumes

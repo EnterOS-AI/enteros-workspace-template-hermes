@@ -214,6 +214,14 @@ control plane sets the run's variables; `molecule-runtime` documents them.
 | `MOLECULE_LIGHT_COPY_EXCLUDE_FILE` | Set by the image to `/app/light-copy-exclude.txt`, the list of what the run's copy leaves out: conversation history and its copies (including messages the gateway queued or spooled to disk), logs, the agent's own gateway and process files, pending restart and update notices, Hermes' cron jobs and kanban boards, which the run's gateway would otherwise run a second time, and the history of Hermes features this image keeps off (checkpoints, MoA traces, Hermes' own A2A conversations). A run therefore sees neither the agent's Hermes cron jobs nor its kanban board. |
 | `MOLECULE_MODEL_CALL_FILE` | Set by `start.sh` in a run only, beside `MOLECULE_TOOL_ACTIVITY_FILE` (`model_call`). The `molecule_turn_activity` plugin then records how each model call ended, as Hermes classified it: the reason and HTTP status of a failed call, never the provider's error text or the request. |
 
+In a run, `start.sh` also writes `auxiliary.background_review.enabled: false`
+into `config.yaml`. After a turn with enough tool calls, Hermes forks a
+background memory and skill review that runs on the turn's session, and its
+model calls would write the same model-call record, so the review could
+replace the turn's outcome before the executor reads it. In a run the review
+would only spend tokens: what it writes lands on the run's copy, which is
+deleted when the run ends. A normal boot keeps the review.
+
 In a run, every reply the executor composes itself, instead of relaying
 Hermes' answer (the turn-supervision replies above, a full queue, an empty
 prompt, a context overflow the auto-heal could not clear, and the

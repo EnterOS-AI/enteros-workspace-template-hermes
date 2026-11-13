@@ -12,6 +12,7 @@ import collections
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -199,6 +200,42 @@ def test_once_mode_overrides_the_agents_own_bounds(tmp_path):
         HERMES_TURN_REPLY_DEADLINE_SECONDS="1500", HERMES_TURN_MAX_SECONDS="0",
     )
     assert (r.rc, r.reply, r.max) == (0, "600", "600")
+
+
+# --- the generated config.yaml ------------------------------------------------------
+
+_SEED_RE = re.compile(r"^\{$\n(.*?)^\} >\"\$HERMES_CONFIG\"$", re.M | re.S)
+
+
+def _render_config(out_dir: pathlib.Path, **env: Optional[str]) -> dict:
+    """The run-mode block, then start.sh's config.yaml seed block, under bash
+    with ``env``; the config they render, parsed."""
+    match = _SEED_RE.search(START_SH.read_text(encoding="utf-8"))
+    assert match, "could not locate the config.yaml seed block in start.sh"
+    out_dir.mkdir()
+    out = out_dir / "config.yaml"
+    seed = match.group(0).replace('} >"$HERMES_CONFIG"', f'}} >"{out}"')
+    script = "\n".join(["set -euo pipefail", _block(), 'DEFAULT_MODEL="m"', 'PROVIDER="custom"', seed])
+    run_env = _clean_env(**env)
+    # The seed block runs python3 + PyYAML: this interpreter first on PATH.
+    run_env["PATH"] = os.pathsep.join([os.path.dirname(sys.executable), run_env.get("PATH", "")])
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=run_env, cwd=ROOT, check=False)
+    assert proc.returncode == 0, proc.stderr
+    return yaml.safe_load(out.read_text(encoding="utf-8")) or {}
+
+
+@posix_only
+def test_a_run_turns_off_hermes_background_review_and_nothing_else(tmp_path):
+    # Review 21723 O1. hermes' background memory/skill review is a full agent on
+    # the turn's session; its model calls fire the hooks that write the run's
+    # model-call record, so it could overwrite the turn's verdict before the
+    # executor reads it. hermes at HERMES_COMMIT reads this key before every
+    # automatic review (agent/background_review.py, load_background_review_settings).
+    serve = _render_config(tmp_path / "serve")
+    run = _render_config(tmp_path / "run", MOLECULE_RUN_MODE="once")
+    assert run["auxiliary"] == {"background_review": {"enabled": False}}
+    assert "auxiliary" not in serve  # a workspace keeps its review
+    assert {k: v for k, v in run.items() if k != "auxiliary"} == serve
 
 
 def test_the_mode_is_decided_before_the_first_boot_step():
