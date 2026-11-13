@@ -211,16 +211,25 @@ control plane sets the run's variables; `molecule-runtime` documents them.
 |---|---|
 | `MOLECULE_RUN_MODE` | Unset or blank: a normal boot, unchanged. `once`: a Light run, where `start.sh` starts no MCP reconcile watcher (a gateway restart would end the run's turn) and requires `molecule-runtime-prepare` (a failure refuses the run with exit 1, because nothing else would give the gateway the agent's MCP servers). Any other value refuses to boot (exit 2). |
 | `MOLECULE_RUN_DEADLINE_SECONDS` | The run's deadline, `3600` when blank. In a run, `start.sh` sets `HERMES_TURN_REPLY_DEADLINE_SECONDS` and `HERMES_TURN_MAX_SECONDS` to it, over the agent's own values, so neither ends a run before `molecule-runtime`'s own deadline. |
-| `MOLECULE_LIGHT_COPY_EXCLUDE_FILE` | Set by the image to `/app/light-copy-exclude.txt`, the list of what the run's copy leaves out: conversation history and its copies, logs, the agent's own gateway and process files, and Hermes' cron jobs and kanban boards, which the run's gateway would otherwise run a second time. A run therefore sees neither the agent's Hermes cron jobs nor its kanban board. |
+| `MOLECULE_LIGHT_COPY_EXCLUDE_FILE` | Set by the image to `/app/light-copy-exclude.txt`, the list of what the run's copy leaves out: conversation history and its copies (including messages the gateway queued or spooled to disk), logs, the agent's own gateway and process files, pending restart and update notices, Hermes' cron jobs and kanban boards, which the run's gateway would otherwise run a second time, and the history of Hermes features this image keeps off (checkpoints, MoA traces, Hermes' own A2A conversations). A run therefore sees neither the agent's Hermes cron jobs nor its kanban board. |
+| `MOLECULE_MODEL_CALL_FILE` | Set by `start.sh` in a run only, beside `MOLECULE_TOOL_ACTIVITY_FILE` (`model_call`). The `molecule_turn_activity` plugin then records how each model call ended, as Hermes classified it: the reason and HTTP status of a failed call, never the provider's error text or the request. |
 
 In a run, every reply the executor composes itself, instead of relaying
 Hermes' answer (the turn-supervision replies above, a full queue, an empty
 prompt, a context overflow the auto-heal could not clear, and the
 chat-completions fallback's errors), is a FAILED task status carrying the same
 text, so the run is recorded as failed. Outside a run it stays the plain reply.
-An error Hermes itself answers in plain text, such as a provider's quota or
-authentication failure, is Hermes' answer, so the run is recorded as
-succeeded with that text.
+
+A turn whose last model call the provider refused is failed too. Hermes
+answers it with its own explanation as plain text: credits or billing
+exhausted, a quota or rate limit it could not wait out, a rejected key, or a
+model the account may not use (Hermes' reasons `billing`, `rate_limit`,
+`upstream_rate_limit`, `auth`, `auth_permanent`, `model_entitlement`, or HTTP
+401, 402, 403 or 429). In a run, that answer becomes a FAILED task status:
+`the model provider refused the call (billing, HTTP 402; <provider> <model>):`
+followed by Hermes' text. A call a retry or a fallback provider recovered is
+not a refusal. Other failures Hermes answers in text, such as a provider's 5xx
+after its retries, stay its answer.
 
 ## Bundled Node.js
 

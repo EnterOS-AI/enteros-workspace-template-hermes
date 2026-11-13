@@ -47,10 +47,11 @@ the chat-completions fallback on port 8642.
 
 A Light run pod (`MOLECULE_RUN_MODE=once`) runs the same sequence on a private
 copy of a parked agent's volume, and `molecule-runtime` then runs one scheduled
-prompt and exits. `start.sh` differs in three places: `molecule-runtime-prepare`
-must succeed, no MCP reconcile watcher starts, and the executor's reply
-deadline and turn cap become the run's deadline. See "Light runs" in
-`docs/CONFIGURATION.md`.
+prompt and exits. `start.sh` differs in four places: `molecule-runtime-prepare`
+must succeed, no MCP reconcile watcher starts, the executor's reply deadline
+and turn cap become the run's deadline, and `MOLECULE_MODEL_CALL_FILE` is set
+so the `molecule_turn_activity` plugin records how each model call ended. See
+"Light runs" in `docs/CONFIGURATION.md`.
 
 Gateway and MCP logs live under `/tmp/.hermes` in the current image. Do not
 document `/var/log` or `/home/agent/.hermes` as the active log/config path.
