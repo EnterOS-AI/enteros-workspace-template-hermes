@@ -57,6 +57,7 @@ claim a different home-directory mount is the active persistence contract.
 | `adapter.py` | Adapter and runtime integration |
 | `executor.py` | A2A-to-Hermes gateway bridge |
 | `config.yaml` | Template metadata, providers, models, and bridge settings |
+| `light-copy-exclude.txt` | What a Light run's copy of the agent's volume leaves out |
 | `scripts/` | Provider/config helpers and their shell tests |
 | `tests/` | Adapter, release, provenance, and documentation contracts |
 
