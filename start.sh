@@ -1046,6 +1046,15 @@ if [ -z "${MOLECULE_TOOL_ACTIVITY_FILE:-}" ]; then
   install -d -m 700 -o agent -g agent "$(dirname "$MOLECULE_TOOL_ACTIVITY_FILE")"
 fi
 export MOLECULE_TOOL_ACTIVITY_FILE
+# A Light run only: the same plugin also records how each model call ended, as
+# hermes classified it, so the executor can tell a provider's refusal (credits,
+# quota, rate limit, a rejected key), which hermes answers in plain text, from
+# an answer (contract C6). Beside the activity file, in the directory both
+# processes already share. A workspace's gateway gets no such hooks.
+if [ "${RUN_ONCE:-0}" = 1 ]; then
+  MOLECULE_MODEL_CALL_FILE="$(dirname "$MOLECULE_TOOL_ACTIVITY_FILE")/model_call"
+  export MOLECULE_MODEL_CALL_FILE
+fi
 # The gateway sends a "still working" notice for a running turn every
 # HERMES_AGENT_NOTIFY_INTERVAL seconds (upstream default 180). The executor
 # counts every gateway send as liveness and gives up on a turn after
