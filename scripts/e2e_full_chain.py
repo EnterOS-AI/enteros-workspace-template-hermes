@@ -29,6 +29,12 @@ HERMES_RUNTIME_DIR / HERMES_DISABLE_LAZY_INSTALLS=1 are set, unless the caller
 already set them. Without it hermes >= v0.22 refuses to start ("no dependency
 environment is committed for this install").
 
+Last, a second gateway is configured the way start.sh configures a Light run
+pod's (MOLECULE_MODEL_CALL_FILE, no background review), and molecule-runtime's
+once-mode runner drives two runs through it: one the stub model answers, one
+it refuses with HTTP 402. That proves, against the pinned hermes, the hooks
+the molecule_turn_activity plugin records model calls with (contract C6).
+
 Run:
     python3 scripts/e2e_full_chain.py     # HERMES_BIN defaults to ~/.local/bin/hermes
 """
@@ -90,6 +96,9 @@ TOOL_MARKER = "use one tool"
 SLEEP_RE = re.compile(r"\[e2e:sleep:(\d+(?:\.\d+)?):(\d+)\]\s*(\S+)")
 # "[e2e:silent]": the stub answers with a bare silence marker.
 SILENT_MARKER = "[e2e:silent]"
+# "[e2e:refuse]": the stub refuses the call the way a provider whose credits are
+# exhausted does (the Light runs Phase 1 gate's platform LLM): HTTP 402.
+REFUSE_MARKER = "[e2e:refuse]"
 
 
 def _tool_call_for(tools: list, probe: str) -> tuple[str, dict] | None:
@@ -128,6 +137,13 @@ async def _stub_llm_server(port: int, observed: dict):
         tool_call = None
         observed.setdefault("user_texts", []).append(last_user)
         observed.setdefault("requests", []).append((time.monotonic(), last_user))
+        if REFUSE_MARKER in last_user:
+            observed.setdefault("refused", []).append(time.monotonic())
+            return web.json_response(
+                {"error": {"message": "insufficient balance", "type": "insufficient_balance",
+                           "code": "insufficient_balance"}},
+                status=402,
+            )
         last_user_at = max(
             (i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1
         )
@@ -684,55 +700,28 @@ async def _turn_supervision_scenarios(
     return None
 
 
-async def _amain() -> int:
-    hermes_bin = os.environ.get("HERMES_BIN", DEFAULT_HERMES_BIN)
-    if not Path(hermes_bin).exists():
-        print(f"FAIL: hermes binary not found at {hermes_bin}")
-        return 1
-
-    plugin_port = _free_port()
-    cb_port = _free_port()
-    llm_port = _free_port()
-
-    # Stand up the stub LLM first — hermes needs it reachable to
-    # complete the agent reply. Stays up for the entire test.
-    print(f"OK: standing up stub LLM on http://127.0.0.1:{llm_port}/v1")
-    observed: dict = {}
-    llm_runner, llm_site = await _stub_llm_server(llm_port, observed)
-
-    # Tmp HERMES_HOME with the plugin enabled and our stub LLM as the
-    # custom-provider endpoint.
-    tmp = Path(tempfile.mkdtemp(prefix="hermes-fullchain-"))
-    hermes_home = tmp / ".hermes"
+def _prepare_home(root: Path) -> Path:
+    """A throwaway HERMES_HOME under ``root``, set up as start.sh sets up the
+    image's: the installs bridge (module docstring) and the turn-activity
+    plugin (runtime#417) under ``plugins/``."""
+    hermes_home = root / ".hermes"
     hermes_home.mkdir()
-    # start.sh's bridge (see the module docstring), applied to this home.
     if (INSTALL_HOME / "installs").is_dir():
         (hermes_home / "installs").symlink_to(INSTALL_HOME / "installs", target_is_directory=True)
         os.environ.setdefault("HERMES_RUNTIME_DIR", str(INSTALL_HOME / "tools"))
         os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
         print(f"OK: bridged {hermes_home}/installs -> {INSTALL_HOME / 'installs'}")
-    probe = tmp / "probe.txt"
-    probe.write_text("e2e probe\n")
-    observed["probe"] = str(probe)
-    # Turn-lease feed (runtime#417), installed the way start.sh installs it:
-    # the template plugin under $HERMES_HOME/plugins and ONE activity-file path
-    # shared by the gateway (env at spawn) and the runtime (this process).
     shutil.copytree(
         REPO / "hermes_plugins" / "molecule_turn_activity",
         hermes_home / "plugins" / "molecule_turn_activity",
     )
-    lease_dir = tmp / "turn-lease"
-    lease_dir.mkdir(mode=0o700)
-    activity = lease_dir / "tool_activity"
-    activity.write_text("")
-    stale = time.time() - 60
-    os.utime(activity, (stale, stale))
-    os.environ["MOLECULE_TOOL_ACTIVITY_FILE"] = str(activity)
-    os.environ["MOLECULE_TOOL_ACTIVITY_POLL_SECONDS"] = "0.2"
-    # The gateway's "still working" notice, the executor's liveness signal
-    # inside one long tool call. start.sh sets 60 s; 2 s keeps this run short.
-    os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = "2"
-    (hermes_home / "config.yaml").write_text(
+    return hermes_home
+
+
+def _gateway_config(llm_port: int, plugin_port: int, cb_port: int, *, light_run: bool = False) -> str:
+    """config.yaml for a gateway on the stub LLM with both plugins enabled;
+    ``light_run`` adds what start.sh adds in a Light run pod."""
+    config = (
         "model:\n"
         "  default: \"test-model\"\n"
         "  provider: \"custom\"\n"
@@ -760,14 +749,207 @@ async def _amain() -> int:
         f"      port: {plugin_port}\n"
         f"      callback_url: \"http://127.0.0.1:{cb_port}/a2a/reply\"\n"
     )
-    (hermes_home / ".env").write_text("HERMES_CUSTOM_API_KEY=sk-stub-fullchain\n")
+    if light_run:
+        config += "auxiliary:\n  background_review:\n    enabled: false\n"
+    return config
 
-    log_file = open(tmp / "gateway.log", "w+", buffering=1)
+
+def _spawn_gateway(hermes_bin: str, root: Path, hermes_home: Path, config: str, extra_env: dict | None = None):
+    """Start ``hermes gateway run`` on ``hermes_home``; (process, log file)."""
+    (hermes_home / "config.yaml").write_text(config)
+    (hermes_home / ".env").write_text("HERMES_CUSTOM_API_KEY=sk-stub-fullchain\n")
+    log_file = open(root / "gateway.log", "w+", buffering=1)
     proc = subprocess.Popen(
         [hermes_bin, "gateway", "run"],
-        env={**os.environ, "HOME": str(tmp), "HERMES_HOME": str(hermes_home)},
+        env={**os.environ, **(extra_env or {}), "HOME": str(root), "HERMES_HOME": str(hermes_home)},
         stdout=log_file, stderr=subprocess.STDOUT,
-        cwd=str(tmp),
+        cwd=str(root),
+    )
+    return proc, log_file
+
+
+def _stop_gateway(proc, log_file) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    log_file.close()
+
+
+# What start.sh exports in a Light run pod, as this process's executor reads it;
+# restored once the Light run scenarios end.
+_LIGHT_RUN_ENV = (
+    "MOLECULE_RUN_MODE", "MOLECULE_MODEL_CALL_FILE", "MOLECULE_A2A_PLATFORM_PORT",
+    "MOLECULE_A2A_CALLBACK_PORT", "HERMES_TURN_REPLY_DEADLINE_SECONDS", "HERMES_TURN_MAX_SECONDS",
+)
+
+
+async def _light_run_scenarios(tmp: Path, hermes_bin: str, llm_port: int, observed: dict) -> str | None:
+    """A Light run pod's gateway, end to end (contract C6). Returns a failure, or None.
+
+    In a run, start.sh exports MOLECULE_MODEL_CALL_FILE to the gateway, so the
+    molecule_turn_activity plugin records how each main-loop model call ended
+    through hermes' post_api_request and api_request_error hooks, and it turns
+    the background review off. A gateway configured the same way runs here, and
+    molecule-runtime's once-mode runner (run_once) drives two runs through it
+    with the executor in once mode: one the stub model answers, one it refuses
+    with HTTP 402. The first must be recorded `succeeded` and the second
+    `failed` with hermes' explanation, which needs hermes at HERMES_COMMIT to
+    classify the 402 as billing and to call the plugin's hooks by these names
+    with these kwargs. A HERMES_COMMIT bump that renames a hook, its `reason` or
+    `status_code` kwargs or the billing reason fails here (review 21723 O3).
+
+    It runs last, on its own gateway: a 402 benches the sole credential
+    (agent/credential_pool.py), which would fail any later turn on it.
+    """
+    from molecule_runtime.adapters.base import AdapterConfig
+    from molecule_runtime.run_once import RunSpec, run_once
+
+    from executor import HermesAgentProxyExecutor
+
+    root = tmp / "light-run"
+    root.mkdir()
+    hermes_home = _prepare_home(root)
+    plugin_port, cb_port = _free_port(), _free_port()
+    # Beside the activity file, where start.sh puts it in a run.
+    model_calls = Path(os.environ["MOLECULE_TOOL_ACTIVITY_FILE"]).parent / "model_call"
+    proc, log_file = _spawn_gateway(
+        hermes_bin, root, hermes_home, _gateway_config(llm_port, plugin_port, cb_port, light_run=True),
+        {"MOLECULE_MODEL_CALL_FILE": str(model_calls)},
+    )
+    print(f"OK: spawned a Light run pod's hermes gateway (pid {proc.pid})")
+    saved = {name: os.environ.get(name) for name in _LIGHT_RUN_ENV}
+    os.environ.update({
+        "MOLECULE_RUN_MODE": "once",
+        "MOLECULE_MODEL_CALL_FILE": str(model_calls),
+        "MOLECULE_A2A_PLATFORM_PORT": str(plugin_port),
+        "MOLECULE_A2A_CALLBACK_PORT": str(cb_port),
+        # start.sh in a run: the turn's bounds are the run's deadline.
+        "HERMES_TURN_REPLY_DEADLINE_SECONDS": "120",
+        "HERMES_TURN_MAX_SECONDS": "120",
+    })
+    executor = None
+
+    def failed(why: str) -> str:
+        log_file.seek(0)
+        print("Light run gateway log tail:")
+        print(log_file.read()[-6000:])
+        return why
+
+    try:
+        if not _wait_url(f"http://127.0.0.1:{plugin_port}/a2a/health", timeout_secs=60):
+            return failed("the Light run gateway's /a2a/health never answered")
+        heartbeat = SimpleNamespace(active_tasks=0, current_task="")
+        executor = HermesAgentProxyExecutor(
+            AdapterConfig(model="test-model", system_prompt="be terse", heartbeat=heartbeat)
+        )
+        await executor.start()
+
+        async def run(run_id: str, prompt: str):
+            """One run as the run pod's molecule-runtime runs it, with a
+            recording run ledger; (exit code, ledger writes, model-call record)."""
+            ledger: List[dict] = []
+
+            async def report(_spec, body):
+                ledger.append(body)
+                return 200
+
+            spec = RunSpec(
+                run_id=run_id, schedule="e2e-weekly-report", prompt=prompt, deadline_seconds=300,
+                workspace_id="00000000-0000-0000-0000-0000000e2e01", platform_url="http://127.0.0.1:9",
+                started_at=time.time(), started_monotonic=time.monotonic(),
+            )
+            rc = await asyncio.wait_for(
+                run_once(spec, executor, heartbeat=heartbeat, report=report, settle_poll_seconds=0.05), 150
+            )
+            try:
+                record = json.loads(model_calls.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                record = {"unreadable": repr(exc)}
+            return rc, ledger, record
+
+        rc, ledger, record = await run("light-e2e-answered", "write the weekly report")
+        outcome = [(b["phase"], b["status"]) for b in ledger]
+        output = ledger[-1]["output"] if ledger else ""
+        if rc != 0 or outcome != [("started", "running"), ("finished", "succeeded")] or "weekly report" not in output:
+            return failed(f"the answered run: exit {rc}, ledger {ledger!r}")
+        if record.get("ok") is not True:
+            return failed(f"post_api_request did not record the answered call: {record!r}")
+        print(
+            f"OK: a Light run the model answered was recorded succeeded ({output[:60]!r}); "
+            f"post_api_request recorded ok ({record.get('provider')} {record.get('model')})"
+        )
+
+        rc, ledger, record = await run("light-e2e-refused", f"{REFUSE_MARKER} write the weekly report")
+        if not observed.get("refused"):
+            return failed("the stub model was never asked for the refused run's call")
+        if (record.get("ok"), record.get("status_code"), record.get("reason")) != (False, 402, "billing"):
+            return failed(f"api_request_error did not record the 402 as billing: {record!r}")
+        outcome = [(b["phase"], b["status"]) for b in ledger]
+        error = ledger[-1]["error"] if ledger else ""
+        if rc != 1 or outcome != [("started", "running"), ("finished", "failed")]:
+            return failed(f"the refused run: exit {rc}, ledger {ledger!r}")
+        if not error.startswith("the model provider refused the call (billing, HTTP 402"):
+            return failed(f"the refused run's error: {error!r}")
+        print(
+            "OK: a Light run whose model call the provider refused (HTTP 402) was recorded failed; "
+            f"api_request_error recorded billing/402: {error[:120]!r}"
+        )
+        return None
+    finally:
+        if executor is not None:
+            await executor.stop()
+        _stop_gateway(proc, log_file)
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+async def _amain() -> int:
+    hermes_bin = os.environ.get("HERMES_BIN", DEFAULT_HERMES_BIN)
+    if not Path(hermes_bin).exists():
+        print(f"FAIL: hermes binary not found at {hermes_bin}")
+        return 1
+
+    plugin_port = _free_port()
+    cb_port = _free_port()
+    llm_port = _free_port()
+
+    # Stand up the stub LLM first — hermes needs it reachable to
+    # complete the agent reply. Stays up for the entire test.
+    print(f"OK: standing up stub LLM on http://127.0.0.1:{llm_port}/v1")
+    observed: dict = {}
+    llm_runner, llm_site = await _stub_llm_server(llm_port, observed)
+
+    # Tmp HERMES_HOME with the plugin enabled and our stub LLM as the
+    # custom-provider endpoint, start.sh's bridge (see the module docstring)
+    # applied to it.
+    tmp = Path(tempfile.mkdtemp(prefix="hermes-fullchain-"))
+    hermes_home = _prepare_home(tmp)
+    probe = tmp / "probe.txt"
+    probe.write_text("e2e probe\n")
+    observed["probe"] = str(probe)
+    # Turn-lease feed (runtime#417), installed the way start.sh installs it:
+    # the template plugin under $HERMES_HOME/plugins (_prepare_home) and ONE
+    # activity-file path shared by the gateway (env at spawn) and the runtime
+    # (this process).
+    lease_dir = tmp / "turn-lease"
+    lease_dir.mkdir(mode=0o700)
+    activity = lease_dir / "tool_activity"
+    activity.write_text("")
+    stale = time.time() - 60
+    os.utime(activity, (stale, stale))
+    os.environ["MOLECULE_TOOL_ACTIVITY_FILE"] = str(activity)
+    os.environ["MOLECULE_TOOL_ACTIVITY_POLL_SECONDS"] = "0.2"
+    # The gateway's "still working" notice, the executor's liveness signal
+    # inside one long tool call. start.sh sets 60 s; 2 s keeps this run short.
+    os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = "2"
+    proc, log_file = _spawn_gateway(
+        hermes_bin, tmp, hermes_home, _gateway_config(llm_port, plugin_port, cb_port)
     )
     print(f"OK: spawned hermes gateway (pid {proc.pid})")
 
@@ -947,16 +1129,17 @@ async def _amain() -> int:
             print("\n".join(tap.lines[-80:]))
             return 1
 
+        failure = await _light_run_scenarios(tmp, hermes_bin, llm_port, observed)
+        if failure:
+            print(f"FAIL: {failure}")
+            print("Executor log tail:")
+            print("\n".join(tap.lines[-80:]))
+            return 1
+
     finally:
         if executor is not None:
             await executor.stop()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        log_file.close()
+        _stop_gateway(proc, log_file)
         await llm_site.stop()
         await llm_runner.cleanup()
 
@@ -972,6 +1155,9 @@ async def _amain() -> int:
     print("    the cap's /stop ending a real run, the reply deadline with a late relay,")
     print("    a silent turn settled, a killed gateway abandoned without stranding the")
     print("    message behind it")
+    print("  + a Light run pod's gateway: run_once records an answered run succeeded and a")
+    print("    run whose model call the provider refused (HTTP 402) failed, through the")
+    print("    plugin's post_api_request / api_request_error hooks")
     return 0
 
 
