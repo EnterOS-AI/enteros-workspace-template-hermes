@@ -587,7 +587,7 @@ if [ -z "${HERMES_INFERENCE_MODEL:-}" ] && [ -z "${HERMES_DEFAULT_MODEL:-}" ] &&
   elif [ -n "${MINIMAX_CN_API_KEY:-}" ]; then
     HERMES_DEFAULT_MODEL="minimax-cn/abab6.5-chat"
   elif [ -n "${GEMINI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
-    HERMES_DEFAULT_MODEL="gemini/gemini-4-carbon"
+    HERMES_DEFAULT_MODEL="gemini/gemini-4-hydrogen"
   elif [ -n "${DEEPSEEK_API_KEY:-}" ]; then
     HERMES_DEFAULT_MODEL="deepseek/deepseek-chat"
   elif [ -n "${KIMI_API_KEY:-}" ]; then

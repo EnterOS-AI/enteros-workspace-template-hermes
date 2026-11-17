@@ -5,13 +5,15 @@ The active configuration is derived by `start.sh` from the workspace's
 environment. `config.yaml` in this repository defines the template defaults and
 the model/provider choices shown by the platform.
 
-The template defaults to platform-managed Gemini 4 Carbon
-(`google/gemini-4-carbon`), which uses the platform proxy (served through
-Google AI Studio) and needs no personal Gemini key. Gemini 3.1 Flash-Lite
+The template defaults to platform-managed Gemini 4 Hydrogen
+(`google/gemini-4-hydrogen`), which uses the platform proxy (served through
+Google AI Studio) and needs no personal Gemini key. Gemini 4 Carbon
+(`google/gemini-4-carbon`) stays selectable, Gemini 3.1 Flash-Lite
 (`google/gemini-3.1-flash-lite`) is the cheaper platform choice, and MiniMax M3
-(`minimax/MiniMax-M3`) stays selectable. The separate `gemini/gemini-4-carbon`
+(`minimax/MiniMax-M3`) stays selectable. The separate `gemini/gemini-4-hydrogen`
 choice uses your own `GEMINI_API_KEY` (and is also what a Gemini key alone
-selects when no model is set), and `minimax:MiniMax-M3` uses `MINIMAX_API_KEY`.
+selects when no model is set); `gemini/gemini-4-carbon` is the same on Carbon,
+and `minimax:MiniMax-M3` uses `MINIMAX_API_KEY`.
 Existing explicit model selections keep their normal precedence.
 
 ## Model and provider precedence
