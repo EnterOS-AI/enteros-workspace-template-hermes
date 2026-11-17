@@ -249,15 +249,20 @@ runtime_config:
   # Default model. hermes-agent owns provider resolution via the
   # HERMES_INFERENCE_PROVIDER env or its own `hermes model` wizard.
   # Override per-workspace in the canvas Config tab.
-  # Gemini 4 Carbon through the Molecule platform proxy (Google AI Studio), the
-  # platform default since 2026-11-17.
-  model: google/gemini-4-carbon
+  # Gemini 4 Hydrogen through the Molecule platform proxy (Google AI Studio),
+  # the platform default since 2026-11-17 (Gemini 4 Carbon before it, still
+  # selectable below).
+  model: google/gemini-4-hydrogen
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
   # Required Env Vars from the selected entry's required_env. Provider
   # names in parentheses mirror hermes-agent's CLI provider field; see
   # docs/CONFIGURATION.md#provider-matrix for the full mapping.
   models:
+    - id: google/gemini-4-hydrogen
+      name: Gemini 4 Hydrogen (Molecule platform)
+      provider: platform
+      required_env: []
     - id: google/gemini-4-carbon
       name: Gemini 4 Carbon (Molecule platform)
       provider: platform
@@ -316,6 +321,9 @@ runtime_config:
       required_env: [OPENROUTER_API_KEY]
 
     # ── Google Gemini (native SDK) ────────────────────────────────────
+    - id: gemini/gemini-4-hydrogen
+      name: Gemini 4 Hydrogen (direct)
+      required_env: [GEMINI_API_KEY]
     - id: gemini/gemini-4-carbon
       name: Gemini 4 Carbon (direct)
       required_env: [GEMINI_API_KEY]

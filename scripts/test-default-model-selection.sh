@@ -152,15 +152,17 @@ check "key-presence fallback still works (no CP model)" "$got" "minimax/MiniMax-
 # 6b. A Gemini key alone selects the platform default model on the tenant's own
 #     key (BYOK gemini/ form), as a MiniMax key alone selects M3.
 got=$(run_case 'GEMINI_API_KEY=x')
-check "Gemini key-presence fallback is Gemini 4 Carbon (BYOK)" "$got" "gemini/gemini-4-carbon"
+check "Gemini key-presence fallback is Gemini 4 Hydrogen (BYOK)" "$got" "gemini/gemini-4-hydrogen"
 got=$(run_case 'GOOGLE_API_KEY=x')
-check "GOOGLE_API_KEY also selects Gemini 4 Carbon (BYOK)" "$got" "gemini/gemini-4-carbon"
+check "GOOGLE_API_KEY also selects Gemini 4 Hydrogen (BYOK)" "$got" "gemini/gemini-4-hydrogen"
 
 # 6c. The concierge inherits a Gemini platform default exactly as delivered.
-got=$(run_case 'MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_MODEL=google/gemini-4-carbon')
-check "platform arm inherits the Gemini default" "$got" "google/gemini-4-carbon"
-got=$(run_case_rc 'MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_MODEL=google/gemini-4-carbon')
+got=$(run_case 'MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_MODEL=google/gemini-4-hydrogen')
+check "platform arm inherits the Gemini default" "$got" "google/gemini-4-hydrogen"
+got=$(run_case_rc 'MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_MODEL=google/gemini-4-hydrogen')
 check "platform arm boots on the Gemini default (rc)" "$got" "0"
+got=$(run_case 'MOLECULE_RESOLVED_PROVIDER=platform MOLECULE_MODEL=google/gemini-4-carbon')
+check "platform arm inherits Gemini 4 Carbon (still selectable)" "$got" "google/gemini-4-carbon"
 
 # --- Platform-managed fail-loud guard (outcome-based) ---
 

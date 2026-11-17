@@ -154,8 +154,8 @@ fi
 # (7b.2) Platform Gemini: derive-provider.sh maps google/ to `auto` (it has no
 # native google/ provider); the platform signal must still route it to the
 # custom proxy with the model id unchanged, which the proxy serves through
-# Google AI Studio. Both the default and the e2e model.
-for gemini_model in google/gemini-4-carbon google/gemini-3.1-flash-lite; do
+# Google AI Studio. The default, Carbon and the e2e model.
+for gemini_model in google/gemini-4-hydrogen google/gemini-4-carbon google/gemini-3.1-flash-lite; do
   run_case "platform routes ${gemini_model} unchanged" \
     "0|custom|custom|${PROXY}|tok-123|chat_completions|${gemini_model}" \
     "MOLECULE_RESOLVED_PROVIDER=platform" "MOLECULE_LLM_BASE_URL=${PROXY}" \
