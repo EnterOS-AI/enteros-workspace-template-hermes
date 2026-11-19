@@ -265,6 +265,83 @@ def test_the_executor_reads_what_the_plugin_records_for_a_model_call(tmp_path, m
     assert executor._model_call_failure(turn_started) is None
 
 
+# --- model calls of other agents in the same process -------------------------------
+#
+# The hooks fire for every agent in the gateway process, not only the one
+# answering the run's prompt. At HERMES_COMMIT a top-level delegate_task runs its
+# children in the background (run_agent.py, _dispatch_delegate_task), each an
+# AIAgent with platform="subagent" (tools/delegate_tool.py); the curator and
+# hermes' own cron run as platform "curator" and "cron". A run is judged by the
+# last model call of ITS agent. Recorded without a filter, a child's retryable
+# 429 that lands after the parent's answer made a healthy run "failed", and a
+# child's answer hid the parent's failed last call (review of 2026-11-19).
+
+SIDE_AGENT_PLATFORMS = ["subagent", "curator", "cron"]
+
+
+@pytest.mark.parametrize("platform", SIDE_AGENT_PLATFORMS)
+def test_another_agents_failed_call_does_not_replace_the_runs_answer(tmp_path, monkeypatch, platform):
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv(MODEL_CALL_ENV, str(model_calls))
+    plugin = _plugin()
+    plugin.record_model_call_ok(**ANSWERED_CALL)
+    child_429 = {**REFUSED_CALL, "platform": platform, "session_id": "child-1",
+                 "status_code": 429, "reason": "rate_limit", "retryable": True}
+    assert plugin.record_model_call_error(**child_429) is None
+    record = json.loads(model_calls.read_text(encoding="utf-8"))
+    assert (record["ok"], record["status_code"], record["reason"]) == (True, None, "")
+
+
+@pytest.mark.parametrize("platform", SIDE_AGENT_PLATFORMS)
+def test_another_agents_answer_does_not_hide_the_runs_failed_call(tmp_path, monkeypatch, platform):
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv(MODEL_CALL_ENV, str(model_calls))
+    plugin = _plugin()
+    plugin.record_model_call_error(**REFUSED_CALL)
+    assert plugin.record_model_call_ok(**{**ANSWERED_CALL, "platform": platform, "session_id": "child-1"}) is None
+    record = json.loads(model_calls.read_text(encoding="utf-8"))
+    assert (record["ok"], record["status_code"], record["reason"]) == (False, 402, "billing")
+
+
+def test_another_agents_calls_alone_leave_no_record(tmp_path, monkeypatch):
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv(MODEL_CALL_ENV, str(model_calls))
+    plugin = _plugin()
+    plugin.record_model_call_ok(**{**ANSWERED_CALL, "platform": "subagent"})
+    plugin.record_model_call_error(**{**REFUSED_CALL, "platform": "subagent"})
+    assert not model_calls.exists()
+
+
+@pytest.mark.parametrize("platform", ["molecule-a2a", "api_server", "", None])
+def test_the_runs_own_agent_is_recorded_on_either_transport(tmp_path, monkeypatch, platform):
+    # molecule-a2a is the plugin transport, api_server the chat-completions one;
+    # a payload with no platform (an older hermes) is the run's agent too.
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv(MODEL_CALL_ENV, str(model_calls))
+    _plugin().record_model_call_error(**{**REFUSED_CALL, "platform": platform})
+    assert json.loads(model_calls.read_text(encoding="utf-8"))["ok"] is False
+
+
+def test_the_executor_judges_a_run_by_its_own_agents_last_call(tmp_path, monkeypatch):
+    import executor
+
+    monkeypatch.setenv(MODEL_CALL_ENV, str(tmp_path / "model_call"))
+    plugin = _plugin()
+    turn_started = time.time()
+    child_429 = {**REFUSED_CALL, "platform": "subagent", "session_id": "child-1",
+                 "status_code": 429, "reason": "rate_limit", "retryable": True}
+    # The parent answered ("dispatched"), then a background child hit a 429.
+    plugin.record_model_call_ok(**ANSWERED_CALL)
+    plugin.record_model_call_error(**child_429)
+    assert executor._model_call_failure(turn_started) is None
+    # The parent's last call failed, then a background child answered.
+    plugin.record_model_call_error(**REFUSED_CALL)
+    plugin.record_model_call_ok(**{**ANSWERED_CALL, "platform": "subagent", "session_id": "child-1"})
+    assert executor._model_call_failure(turn_started) == (
+        "the model provider refused the call (billing, HTTP 402; custom minimax/MiniMax-M2.7)"
+    )
+
+
 # --- start.sh: enabling it ----------------------------------------------------------
 
 _SEED_RE = re.compile(r"^\{$\n(.*?)^\} >\"\$HERMES_CONFIG\"$", re.M | re.S)

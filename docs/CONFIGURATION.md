@@ -245,10 +245,24 @@ answer becomes a FAILED task status followed by Hermes' text:
   `auth_permanent`, `model_entitlement`, or HTTP 401, 402, 403 or 429).
 - `the turn's last model call failed (server_error, HTTP 500; <provider> <model>):`
   for any other failure: a provider error or overload after Hermes' retries, a
-  timeout, empty or malformed responses, a prompt the model declined.
+  timeout, a response body that is empty or malformed, a prompt the model
+  declined (`content_filter`).
 
 A call a retry or a fallback provider recovered is not a failure: the record
-holds the turn's last attempt.
+holds the last attempt of the run's own agent. Model calls of agents Hermes
+runs beside it (`delegate_task` children, the curator, Hermes' cron) are not
+counted, so a sub-agent's failure after the answer does not fail the run.
+
+What is still recorded as a succeeded run, because the model call itself
+answered:
+
+- A well-formed reply with no visible text on every attempt. Hermes answers
+  with its own sentence (`<model> didn't produce a reply this time…`), and
+  that sentence is the run's output.
+- An answer cut off at the output limit (`finish_reason: length`) that Hermes
+  could not complete. The partial text is the run's output.
+
+A caller that needs a particular result must check the run's `output` itself.
 
 A turn that ends with no answer is failed when no model call was recorded for
 it (`the turn ended with no answer, and no model call was recorded for it`):

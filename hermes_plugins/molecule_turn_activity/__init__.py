@@ -132,6 +132,16 @@ def touch_activity_file(**payload) -> None:
 MODEL_CALL_FILE_ENV = "MOLECULE_MODEL_CALL_FILE"
 MODEL_CALL_VERSION = 1
 
+# Agents hermes runs BESIDE the one answering the run's prompt, by the platform
+# each is built with: delegate_task children ("subagent", tools/delegate_tool.py),
+# the curator and hermes' own cron. Their model calls fire the same two hooks in
+# the same process. The record is the verdict on the run's own agent, so theirs
+# are not recorded: a top-level delegate_task runs its children in the
+# background, and a child's retryable 429 landing after the parent's answer
+# would otherwise make a healthy run "failed" (and a child's answer would hide
+# the parent's failed last call).
+_SIDE_AGENT_PLATFORMS = frozenset({"subagent", "curator", "cron"})
+
 
 def _model_call_record(ok: bool, payload: dict) -> dict:
     status = payload.get("status_code")
@@ -151,6 +161,8 @@ def _model_call_record(ok: bool, payload: dict) -> dict:
 def _record_model_call(ok: bool, payload: dict) -> None:
     path = os.environ.get(MODEL_CALL_FILE_ENV, "").strip()
     if not path:
+        return None
+    if str(payload.get("platform") or "") in _SIDE_AGENT_PLATFORMS:
         return None
     try:
         _write_atomically(path, json.dumps(_model_call_record(ok, payload), ensure_ascii=False))
