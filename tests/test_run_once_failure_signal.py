@@ -454,31 +454,167 @@ async def test_a_turn_the_provider_refused(monkeypatch, tmp_path, case, mode):
     assert result.error.startswith(f"the model provider refused the call ({reason}")
 
 
-NOT_REFUSALS = {
-    # A retry or a fallback provider answered after the refusal.
+# --- a last model call that failed some other way ---------------------------------
+#
+# hermes fires api_request_error for EVERY failed attempt of a main-loop model
+# call and post_api_request for every one that answers (agent/turn_api_error.py,
+# turn_response_check.py, turn_truncation.py and turn_response_intake.py at
+# HERMES_COMMIT), so the record is the turn's last attempt. When that attempt
+# failed, nothing answered after it: the text hermes replies with is its own
+# account of the failure, whatever the reason. These used to be recorded as
+# succeeded runs, with that account as the run's output.
+
+_SERVER_ERROR_TEXT = "API call failed after 3 retries: HTTP 500: upstream connect error"
+
+FAILED_CALLS = {
+    # The provider, or the proxy in front of it, is failing or overloaded.
+    "server-error-500": ({"status": 500, "reason": "server_error"}, "server_error, HTTP 500"),
+    "bad-gateway-502": ({"status": 502, "reason": "server_error"}, "server_error, HTTP 502"),
+    "overloaded-503": ({"status": 503, "reason": "overloaded"}, "overloaded, HTTP 503"),
+    # No status: the call never got a response.
+    "timeout": ({"reason": "timeout"}, "timeout"),
+    # Empty or malformed responses, retries exhausted.
+    "invalid-response": ({"reason": "invalid_response"}, "invalid_response"),
+    # The model declined the prompt and no fallback answered.
+    "content-policy": ({"reason": "content_policy_blocked"}, "content_policy_blocked"),
+    # A request the provider rejects outright.
+    "bad-request-400": ({"status": 400, "reason": "format_error"}, "format_error, HTTP 400"),
+    "model-not-found-404": ({"status": 404, "reason": "model_not_found"}, "model_not_found, HTTP 404"),
+    # hermes could not classify it.
+    "unknown": ({"reason": "unknown"}, "unknown"),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["serve", "once"])
+@pytest.mark.parametrize("case", list(FAILED_CALLS))
+async def test_a_turn_whose_last_model_call_failed(monkeypatch, tmp_path, case, mode):
+    if mode == "once":
+        monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    record, reason = FAILED_CALLS[case]
+    queue = await asyncio.wait_for(
+        _hermes_answers_after(monkeypatch, tmp_path, [{"ok": False, **record}], text=_SERVER_ERROR_TEXT), 20
+    )
+    (event,) = queue.events
+    if mode == "serve":  # hermes' reply, byte for byte, as before
+        assert isinstance(event, Message) and _text(event) == _SERVER_ERROR_TEXT
+        return
+    assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
+    assert _text(event.status.message) == (
+        f"the turn's last model call failed ({reason}; custom minimax/MiniMax-M2.7): {_SERVER_ERROR_TEXT}"
+    )
+    result = classify_turn(queue.events)
+    assert (result.status, result.output, result.exit_code) == ("failed", "", 1)
+    assert result.error.startswith(f"the turn's last model call failed ({reason}")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_model_call_hermes_gave_no_reason_for(monkeypatch, tmp_path):
+    # No reason and no status: the failure is still the run's.
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    queue = await asyncio.wait_for(
+        _hermes_answers_after(monkeypatch, tmp_path, [{"ok": False}], text=_SERVER_ERROR_TEXT), 20
+    )
+    (event,) = queue.events
+    assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
+    assert _text(event.status.message) == (
+        f"the turn's last model call failed (custom minimax/MiniMax-M2.7): {_SERVER_ERROR_TEXT}"
+    )
+
+
+NOT_FAILURES = {
+    # A retry or a fallback provider answered after the failure.
     "recovered": dict(records=[{"ok": False, "status": 429, "reason": "rate_limit"}, {"ok": True}]),
-    # Another turn's refusal, before this one started.
+    "recovered-from-500": dict(records=[{"ok": False, "status": 500, "reason": "server_error"}, {"ok": True}]),
+    # Another turn's failure, before this one started.
     "earlier-turn": dict(records=[], before_turn=[{"ok": False, "status": 402, "reason": "billing", "at": 1.0}]),
-    # A failure that is not the provider refusing (outside C6's refusal set).
-    "server-error": dict(records=[{"ok": False, "status": 500, "reason": "server_error"}]),
-    "content-policy": dict(records=[{"ok": False, "reason": "content_policy_blocked"}]),
     # A call that answered decides, whatever else the record holds (review 21723
-    # N1: the plugin never writes a refusal on an `ok: true` record, so only this
+    # N1: the plugin never writes a failure on an `ok: true` record, so only this
     # pins the executor's `ok is not False` guard).
     "answered-with-refusal-fields": dict(records=[{"ok": True, "status": 429, "reason": "rate_limit"}]),
 }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", list(NOT_REFUSALS))
-async def test_hermes_answer_stays_an_answer_unless_the_last_call_was_refused(monkeypatch, tmp_path, case):
+@pytest.mark.parametrize("case", list(NOT_FAILURES))
+async def test_hermes_answer_stays_an_answer_unless_the_last_call_failed(monkeypatch, tmp_path, case):
     monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
     queue = await asyncio.wait_for(
-        _hermes_answers_after(monkeypatch, tmp_path, text="the weekly report", **NOT_REFUSALS[case]), 20
+        _hermes_answers_after(monkeypatch, tmp_path, text="the weekly report", **NOT_FAILURES[case]), 20
     )
     (event,) = queue.events
     assert isinstance(event, Message) and _text(event) == "the weekly report"
     assert classify_turn(queue.events).status == "succeeded"
+
+
+# --- a turn that ended with no answer ----------------------------------------------
+#
+# A scheduled task may finish quietly on purpose (a bare [SILENT]): hermes then
+# sends nothing under the turn's id and the turn settles with the runtime's
+# no-response text. That is a succeeded run WHEN a model call answered during
+# the turn. In a run pod, whose gateway records every model call, a turn that
+# ends with no answer and no recorded call never reached the model at all.
+
+
+async def _silent_end_after(monkeypatch, tmp_path, records=(), *, before_turn=()):
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv("MOLECULE_MODEL_CALL_FILE", str(model_calls))
+    for record in before_turn:
+        _model_call(model_calls, **record)
+    async with _running(monkeypatch, HERMES_TURN_SETTLE_SECONDS="0.3") as (ex, gateway):
+        queue = _Queue()
+        turn = asyncio.create_task(ex.execute(_run_ctx(), queue))
+        await _dispatched(gateway, SPEC.prompt)
+        for record in records:
+            _model_call(model_calls, **record)
+        await turn
+    return queue
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_finish_after_a_model_call_that_answered_is_a_succeeded_run(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    queue = await asyncio.wait_for(_silent_end_after(monkeypatch, tmp_path, [{"ok": True}]), 20)
+    (event,) = queue.events
+    assert isinstance(event, Message) and _text(event) == executor_mod._NO_RESPONSE
+    assert classify_turn(queue.events).status == "succeeded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before_turn", [(), ({"ok": True, "at": 1.0},)], ids=["no-record", "only-an-earlier-turns"])
+async def test_no_answer_and_no_model_call_is_a_failed_run(monkeypatch, tmp_path, before_turn):
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    queue = await asyncio.wait_for(_silent_end_after(monkeypatch, tmp_path, before_turn=before_turn), 20)
+    (event,) = queue.events
+    assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
+    assert _text(event.status.message) == (
+        "the turn ended with no answer, and no model call was recorded for it"
+    )
+    result = classify_turn(queue.events)
+    assert (result.status, result.output, result.exit_code) == ("failed", "", 1)
+
+
+@pytest.mark.asyncio
+async def test_no_answer_after_a_failed_model_call_names_the_failed_call(monkeypatch, tmp_path):
+    # Retries exhausted on empty responses, and hermes sent nothing.
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    queue = await asyncio.wait_for(
+        _silent_end_after(monkeypatch, tmp_path, [{"ok": False, "reason": "invalid_response"}]), 20
+    )
+    (event,) = queue.events
+    assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
+    assert _text(event.status.message) == (
+        "the turn's last model call failed (invalid_response; custom minimax/MiniMax-M2.7): "
+        + executor_mod._NO_RESPONSE
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_finish_outside_a_run_is_unchanged(monkeypatch, tmp_path):
+    # Serve mode: a workspace's quiet turn stays a reply, whatever was recorded.
+    queue = await asyncio.wait_for(_silent_end_after(monkeypatch, tmp_path), 20)
+    (event,) = queue.events
+    assert isinstance(event, Message) and _text(event) == executor_mod._NO_RESPONSE
 
 
 @pytest.mark.asyncio
@@ -505,6 +641,25 @@ async def test_a_turn_the_provider_refused_on_the_chat_completions_fallback(monk
         return
     assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
     assert _text(event.status.message).startswith("the model provider refused the call (billing, HTTP 402")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_model_call_on_the_chat_completions_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv("MOLECULE_MODEL_CALL_FILE", str(model_calls))
+
+    async def failing(_request):
+        _model_call(model_calls, ok=False, status=503, reason="overloaded")
+        return web.json_response({"choices": [{"finish_reason": "error", "message": {
+            "role": "assistant", "content": _SERVER_ERROR_TEXT}}]})
+
+    async with _chat_completions(monkeypatch, failing) as ex:
+        queue = _Queue()
+        await asyncio.wait_for(ex.execute(_run_ctx(), queue), 20)
+    (event,) = queue.events
+    assert isinstance(event, TaskStatusUpdateEvent) and event.status.state == TaskState.TASK_STATE_FAILED
+    assert _text(event.status.message).startswith("the turn's last model call failed (overloaded, HTTP 503")
 
 
 def test_the_refusal_reasons_are_hermes_own():
@@ -596,6 +751,29 @@ async def test_once_mode_records_a_provider_refusal_as_failed(monkeypatch, tmp_p
     assert hb.active_tasks == 0
 
 
+@pytest.mark.asyncio
+async def test_once_mode_records_a_failed_model_call_as_failed(monkeypatch, tmp_path):
+    # A provider outage, end to end: was `succeeded` with hermes' error text.
+    monkeypatch.setenv("MOLECULE_RUN_MODE", "once")
+    model_calls = tmp_path / "model_call"
+    monkeypatch.setenv("MOLECULE_MODEL_CALL_FILE", str(model_calls))
+    hb = SimpleNamespace(active_tasks=0, current_task="")
+    ledger = _Ledger()
+    async with _running(monkeypatch, heartbeat=hb) as (ex, gateway):
+        run = asyncio.create_task(run_once(_spec(), ex, heartbeat=hb, report=ledger, settle_poll_seconds=0.02))
+        await _dispatched(gateway, SPEC.prompt)
+        _model_call(model_calls, ok=False, status=500, reason="server_error")
+        await gateway.answer(SPEC.prompt, _SERVER_ERROR_TEXT)
+        rc = await asyncio.wait_for(run, 20)
+    assert rc == 1
+    assert [(b["phase"], b["status"]) for b in ledger.bodies] == [("started", "running"), ("finished", "failed")]
+    finished = ledger.bodies[-1]
+    assert (finished["exit_code"], finished["output"]) == (1, "")
+    assert finished["error"].startswith("the turn's last model call failed (server_error, HTTP 500")
+    assert "upstream connect error" in finished["error"]
+    assert hb.active_tasks == 0
+
+
 # --- the switch and the sites ------------------------------------------------------
 
 
@@ -642,9 +820,9 @@ def test_every_reply_the_executor_composes_goes_through_give_up():
         "execute": 2,                        # P1 empty prompt, P2 repeat wake dropped
         "_dispatch_and_wait": 2,             # P3 queue full, P4 shutting down
         "_await_outcome": 4,                 # P5 interim, P6 cancelled, P7 abandoned, P8 other error
-        "_run_plugin_turn": 2,               # P9 overflow the heal could not clear, P10 provider refusal
-        "_execute_via_chat_completions": 4,  # C4 provider refusal, C3 tool-round cap, C1 HTTP error,
-                                             # C2 unreachable
+        "_run_plugin_turn": 2,               # P9 overflow the heal could not clear, P10 the last model
+                                             # call failed, or no answer and no model call
+        "_execute_via_chat_completions": 4,  # C4 as P10, C3 tool-round cap, C1 HTTP error, C2 unreachable
     }
 
 

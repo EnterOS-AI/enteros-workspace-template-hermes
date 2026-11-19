@@ -119,9 +119,10 @@ def touch_activity_file(**payload) -> None:
 
 
 # --- Light runs: how each model call ended ----------------------------------------
-# hermes answers a turn whose model call the provider refused (credits or billing
-# exhausted, a quota or rate limit it could not wait out, a rejected key) with its
-# own explanation as the reply text. Its verdict (the agent result's ``failed`` and
+# hermes answers a turn whose model call failed (a refusal: credits or billing
+# exhausted, a quota or rate limit it could not wait out, a rejected key; or a
+# provider error, a timeout, empty responses, a declined prompt) with its own
+# explanation as the reply text. Its verdict (the agent result's ``failed`` and
 # ``failure_reason``) never reaches the executor: the molecule-a2a callback
 # carries the text only. In a Light run (start.sh sets MOLECULE_MODEL_CALL_FILE
 # only there) this plugin records each main-loop model call's outcome as hermes

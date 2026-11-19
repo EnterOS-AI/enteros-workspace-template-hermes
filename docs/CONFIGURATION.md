@@ -234,16 +234,26 @@ prompt, a context overflow the auto-heal could not clear, and the
 chat-completions fallback's errors), is a FAILED task status carrying the same
 text, so the run is recorded as failed. Outside a run it stays the plain reply.
 
-A turn whose last model call the provider refused is failed too. Hermes
-answers it with its own explanation as plain text: credits or billing
-exhausted, a quota or rate limit it could not wait out, a rejected key, or a
-model the account may not use (Hermes' reasons `billing`, `rate_limit`,
-`upstream_rate_limit`, `auth`, `auth_permanent`, `model_entitlement`, or HTTP
-401, 402, 403 or 429). In a run, that answer becomes a FAILED task status:
-`the model provider refused the call (billing, HTTP 402; <provider> <model>):`
-followed by Hermes' text. A call a retry or a fallback provider recovered is
-not a refusal. Other failures Hermes answers in text, such as a provider's 5xx
-after its retries, stay its answer.
+A turn whose last model call failed is failed too, whatever the cause. Hermes
+answers such a turn with its own explanation as plain text, and in a run that
+answer becomes a FAILED task status followed by Hermes' text:
+
+- `the model provider refused the call (billing, HTTP 402; <provider> <model>):`
+  for a refusal: credits or billing exhausted, a quota or rate limit it could
+  not wait out, a rejected key, or a model the account may not use (Hermes'
+  reasons `billing`, `rate_limit`, `upstream_rate_limit`, `auth`,
+  `auth_permanent`, `model_entitlement`, or HTTP 401, 402, 403 or 429).
+- `the turn's last model call failed (server_error, HTTP 500; <provider> <model>):`
+  for any other failure: a provider error or overload after Hermes' retries, a
+  timeout, empty or malformed responses, a prompt the model declined.
+
+A call a retry or a fallback provider recovered is not a failure: the record
+holds the turn's last attempt.
+
+A turn that ends with no answer is failed when no model call was recorded for
+it (`the turn ended with no answer, and no model call was recorded for it`):
+the prompt never reached the model. A quiet finish after a call that answered,
+such as a bare `[SILENT]`, is a succeeded run.
 
 ## Bundled Node.js
 

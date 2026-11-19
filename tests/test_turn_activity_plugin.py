@@ -258,11 +258,11 @@ def test_the_executor_reads_what_the_plugin_records_for_a_model_call(tmp_path, m
     monkeypatch.setenv(MODEL_CALL_ENV, str(tmp_path / "model_call"))
     turn_started = time.time()
     _plugin().record_model_call_error(**REFUSED_CALL)
-    assert executor._provider_refusal(turn_started) == (
+    assert executor._model_call_failure(turn_started) == (
         "the model provider refused the call (billing, HTTP 402; custom minimax/MiniMax-M2.7)"
     )
     _plugin().record_model_call_ok(**ANSWERED_CALL)
-    assert executor._provider_refusal(turn_started) is None
+    assert executor._model_call_failure(turn_started) is None
 
 
 # --- start.sh: enabling it ----------------------------------------------------------
