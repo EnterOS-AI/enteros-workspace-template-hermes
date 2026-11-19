@@ -1021,17 +1021,21 @@ async def _give_up(event_queue: EventQueue, text: str) -> None:
         await event_queue.enqueue_event(new_text_message(text))
 
 
-# A model call the provider refused (C6). hermes answers such a turn with its own
-# explanation as the reply text, and its verdict (the agent result's `failed`,
+# A turn whose last model call failed (C6). hermes answers such a turn with its
+# own explanation as the reply text, and its verdict (the agent result's `failed`,
 # `failure_reason`) never crosses the molecule-a2a callback, which carries the
 # text only. In a Light run the image's molecule_turn_activity plugin records how
-# each main-loop model call ended, as hermes classified it (api_request_error /
-# post_api_request), in MOLECULE_MODEL_CALL_FILE. A turn whose last model call
-# the provider refused is the run's failure: hermes' text is its explanation.
+# each main-loop model call ended, as hermes classified it, in
+# MOLECULE_MODEL_CALL_FILE: api_request_error fires for every failed attempt and
+# post_api_request for every one that answers, so the record is the turn's last
+# attempt. When that attempt failed nothing answered after it, whatever the
+# reason (a refusal, a 5xx, a timeout, empty responses, a declined prompt): the
+# run failed, and hermes' text is its explanation.
 _MODEL_CALL_FILE_ENV = "MOLECULE_MODEL_CALL_FILE"
 # hermes' FailoverReason values (agent/error_classifier.py at HERMES_COMMIT) for a
 # provider that refused the call: credits or billing, a quota or rate limit,
-# a rejected key, a model this account may not use.
+# a rejected key, a model this account may not use. They only choose the words
+# of the failure: every failed last call fails the run.
 _PROVIDER_REFUSAL_REASONS = frozenset(
     {"billing", "rate_limit", "upstream_rate_limit", "auth", "auth_permanent", "model_entitlement"}
 )
@@ -1039,11 +1043,10 @@ _PROVIDER_REFUSAL_REASONS = frozenset(
 _PROVIDER_REFUSAL_STATUSES = frozenset({401, 402, 403, 429})
 
 
-def _provider_refusal(since: float) -> str | None:
-    """Why the provider refused the last model call made since ``since`` (the
-    turn's dispatch, wall clock), or None: no record, an older one (another
-    turn's), a call that answered (a retry or a fallback that recovered), or a
-    failure that is not a refusal. Never raises."""
+def _model_call_record(since: float) -> dict | None:
+    """The plugin's record of the last model call made since ``since`` (the
+    turn's dispatch, wall clock), or None: no file configured, no record, an
+    unreadable one, or an older one (another turn's). Never raises."""
     path = os.environ.get(_MODEL_CALL_FILE_ENV, "").strip()
     if not path:
         return None
@@ -1052,20 +1055,50 @@ def _provider_refusal(since: float) -> str | None:
             record = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict) or record.get("ok") is not False:
+    if not isinstance(record, dict):
         return None
     at = record.get("ts")
     if not isinstance(at, (int, float)) or at < since:
+        return None
+    return record
+
+
+def _model_call_failure(since: float) -> str | None:
+    """Why the last model call made since ``since`` failed, or None: no record
+    of this turn's, or a call that answered (a retry or a fallback that
+    recovered). Never raises."""
+    record = _model_call_record(since)
+    if record is None or record.get("ok") is not False:
         return None
     reason = str(record.get("reason") or "")
     status = record.get("status_code")
     if not isinstance(status, int) or isinstance(status, bool):
         status = None
-    if reason not in _PROVIDER_REFUSAL_REASONS and status not in _PROVIDER_REFUSAL_STATUSES:
-        return None
+    refused = reason in _PROVIDER_REFUSAL_REASONS or status in _PROVIDER_REFUSAL_STATUSES
     what = ", ".join(part for part in (reason, f"HTTP {status}" if status is not None else "") if part)
     who = " ".join(str(record.get(key) or "") for key in ("provider", "model")).strip()
-    return f"the model provider refused the call ({what}{'; ' + who if who else ''})"
+    detail = "; ".join(part for part in (what, who) if part)
+    lead = "the model provider refused the call" if refused else "the turn's last model call failed"
+    return f"{lead} ({detail})" if detail else lead
+
+
+def _run_failure(text: str, since: float) -> str | None:
+    """Why a Light run whose turn was dispatched at ``since`` and ended with
+    ``text`` failed, or None: ``text`` is the run's answer.
+
+    The last model call failed: ``text`` is hermes' account of it. Or the turn
+    ended with no answer (empty, or the no-response text a quiet turn settles
+    with) and the run pod's gateway, which records every model call, recorded
+    none for it: the prompt never reached the model. A quiet finish after a call
+    that answered stays an answer (a scheduled task may end on a bare [SILENT]),
+    and so does any turn where no model-call file is configured."""
+    failed_call = _model_call_failure(since)
+    if failed_call is not None:
+        return f"{failed_call}: {text}"
+    no_answer = not (text or "").strip() or text == _NO_RESPONSE
+    if no_answer and os.environ.get(_MODEL_CALL_FILE_ENV, "").strip() and _model_call_record(since) is None:
+        return "the turn ended with no answer, and no model call was recorded for it"
+    return None
 
 
 class HermesAgentProxyExecutor(AgentExecutor):
@@ -1558,11 +1591,12 @@ class HermesAgentProxyExecutor(AgentExecutor):
             await _give_up(event_queue, text)
             return
 
-        refusal = _provider_refusal(dispatched_at) if _run_once_mode() else None
-        if refusal is not None:
-            # hermes' text explains why the provider refused the turn's last
-            # model call: in a Light run, the run's failure, not its answer.
-            await _give_up(event_queue, f"{refusal}: {text}")
+        failure = _run_failure(text, dispatched_at) if _run_once_mode() else None
+        if failure is not None:
+            # The turn's last model call failed (hermes' text explains why), or
+            # it ended with no answer and no model call: in a Light run, the
+            # run's failure, not its answer.
+            await _give_up(event_queue, failure)
             return
 
         await event_queue.enqueue_event(
@@ -2863,9 +2897,9 @@ class HermesAgentProxyExecutor(AgentExecutor):
                         text = assistant_msg.get("content")
                         if not text:
                             text = self._extract_assistant_text(data)
-                        refusal = _provider_refusal(dispatched_at) if _run_once_mode() else None
-                        if refusal is not None:  # as on the plugin transport
-                            await _give_up(event_queue, f"{refusal}: {text}")
+                        failure = _run_failure(text, dispatched_at) if _run_once_mode() else None
+                        if failure is not None:  # as on the plugin transport
+                            await _give_up(event_queue, failure)
                             return
                         await event_queue.enqueue_event(new_text_message(text))
                         return

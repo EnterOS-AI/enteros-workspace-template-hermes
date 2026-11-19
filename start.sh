@@ -1065,9 +1065,9 @@ if [ -z "${MOLECULE_TOOL_ACTIVITY_FILE:-}" ]; then
 fi
 export MOLECULE_TOOL_ACTIVITY_FILE
 # A Light run only: the same plugin also records how each model call ended, as
-# hermes classified it, so the executor can tell a provider's refusal (credits,
-# quota, rate limit, a rejected key), which hermes answers in plain text, from
-# an answer (contract C6). Beside the activity file, in the directory both
+# hermes classified it, so the executor can tell a failed model call (a refusal,
+# a provider error, a timeout), which hermes answers in plain text, from an
+# answer (contract C6). Beside the activity file, in the directory both
 # processes already share. A workspace's gateway gets no such hooks.
 if [ "${RUN_ONCE:-0}" = 1 ]; then
   MOLECULE_MODEL_CALL_FILE="$(dirname "$MOLECULE_TOOL_ACTIVITY_FILE")/model_call"

@@ -5,7 +5,7 @@ description: >-
   tool call, so the Molecule runtime's turn lease sees the gateway working and
   the executor can report each tool call to the platform. In a Light run
   (MOLECULE_MODEL_CALL_FILE set) it also records how each model call ended, as
-  hermes classified it, so the executor can tell a provider's refusal from an
+  hermes classified it, so the executor can tell a failed model call from an
   answer.
 kind: standalone
 provides_hooks:
